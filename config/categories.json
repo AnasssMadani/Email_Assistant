@@ -1,0 +1,65 @@
+{
+  "categories": [
+    {
+      "id": "demande_information",
+      "label": "Demande d'information",
+      "slaHours": 24,
+      "acknowledgeAutomatically": true,
+      "allowExternalRelance": false
+    },
+    {
+      "id": "reclamation",
+      "label": "Reclamation",
+      "slaHours": 8,
+      "acknowledgeAutomatically": true,
+      "allowExternalRelance": false
+    },
+    {
+      "id": "devis",
+      "label": "Demande de devis",
+      "slaHours": 24,
+      "acknowledgeAutomatically": true,
+      "allowExternalRelance": true
+    },
+    {
+      "id": "candidature",
+      "label": "Candidature",
+      "slaHours": 72,
+      "acknowledgeAutomatically": true,
+      "allowExternalRelance": false
+    },
+    {
+      "id": "suivi_dossier",
+      "label": "Suivi d'un dossier en cours",
+      "slaHours": 24,
+      "acknowledgeAutomatically": true,
+      "allowExternalRelance": true
+    },
+    {
+      "id": "spam_newsletter",
+      "label": "Spam / newsletter / notification automatique",
+      "slaHours": 0,
+      "acknowledgeAutomatically": false,
+      "allowExternalRelance": false
+    },
+    {
+      "id": "interne",
+      "label": "Communication interne",
+      "slaHours": 0,
+      "acknowledgeAutomatically": false,
+      "allowExternalRelance": false
+    },
+    {
+      "id": "autre",
+      "label": "Autre / non classifie",
+      "slaHours": 24,
+      "acknowledgeAutomatically": true,
+      "allowExternalRelance": false
+    }
+  ],
+  "relance": {
+    "internalReminderAfterHours": 24,
+    "externalRelanceAfterHours": 96,
+    "maxRelances": 2
+  }
+}

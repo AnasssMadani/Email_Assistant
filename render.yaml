@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: accuse-reception-relance
+    runtime: node
+    plan: starter
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:all
+    autoDeployTrigger: commit
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /var/data/app.db
+      - key: CONNECTION_STATE_PATH
+        value: /var/data/connection.json
+      - key: GOOGLE_TOKEN_PATH
+        value: /var/data/gmail-token.json
+      - key: AZURE_TOKEN_PATH
+        value: /var/data/graph-token.json
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: AZURE_CLIENT_SECRET
+        sync: false
+      - key: AZURE_TENANT_ID
+        sync: false
+      - key: AZURE_REDIRECT_URI
+        sync: false
+      - key: SETUP_USERNAME
+        sync: false
+      - key: SETUP_PASSWORD
+        sync: false
