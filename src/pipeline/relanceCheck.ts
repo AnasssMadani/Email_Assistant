@@ -1,5 +1,6 @@
 import { getCategory, loadCategories } from "../config.js";
 import { draftRelance } from "../ai/draftRelance.js";
+import { buildReplySubject } from "../utils.js";
 import {
   incrementRelance,
   listThreadsAwaitingReply,
@@ -53,7 +54,7 @@ async function checkThread(connector: EmailConnector, row: ThreadRow): Promise<v
     await connector.sendReply({
       threadId: row.thread_id,
       to: row.sender_email,
-      subject: relance.subject,
+      subject: buildReplySubject(row.subject),
       bodyText: relance.body,
       inReplyToMessageId: lastInbound.rfcMessageId,
     });

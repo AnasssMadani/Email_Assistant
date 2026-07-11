@@ -2,6 +2,7 @@ import { getCategory } from "../config.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
 import { draftThreeReplies } from "../ai/draftReplies.js";
+import { buildReplySubject } from "../utils.js";
 import {
   isMessageProcessed,
   markMessageProcessed,
@@ -47,11 +48,17 @@ export async function processIncomingMessage(
     return;
   }
 
+  // Le sujet envoye reprend toujours "Re: <sujet original>", pas celui que
+  // Claude propose (ack.subject) - Gmail/Outlook exigent cette coherence
+  // de sujet, en plus des en-tetes de threading, pour rattacher la reponse
+  // au bon fil plutot que d'en creer un nouveau.
+  const replySubject = buildReplySubject(message.subject);
+
   const ack = await draftAcknowledgement(thread, message, category);
   await connector.sendReply({
     threadId: message.threadId,
     to: message.from.email,
-    subject: ack.subject,
+    subject: replySubject,
     bodyText: ack.body,
     inReplyToMessageId: message.rfcMessageId,
   });
@@ -63,7 +70,7 @@ export async function processIncomingMessage(
     const draft = await connector.createDraftReply({
       threadId: message.threadId,
       to: message.from.email,
-      subject: reply.subject,
+      subject: replySubject,
       bodyText: reply.body,
       inReplyToMessageId: message.rfcMessageId,
     });
