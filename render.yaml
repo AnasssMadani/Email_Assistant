@@ -14,6 +14,13 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: "22"
+      # Filet de securite: sur certaines versions 22.x, node:sqlite exige
+      # encore ce flag explicitement. Sans effet (juste un avertissement)
+      # sur les versions ou il est deja actif par defaut.
+      - key: NODE_OPTIONS
+        value: --experimental-sqlite
       - key: DB_PATH
         value: /var/data/app.db
       - key: CONNECTION_STATE_PATH

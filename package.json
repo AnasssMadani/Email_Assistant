@@ -4,6 +4,9 @@
   "private": true,
   "description": "Accuse de reception automatique, brouillons de reponse et relances par email. Phase de test sur Gmail, cible de production Outlook / Microsoft 365.",
   "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev": "node ./node_modules/tsx/dist/cli.mjs src/index.ts",
     "build": "node ./node_modules/typescript/bin/tsc -p .",
