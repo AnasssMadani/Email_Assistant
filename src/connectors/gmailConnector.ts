@@ -10,9 +10,15 @@ export class GmailConnector implements EmailConnector {
 
   private async getGmail(): Promise<gmail_v1.Gmail> {
     if (!this.gmailPromise) {
-      this.gmailPromise = getAuthorizedClient().then((auth) =>
-        google.gmail({ version: "v1", auth })
-      );
+      this.gmailPromise = getAuthorizedClient()
+        .then((auth) => google.gmail({ version: "v1", auth }))
+        .catch((err) => {
+          // Ne pas garder en cache un echec (ex: pas encore connecte au
+          // demarrage) - sinon toute reconnexion ulterieure resterait
+          // bloquee sur cette meme promesse rejetee indefiniment.
+          this.gmailPromise = null;
+          throw err;
+        });
     }
     return this.gmailPromise;
   }
