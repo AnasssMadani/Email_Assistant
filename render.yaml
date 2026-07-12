@@ -47,5 +47,17 @@ services:
         sync: false
       - key: SETUP_USERNAME
         sync: false
+      - key: SETUP_PASSWORD_HASH
+        sync: false
+      # Deprecie, conserve declare pour eviter qu'une synchro de blueprint ne
+      # supprime la valeur existante sur un service deja deploye.
       - key: SETUP_PASSWORD
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: BRAND_NAME
+        value: Accusé & Relance
+      - key: BRAND_PRIMARY_COLOR
+        value: "#16202A"
+      - key: BRAND_LOGO_URL
         sync: false
