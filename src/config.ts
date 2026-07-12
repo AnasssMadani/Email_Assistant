@@ -1,7 +1,6 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import type { CategoriesFile } from "./types.js";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -38,26 +37,29 @@ export const config = {
   brandVoicePath: process.env.BRAND_VOICE_PATH ?? "./config/brand-voice.md",
   connectionStatePath: process.env.CONNECTION_STATE_PATH ?? "./data/connection.json",
   emailConnector: (process.env.EMAIL_CONNECTOR ?? "gmail") as "gmail" | "graph",
+  // Cle AES-256 (64 caracteres hexadecimaux) pour chiffrer les jetons OAuth au
+  // repos. Generer avec: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  // Si absente, les jetons restent en clair sur disque (avertissement au demarrage).
+  encryptionKey: process.env.ENCRYPTION_KEY ?? "",
+  auth: {
+    username: process.env.SETUP_USERNAME ?? "",
+    // Format "salt:hash" genere par `npm run auth:hash-password -- "motdepasse"`.
+    passwordHash: process.env.SETUP_PASSWORD_HASH ?? "",
+    // Ancien mode de passe en clair, conserve uniquement pour compatibilite
+    // ascendante. A migrer vers SETUP_PASSWORD_HASH.
+    legacyPlaintextPassword: process.env.SETUP_PASSWORD ?? "",
+  },
+  branding: {
+    name: process.env.BRAND_NAME ?? "Accusé & Relance",
+    primaryColor: process.env.BRAND_PRIMARY_COLOR ?? "#16202A",
+    logoUrl: process.env.BRAND_LOGO_URL ?? "",
+  },
 };
 
 export function requireAnthropicApiKey(): string {
   return config.anthropicApiKey || required("ANTHROPIC_API_KEY");
 }
 
-export function loadCategories(): CategoriesFile {
-  const raw = readFileSync(path.resolve(config.categoriesConfigPath), "utf-8");
-  return JSON.parse(raw) as CategoriesFile;
-}
-
 export function loadBrandVoice(): string {
   return readFileSync(path.resolve(config.brandVoicePath), "utf-8");
-}
-
-export function getCategory(categoryId: string): CategoriesFile["categories"][number] {
-  const { categories } = loadCategories();
-  const found = categories.find((c) => c.id === categoryId);
-  if (found) return found;
-  const fallback = categories.find((c) => c.id === "autre");
-  if (fallback) return fallback;
-  throw new Error(`Categorie inconnue: ${categoryId}, et aucune categorie "autre" de repli.`);
 }

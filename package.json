@@ -14,6 +14,8 @@
     "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "gmail:auth": "node ./node_modules/tsx/dist/cli.mjs src/scripts/gmailAuthSetup.ts",
     "test:pipeline": "node ./node_modules/tsx/dist/cli.mjs src/scripts/testPipeline.ts",
+    "test": "node ./node_modules/tsx/dist/cli.mjs --test test/**/*.test.ts",
+    "auth:hash-password": "node ./node_modules/tsx/dist/cli.mjs src/scripts/hashPassword.ts",
     "setup": "node ./node_modules/tsx/dist/cli.mjs src/web/server.ts",
     "dev:all": "node ./node_modules/tsx/dist/cli.mjs src/main.ts",
     "start:all": "node dist/main.js"

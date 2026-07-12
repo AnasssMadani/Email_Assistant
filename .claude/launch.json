@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "setup-server",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["./node_modules/tsx/dist/cli.mjs", "src/web/server.ts"],
+      "port": 4300
+    }
+  ]
+}

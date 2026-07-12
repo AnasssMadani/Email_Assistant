@@ -1,4 +1,4 @@
-import { getCategory, loadCategories } from "../config.js";
+import { getCategory, loadCategories } from "../settings.js";
 import { draftRelance } from "../ai/draftRelance.js";
 import { buildReplySubject } from "../utils.js";
 import {

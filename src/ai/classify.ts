@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
-import { loadCategories } from "../config.js";
+import { loadCategories } from "../settings.js";
 import { formatThreadContext } from "./prompts.js";
 import type { ClassificationResult, EmailMessage, EmailThread } from "../types.js";
 

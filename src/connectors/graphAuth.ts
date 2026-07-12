@@ -1,6 +1,17 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
+import { decryptJson, encryptJson, looksEncrypted } from "../crypto.js";
+
+let warnedPlaintextTokens = false;
+function warnPlaintextTokensOnce(): void {
+  if (warnedPlaintextTokens) return;
+  warnedPlaintextTokens = true;
+  console.warn(
+    "[avertissement] ENCRYPTION_KEY non definie: le jeton Microsoft est stocke en clair sur disque. " +
+      "Definissez ENCRYPTION_KEY pour le chiffrer au repos."
+  );
+}
 
 export const GRAPH_SCOPES = [
   "offline_access",
@@ -47,12 +58,22 @@ export function buildGraphAuthUrl(state: string): string {
 
 export function saveGraphToken(tokens: GraphTokenSet): void {
   mkdirSync(path.dirname(tokenPath()), { recursive: true });
-  writeFileSync(tokenPath(), JSON.stringify(tokens, null, 2), "utf-8");
+  if (config.encryptionKey) {
+    writeFileSync(tokenPath(), encryptJson(tokens, config.encryptionKey), "utf-8");
+  } else {
+    warnPlaintextTokensOnce();
+    writeFileSync(tokenPath(), JSON.stringify(tokens, null, 2), "utf-8");
+  }
 }
 
 export function loadGraphToken(): GraphTokenSet | null {
   if (!existsSync(tokenPath())) return null;
-  return JSON.parse(readFileSync(tokenPath(), "utf-8")) as GraphTokenSet;
+  const raw = readFileSync(tokenPath(), "utf-8");
+  if (config.encryptionKey && looksEncrypted(raw)) {
+    return decryptJson<GraphTokenSet>(raw, config.encryptionKey);
+  }
+  if (!config.encryptionKey) warnPlaintextTokensOnce();
+  return JSON.parse(raw) as GraphTokenSet;
 }
 
 async function requestToken(body: URLSearchParams): Promise<GraphTokenSet> {

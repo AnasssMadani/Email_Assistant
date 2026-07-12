@@ -1,4 +1,4 @@
-import { getCategory } from "../config.js";
+import { getCategory } from "../settings.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
 import { draftThreeReplies } from "../ai/draftReplies.js";

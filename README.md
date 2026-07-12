@@ -152,19 +152,44 @@ automatiquement au premier clic — se reconnecter sur l'autre fournisseur
 bascule le pipeline sans redémarrage manuel de configuration.
 
 **Protégez cette page dès qu'elle sort de votre poste local**: définissez
-`SETUP_USERNAME` / `SETUP_PASSWORD` dans `.env` (authentification HTTP
-Basic). Sans ça, n'importe qui connaissant l'URL peut reconnecter ou
-déconnecter la messagerie. Un avertissement s'affiche au démarrage tant
-que ces variables sont vides.
+`SETUP_USERNAME` et `SETUP_PASSWORD_HASH` dans `.env`. Générez le hash avec:
+
+```bash
+npm run auth:hash-password -- "votre-mot-de-passe"
+```
+
+et collez la ligne `SETUP_PASSWORD_HASH=...` affichée dans `.env`. Sans ces
+variables, l'application n'est pas protégée — un avertissement s'affiche au
+démarrage tant qu'elles sont vides. La page de login est désormais une page
+brandée propre à l'application (plus le popup natif du navigateur), avec
+session cookie, protection CSRF sur tous les formulaires, et une limite de
+tentatives (5 essais / 15 min / IP).
+
+`SETUP_PASSWORD` (mot de passe en clair) reste accepté pour compatibilité
+ascendante mais est déprécié — préférez `SETUP_PASSWORD_HASH`.
 
 ### 4. Personnalisation métier
 
-- [`config/categories.json`](config/categories.json) — types de demandes,
-  délai (SLA) par catégorie, et si la relance externe automatique est
-  autorisée.
+- **Catégories et seuils de relance** (SLA par catégorie, accusé
+  automatique, autorisation de relance externe, délais de rappel
+  interne/relance externe, nombre max de relances) se règlent désormais
+  depuis l'application, onglet **Réglages** (`npm run setup` →
+  `/reglages`) — **aucun redéploiement nécessaire**. Le fichier
+  [`config/categories.json`](config/categories.json) ne sert plus qu'à
+  l'amorçage initial de la base au premier démarrage; il est ensuite ignoré.
 - [`config/brand-voice.md`](config/brand-voice.md) — ton de marque, exemples
   à suivre, ce qu'il faut éviter. À compléter avec le client pendant
   l'atelier de cadrage.
+- **Image de marque de l'application** (nom, couleur, logo) — variables
+  `BRAND_NAME`, `BRAND_PRIMARY_COLOR`, `BRAND_LOGO_URL` dans `.env`.
+
+### Autres pages de l'application
+
+- **Journal** (`/journal`) — historique des rappels internes et relances
+  externes envoyées automatiquement (table `reminders`).
+- **Confidentialité & rétention** (`/confidentialite`) — ce qui est stocké,
+  pendant combien de temps, et comment supprimer les données d'un dossier
+  (bouton "Supprimer les données" sur la page Suivi des dossiers).
 
 ### 5. Lancement
 
@@ -241,22 +266,25 @@ pas d'un conteneur Linux en production.
    plateforme). Mettez à jour `GOOGLE_REDIRECT_URI` et `AZURE_REDIRECT_URI`
    avec ce domaine, et enregistrez les mêmes URI côté Google Cloud Console
    et Azure Portal (les URI de redirection doivent correspondre exactement).
-2. **`SETUP_USERNAME` / `SETUP_PASSWORD`** — obligatoire dès que ce n'est
-   plus `localhost`.
-3. **Secrets** — `ANTHROPIC_API_KEY`, `GOOGLE_CLIENT_SECRET`,
-   `AZURE_CLIENT_SECRET`, `SETUP_PASSWORD` via le gestionnaire de secrets
-   de votre hébergeur (variables d'environnement du service), jamais un
-   fichier `.env` committé.
-4. **Process toujours actif** — le pipeline dépend d'un `node-cron` qui
+2. **`SETUP_USERNAME` / `SETUP_PASSWORD_HASH`** — obligatoire dès que ce
+   n'est plus `localhost`.
+3. **`ENCRYPTION_KEY`** — recommandé pour chiffrer au repos les jetons OAuth
+   Gmail/Outlook stockés sur disque (`data/gmail-token.json`,
+   `data/graph-token.json`). Sans elle, ces fichiers restent en clair.
+4. **Secrets** — `ANTHROPIC_API_KEY`, `GOOGLE_CLIENT_SECRET`,
+   `AZURE_CLIENT_SECRET`, `SETUP_PASSWORD_HASH`, `ENCRYPTION_KEY` via le
+   gestionnaire de secrets de votre hébergeur (variables d'environnement du
+   service), jamais un fichier `.env` committé.
+5. **Process toujours actif** — le pipeline dépend d'un `node-cron` qui
    tourne dans le process; il faut donc un service "always on"
    (App Service avec "Always On" activé, VM + systemd/pm2, ou un
    orchestrateur de conteneurs), pas une fonction serverless qui s'éteint
    entre les requêtes.
-5. **Base de données** — si l'hébergement ne garantit pas un disque
+6. **Base de données** — si l'hébergement ne garantit pas un disque
    persistant (containers éphémères redéployés, plusieurs instances),
    migrer `src/db.ts` de SQLite vers Postgres avant d'aller au-delà du
    pilote.
-6. **Scrutation → webhooks** — au-delà du pilote, remplacer le polling par
+7. **Scrutation → webhooks** — au-delà du pilote, remplacer le polling par
    les souscriptions Microsoft Graph / Gmail push (Pub/Sub) pour un
    traitement en quasi temps réel et moins d'appels API.
 
@@ -265,22 +293,71 @@ Service (Linux, Node) ou Azure Container Apps — cohérence avec
 l'écosystème du client, simplifie la validation par son équipe IT.
 Alternatives valables pour un pilote plus léger: Railway, Render, Fly.io.
 
+## Ce que ce dépôt ne peut pas faire à votre place
+
+Ces points nécessitent un accès direct aux consoles Google Cloud / Azure du
+client (comptes, écrans de consentement, soumissions de vérification) —
+aucune modification de code ne peut les couvrir:
+
+- **Google OAuth — écran de consentement + vérification.** Tant que
+  l'app OAuth reste en mode "Testing", les utilisateurs voient "Google
+  n'a pas vérifié cette application" à l'écran de consentement. À faire
+  dans [Google Cloud Console](https://console.cloud.google.com/apis/credentials) →
+  OAuth consent screen: renseigner nom, logo, domaine, politique de
+  confidentialité et conditions d'utilisation, puis soumettre l'app à
+  vérification (obligatoire pour les scopes sensibles `gmail.send` /
+  `gmail.readonly`). Ce projet publie désormais une page
+  [Confidentialité & rétention](#3-page-de-connexion-le-client-branche-sa-boîte-lui-même)
+  (`/confidentialite`) qui peut servir de base à la politique de
+  confidentialité demandée par Google.
+- **Azure — image de marque de l'inscription d'application.** Dans le
+  [Azure Portal](https://portal.azure.com) du client → Entra ID → App
+  registrations → Branding & properties: ajouter logo et domaine
+  d'éditeur, sinon l'écran de consentement Microsoft affiche un nom
+  générique sans logo.
+- **URI de redirection de production.** `GOOGLE_REDIRECT_URI` et
+  `AZURE_REDIRECT_URI` pointent vers `localhost` par défaut
+  ([`.env.example`](.env.example)) — à remplacer par l'URL HTTPS réelle et à
+  enregistrer à l'identique côté Google Cloud Console et Azure Portal avant
+  toute autorisation en production (voir
+  [Checklist avant d'exposer publiquement](#checklist-avant-dexposer-publiquement)).
+
+## Tests
+
+```bash
+npm test          # tests unitaires (node:test), sans accès email ni clé API
+npm run typecheck
+npm run test:pipeline   # test manuel de bout en bout de la couche IA (nécessite ANTHROPIC_API_KEY)
+```
+
+`npm test` couvre les unités isolables (utilitaires, chiffrement des jetons,
+authentification/session/CSRF, résolution des catégories) — voir
+[`test/`](test). La logique du pipeline complet (classification + rédaction
++ envoi réel) reste couverte par le script manuel `test:pipeline`, pas par
+des tests automatisés, car elle suppose un accès Claude/connecteur réel.
+Le workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) fait
+tourner `typecheck` + `test` sur chaque push/PR.
+
 ## Structure du projet
 
 ```
 config/
-  categories.json         catégories, SLA, règles de relance
+  categories.json         catégories, SLA, règles de relance — amorçage initial uniquement (voir /reglages)
   brand-voice.md           ton de marque
 src/
   connectors/               Gmail et Microsoft Graph (interface commune EmailConnector)
-  web/server.ts             page de connexion + suivi des dossiers
+  web/server.ts             login + connexion messagerie + suivi des dossiers + réglages + journal
+  web/auth.ts                sessions, CSRF, hash de mot de passe, limitation des tentatives
+  crypto.ts                  chiffrement AES-256-GCM des jetons OAuth au repos
+  settings.ts                categories/seuils de relance, lus depuis la base (plus depuis le JSON)
   ai/                        classification + rédaction (Claude)
   pipeline/                  orchestration (email entrant, vérification des relances)
-  scripts/                   auth Gmail en CLI (fallback), test de la couche IA sans email
+  scripts/                   auth Gmail en CLI (fallback), test de la couche IA sans email, hash de mot de passe
   connectionState.ts         messagerie active (écrit par la page de connexion)
-  db.ts                      suivi des dossiers (SQLite local)
+  db.ts                      suivi des dossiers, catégories, réglages de relance, journal (SQLite local)
   scheduler.ts, index.ts     pipeline seul
   main.ts                    pipeline + page web dans un seul process (prod/Docker)
+test/                      tests unitaires (node:test, exécutés via tsx)
 render.yaml                       déploiement Render (recommandé, sans Docker)
 Dockerfile, docker-compose.yml   déploiement Docker (alternatif)
 ```
@@ -300,9 +377,13 @@ sans `&` (ex. `SRA and Co`).
 
 - La scrutation de boîte se fait par intervalle (cron), pas par webhook —
   voir [Mise en production](#mise-en-production).
-- Le rappel interne (`recordReminder`, kind `internal`) n'est aujourd'hui
-  journalisé qu'en base et visible sur la page "Suivi des dossiers" — à
-  brancher sur Slack/Teams/email d'équipe selon l'outil du client.
+- Le rappel interne (`recordReminder`, kind `internal`) est journalisé en
+  base et visible sur la page **Journal** (`/journal`) — à brancher sur
+  Slack/Teams/email d'équipe selon l'outil du client pour une notification
+  active plutôt qu'une simple consultation.
+- Aucune purge automatique des données anciennes: suppression uniquement
+  manuelle, dossier par dossier, depuis "Suivi des dossiers" (voir
+  [Confidentialité & rétention](#autres-pages-de-lapplication)).
 - SQLite local convient au pilote; prévoir Postgres pour la production à
   plus grande échelle (voir [Où sont stockées les données](#où-sont-stockées-les-données)).
 - Un seul compte connecté à la fois par instance (`data/connection.json`).

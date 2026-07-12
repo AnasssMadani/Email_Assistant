@@ -1,7 +1,7 @@
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
 import { draftThreeReplies } from "../ai/draftReplies.js";
-import { getCategory } from "../config.js";
+import { getCategory } from "../settings.js";
 import type { EmailMessage, EmailThread } from "../types.js";
 
 /**

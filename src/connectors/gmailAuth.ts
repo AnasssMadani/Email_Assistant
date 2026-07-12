@@ -2,6 +2,17 @@ import { OAuth2Client } from "google-auth-library";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
+import { decryptJson, encryptJson, looksEncrypted } from "../crypto.js";
+
+let warnedPlaintextTokens = false;
+function warnPlaintextTokensOnce(): void {
+  if (warnedPlaintextTokens) return;
+  warnedPlaintextTokens = true;
+  console.warn(
+    "[avertissement] ENCRYPTION_KEY non definie: le jeton Gmail est stocke en clair sur disque. " +
+      "Definissez ENCRYPTION_KEY pour le chiffrer au repos."
+  );
+}
 
 export const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
@@ -42,7 +53,21 @@ export async function exchangeCodeForGmailToken(code: string): Promise<void> {
 export function saveToken(tokens: unknown): void {
   const tokenPath = path.resolve(config.google.tokenPath);
   mkdirSync(path.dirname(tokenPath), { recursive: true });
-  writeFileSync(tokenPath, JSON.stringify(tokens, null, 2), "utf-8");
+  if (config.encryptionKey) {
+    writeFileSync(tokenPath, encryptJson(tokens, config.encryptionKey), "utf-8");
+  } else {
+    warnPlaintextTokensOnce();
+    writeFileSync(tokenPath, JSON.stringify(tokens, null, 2), "utf-8");
+  }
+}
+
+function readToken(tokenPath: string): Record<string, unknown> {
+  const raw = readFileSync(tokenPath, "utf-8");
+  if (config.encryptionKey && looksEncrypted(raw)) {
+    return decryptJson(raw, config.encryptionKey);
+  }
+  if (!config.encryptionKey) warnPlaintextTokensOnce();
+  return JSON.parse(raw);
 }
 
 export async function getAuthorizedClient(): Promise<OAuth2Client> {
@@ -53,7 +78,7 @@ export async function getAuthorizedClient(): Promise<OAuth2Client> {
     );
   }
   const client = createOAuthClient();
-  const tokens = JSON.parse(readFileSync(tokenPath, "utf-8"));
+  const tokens = readToken(tokenPath);
   client.setCredentials(tokens);
 
   client.on("tokens", (newTokens) => {
