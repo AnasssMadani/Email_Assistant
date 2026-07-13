@@ -1,4 +1,4 @@
-import express, { type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { getConnectionState, saveConnectionState, clearConnectionState } from "../connectionState.js";
@@ -221,7 +221,9 @@ app.get("/dossiers/:threadId", (req: Request, res: Response) => {
     return;
   }
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderDossierDetailPage(thread, res.locals.csrfToken as string | undefined, query(req).saved));
+  res.send(
+    renderDossierDetailPage(thread, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error)
+  );
 });
 
 app.post("/dossiers/:threadId/cloturer", requireCsrf, async (req: Request, res: Response) => {
@@ -271,37 +273,56 @@ async function attemptCleanup(threadId: string): Promise<void> {
   }
 }
 
+/** Journalise et redirige avec une banniere d'erreur au lieu de laisser une route synchrone planter jusqu'a la page 500 generique. */
+function runOrRedirectError(res: Response, context: string, threadId: string, action: () => void): void {
+  try {
+    action();
+  } catch (err) {
+    console.error(`[${context}] erreur sur le dossier ${threadId}:`, err);
+    recordPipelineError(context, threadId, (err as Error).message);
+    res.redirect(`/dossiers/${encodeURIComponent(threadId)}?error=1`);
+    return;
+  }
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+}
+
 app.post("/dossiers/:threadId/relance-steps", requireCsrf, (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  // Le clamp doit porter sur la propre sequence du dossier (vide au premier
-  // ajout), pas sur celle de la categorie de repli — sinon la premiere etape
-  // d'une nouvelle surcharge se retrouve poussee au delai de la derniere
-  // etape de la categorie au lieu de rester libre.
-  const existing = getThreadRelanceOverride(threadId);
-  const parsed = parseStep(req.body as Record<string, string>);
-  addThreadRelanceStep(threadId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
-  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+  runOrRedirectError(res, "relance_step_add", threadId, () => {
+    // Le clamp doit porter sur la propre sequence du dossier (vide au premier
+    // ajout), pas sur celle de la categorie de repli — sinon la premiere etape
+    // d'une nouvelle surcharge se retrouve poussee au delai de la derniere
+    // etape de la categorie au lieu de rester libre.
+    const existing = getThreadRelanceOverride(threadId);
+    const parsed = parseStep(req.body as Record<string, string>);
+    addThreadRelanceStep(threadId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
+  });
 });
 
 app.post("/dossiers/:threadId/relance-steps/personnaliser", requireCsrf, (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  const thread = getThreadRow(threadId);
-  if (thread && !hasThreadRelanceOverride(threadId)) {
-    const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id);
-    const base = steps.length > 0 ? steps : [{ channel: "internal" as const, delayMinutes: 1440 }];
-    for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayMinutes: step.delayMinutes });
-  }
-  res.redirect(`/dossiers/${encodeURIComponent(threadId)}`);
+  runOrRedirectError(res, "relance_step_personnaliser", threadId, () => {
+    const thread = getThreadRow(threadId);
+    if (thread && !hasThreadRelanceOverride(threadId)) {
+      const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id);
+      const base = steps.length > 0 ? steps : [{ channel: "internal" as const, delayMinutes: 1440 }];
+      for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayMinutes: step.delayMinutes });
+    }
+  });
 });
 
 app.post("/dossiers/:threadId/relance-steps/reset", requireCsrf, (req: Request, res: Response) => {
-  clearThreadRelanceOverride(req.params.threadId);
-  res.redirect(`/dossiers/${encodeURIComponent(req.params.threadId)}?saved=1`);
+  const threadId = req.params.threadId;
+  runOrRedirectError(res, "relance_step_reset", threadId, () => {
+    clearThreadRelanceOverride(threadId);
+  });
 });
 
 app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
-  deleteThreadRelanceStep(req.params.threadId, Number(req.params.order));
-  res.redirect(`/dossiers/${encodeURIComponent(req.params.threadId)}?saved=1`);
+  const threadId = req.params.threadId;
+  runOrRedirectError(res, "relance_step_delete", threadId, () => {
+    deleteThreadRelanceStep(threadId, Number(req.params.order));
+  });
 });
 
 /**
@@ -349,31 +370,52 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
 app.get("/reglages", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(
-    renderReglagesPage(listCategories(), res.locals.csrfToken as string | undefined, query(req).saved)
+    renderReglagesPage(
+      listCategories(),
+      res.locals.csrfToken as string | undefined,
+      query(req).saved,
+      query(req).error
+    )
   );
 });
 
+/** Meme filet de securite que runOrRedirectError, mais pour les routes /reglages (redirection sans threadId). */
+function runOrRedirectReglagesError(res: Response, context: string, action: () => void): void {
+  try {
+    action();
+  } catch (err) {
+    console.error(`[${context}] erreur:`, err);
+    recordPipelineError(context, null, (err as Error).message);
+    res.redirect("/reglages?error=1");
+    return;
+  }
+  res.redirect("/reglages?saved=1");
+}
+
 app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) => {
   const body = req.body as Record<string, string>;
-  updateCategory(req.params.id, {
-    label: (body.label ?? "").trim() || req.params.id,
-    slaHours: Math.max(0, Number(body.slaHours) || 0),
-    acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
+  runOrRedirectReglagesError(res, "category_update", () => {
+    updateCategory(req.params.id, {
+      label: (body.label ?? "").trim() || req.params.id,
+      slaHours: Math.max(0, Number(body.slaHours) || 0),
+      acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
+    });
   });
-  res.redirect("/reglages?saved=1");
 });
 
 app.post("/reglages/categories/:id/relance-steps", requireCsrf, (req: Request, res: Response) => {
   const categoryId = req.params.id;
-  const existing = getCategoryRelanceSteps(categoryId);
-  const parsed = parseStep(req.body as Record<string, string>);
-  addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
-  res.redirect("/reglages?saved=1");
+  runOrRedirectReglagesError(res, "category_relance_step_add", () => {
+    const existing = getCategoryRelanceSteps(categoryId);
+    const parsed = parseStep(req.body as Record<string, string>);
+    addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
+  });
 });
 
 app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
-  deleteCategoryRelanceStep(req.params.id, Number(req.params.order));
-  res.redirect("/reglages?saved=1");
+  runOrRedirectReglagesError(res, "category_relance_step_delete", () => {
+    deleteCategoryRelanceStep(req.params.id, Number(req.params.order));
+  });
 });
 
 // ---------- Journal (audit des relances) ----------
@@ -868,12 +910,21 @@ function renderThreadRow(
 
 // ---------- Detail d'un dossier ----------
 
-function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefined, saved: string | undefined): string {
+function renderDossierDetailPage(
+  thread: ThreadRow,
+  csrfToken: string | undefined,
+  saved: string | undefined,
+  error: string | undefined
+): string {
   const categoryLabels = new Map(listCategories().map((c) => [c.id, c.label]));
   const categoryLabel = categoryLabels.get(thread.category_id) ?? thread.category_id;
   const stamp = statusStamp(thread);
   const canClose = !["responded", "closed", "skipped"].includes(thread.status);
-  const banner = saved ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>` : "";
+  const banner = error
+    ? `<div class="banner banner-error">L'action a échoué — l'erreur a été journalisée, voir la page <a href="/journal">Journal</a>.</div>`
+    : saved
+      ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>`
+      : "";
 
   const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id);
   const draftCount = listDraftsForThread(thread.thread_id).length;
@@ -882,6 +933,17 @@ function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefine
     thread.due_at !== null &&
     ["ack_sent", "drafts_ready", "relance_sent"].includes(thread.status) &&
     Boolean(nextStep);
+  // L'echeance (due_at) est l'ancrage fixe (reception + SLA de la categorie) —
+  // elle ne bouge pas apres une relance, par design: c'est la date de depart
+  // dont chaque etape de la sequence calcule son propre delai. Ce qui bouge
+  // reellement, c'est la prochaine action prevue (echeance + delai de
+  // l'etape a venir), qu'on affiche separement pour eviter la confusion
+  // "l'echeance est passee mais rien ne s'est passe".
+  const nextActionAt =
+    thread.due_at && nextStep
+      ? new Date(new Date(thread.due_at).getTime() + nextStep.delayMinutes * 60_000)
+      : null;
+  const triggerLabel = nextStep?.channel === "external" ? "Envoyer la relance maintenant" : "Déclencher le rappel interne maintenant";
 
   const header = `
     <div class="detail-header">
@@ -892,7 +954,12 @@ function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefine
         <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
         <div class="ledger-fact"><span class="fact-label">Reçu le</span><span class="fact-value">${escapeHtml(new Date(thread.received_at).toLocaleString("fr-FR"))}</span></div>
         <div class="ledger-fact"><span class="fact-label">Accusé le</span><span class="fact-value">${thread.ack_sent_at ? escapeHtml(new Date(thread.ack_sent_at).toLocaleString("fr-FR")) : "—"}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Échéance</span><span class="fact-value">${thread.due_at ? escapeHtml(new Date(thread.due_at).toLocaleString("fr-FR")) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Échéance (SLA initial)</span><span class="fact-value">${thread.due_at ? escapeHtml(new Date(thread.due_at).toLocaleString("fr-FR")) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Prochaine action prévue</span><span class="fact-value">${
+          nextActionAt
+            ? `${escapeHtml(nextActionAt.toLocaleString("fr-FR"))} — ${escapeHtml(channelLabel(nextStep!.channel))}`
+            : "—"
+        }</span></div>
         <div class="ledger-fact"><span class="fact-label">Relances</span><span class="fact-value">${thread.relance_count}</span></div>
         <div class="ledger-fact"><span class="fact-label">Brouillons déposés</span><span class="fact-value">${draftCount}</span></div>
       </div>
@@ -902,7 +969,7 @@ function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefine
             ? `<form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relancer-maintenant"
                      onsubmit="return confirm('Declencher l\\'etape ${nextStep!.order} (${escapeHtml(channelLabel(nextStep!.channel))}) maintenant, sans attendre l\\'echeance ?');">
                  ${csrfField(csrfToken)}
-                 <button class="btn btn-primary btn-sm" type="submit">Déclencher la relance maintenant</button>
+                 <button class="btn btn-primary btn-sm" type="submit">${escapeHtml(triggerLabel)}</button>
                </form>`
             : ""
         }
@@ -1048,8 +1115,17 @@ function renderStepList(opts: {
 
 // ---------- Reglages ----------
 
-function renderReglagesPage(categories: CategoryConfig[], csrfToken: string | undefined, saved: string | undefined): string {
-  const banner = saved ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>` : "";
+function renderReglagesPage(
+  categories: CategoryConfig[],
+  csrfToken: string | undefined,
+  saved: string | undefined,
+  error: string | undefined
+): string {
+  const banner = error
+    ? `<div class="banner banner-error">L'action a échoué — l'erreur a été journalisée, voir la page <a href="/journal">Journal</a>.</div>`
+    : saved
+      ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>`
+      : "";
 
   const categoryBlocks = categories
     .map((cat) => {
@@ -1222,6 +1298,56 @@ function escapeHtml(value: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
+/**
+ * Filet de securite final: sans ce middleware, une erreur non rattrapee dans
+ * une route (surtout les routes synchrones — Express 4 les intercepte
+ * automatiquement mais n'avait nulle part ou les envoyer) finissait en page
+ * 500 generique d'Express, invisible cote admin. Desormais journalisee dans
+ * pipeline_errors (visible sur /journal) avec le chemin et le message exacts.
+ */
+function renderErrorPage(): string {
+  return `<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Erreur</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #F6F1E7; color: #211D17;
+    display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+  .box { max-width: 420px; text-align: center; }
+  h1 { font-size: 19px; }
+  p { color: #6E6455; line-height: 1.5; }
+  a { color: #16202A; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>Une erreur est survenue</h1>
+    <p>L'action n'a pas pu aboutir. Elle a été journalisée — consultez la page <a href="/journal">Journal</a> pour le détail.</p>
+    <p><a href="/dossiers">Retour au registre des dossiers</a></p>
+  </div>
+</body>
+</html>`;
+}
+
+app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[erreur non geree] ${req.method} ${req.path}:`, err);
+  try {
+    recordPipelineError("web_request", null, `${req.method} ${req.path}: ${message}`);
+  } catch {
+    // Si meme la journalisation echoue, ne pas empecher la reponse d'erreur de partir.
+  }
+  res.status(500);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderErrorPage());
+});
 
 app.listen(config.webPort, () => {
   console.log(`Page de connexion disponible sur http://localhost:${config.webPort}`);
