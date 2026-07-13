@@ -95,13 +95,15 @@ actions "Marquer répondu" / "Supprimer les données".
 ## Séquences de relance
 
 Chaque **catégorie** a sa propre séquence de relance: une liste ordonnée
-d'étapes, chacune définie par un délai (en heures après l'échéance du
-dossier) et un canal — **rappel interne** (journalisé, visible sur la page
-Journal, à brancher sur l'outil d'équipe) ou **relance externe** (email
-envoyé automatiquement au demandeur, rédigé par Claude). Exemple typique:
-étape 1 à +24h en rappel interne, étape 2 à +96h en relance externe. Se
-règle depuis **Réglages** (`/reglages`), par catégorie — pas de
-redéploiement nécessaire.
+d'étapes, chacune définie par un délai **en minutes** après l'échéance du
+dossier (l'interface l'affiche en minutes, heures ou jours selon la
+grandeur — `+30min`, `+4h`, `J+2`) et un canal — **rappel interne**
+(journalisé, visible sur la page Journal, à brancher sur l'outil d'équipe)
+ou **relance externe** (email envoyé automatiquement au demandeur, rédigé
+par Claude). Exemple typique: étape 1 à J+1 en rappel interne, étape 2 à
+J+5 en relance externe — mais rien n'empêche un délai de quelques minutes
+pour tester le pipeline sans attendre. Se règle depuis **Réglages**
+(`/reglages`), par catégorie — pas de redéploiement nécessaire.
 
 Un **dossier précis** peut avoir sa propre séquence, indépendante de celle
 de sa catégorie: depuis sa page de détail, "Personnaliser pour ce dossier"

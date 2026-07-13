@@ -51,13 +51,13 @@ test("adding a thread-scoped step overrides the category sequence entirely", () 
   });
 
   assert.equal(hasThreadRelanceOverride("t-override"), false);
-  addThreadRelanceStep("t-override", { channel: "external", delayHours: 48 });
+  addThreadRelanceStep("t-override", { channel: "external", delayMinutes: 48 });
 
   const { steps, isCustom } = getEffectiveRelanceSteps("t-override", "devis");
   assert.equal(isCustom, true);
   assert.equal(steps.length, 1);
   assert.equal(steps[0].channel, "external");
-  assert.equal(steps[0].delayHours, 48);
+  assert.equal(steps[0].delayMinutes, 48);
   assert.notDeepEqual(steps, getCategoryRelanceSteps("devis"));
 });
 
@@ -73,7 +73,7 @@ test("clearing a thread override reverts it to the category default", () => {
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });
-  addThreadRelanceStep("t-clear", { channel: "internal", delayHours: 12 });
+  addThreadRelanceStep("t-clear", { channel: "internal", delayMinutes: 12 });
   assert.equal(getEffectiveRelanceSteps("t-clear", "devis").isCustom, true);
 
   clearThreadRelanceOverride("t-clear");
@@ -84,7 +84,7 @@ test("clearing a thread override reverts it to the category default", () => {
 
 test("category steps can be added and deleted, re-numbering the remaining ones", () => {
   const before = getCategoryRelanceSteps("candidature").length;
-  addCategoryRelanceStep("candidature", { channel: "external", delayHours: 200 });
+  addCategoryRelanceStep("candidature", { channel: "external", delayMinutes: 200 });
   const afterAdd = getCategoryRelanceSteps("candidature");
   assert.equal(afterAdd.length, before + 1);
 
@@ -109,7 +109,7 @@ test("deleteThreadData removes a dossier's custom relance override", () => {
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });
-  addThreadRelanceStep("t-delete", { channel: "external", delayHours: 10 });
+  addThreadRelanceStep("t-delete", { channel: "external", delayMinutes: 10 });
   assert.equal(hasThreadRelanceOverride("t-delete"), true);
 
   deleteThreadData("t-delete");

@@ -11,7 +11,7 @@ import {
   setThreadStatus,
   recordDraft,
 } from "../db.js";
-import type { EmailConnector, EmailMessage } from "../types.js";
+import type { CategoryConfig, EmailConnector, EmailMessage, EmailThread } from "../types.js";
 
 export async function processIncomingMessage(
   connector: EmailConnector,
@@ -48,39 +48,57 @@ export async function processIncomingMessage(
     return;
   }
 
+  await sendAcknowledgementAndDrafts(connector, thread, message, category);
+}
+
+/**
+ * Envoie l'accuse de reception et depose les 3 brouillons de reponse pour un
+ * message donne. Extrait de processIncomingMessage pour etre reutilisable
+ * depuis une intervention manuelle (voir POST /dossiers/:threadId/traiter
+ * dans web/server.ts): un dossier mal classifie par erreur (ex: vrai email
+ * client marque "newsletter", donc jamais accuse) peut ainsi etre traite
+ * a la main avec la bonne categorie, sans devoir rejouer toute la
+ * classification.
+ */
+export async function sendAcknowledgementAndDrafts(
+  connector: EmailConnector,
+  thread: EmailThread,
+  incoming: EmailMessage,
+  category: CategoryConfig
+): Promise<void> {
   // Le sujet envoye reprend toujours "Re: <sujet original>", pas celui que
   // Claude propose (ack.subject) - Gmail/Outlook exigent cette coherence
   // de sujet, en plus des en-tetes de threading, pour rattacher la reponse
   // au bon fil plutot que d'en creer un nouveau.
-  const replySubject = buildReplySubject(message.subject);
+  const replySubject = buildReplySubject(incoming.subject);
 
-  const ack = await draftAcknowledgement(thread, message, category);
+  const ack = await draftAcknowledgement(thread, incoming, category);
   await connector.sendReply({
-    threadId: message.threadId,
-    to: message.from.email,
+    threadId: incoming.threadId,
+    to: incoming.from.email,
     subject: replySubject,
     bodyText: ack.body,
-    inReplyToMessageId: message.rfcMessageId,
+    inReplyToMessageId: incoming.rfcMessageId,
   });
-  setThreadAckSent(message.threadId);
-  console.log(`[accuse envoye] ${message.from.email} — "${message.subject}"`);
+  setThreadAckSent(incoming.threadId);
+  console.log(`[accuse envoye] ${incoming.from.email} — "${incoming.subject}"`);
 
-  const replies = await draftThreeReplies(thread, message, category);
+  const replies = await draftThreeReplies(thread, incoming, category);
   for (const reply of replies) {
     const draft = await connector.createDraftReply({
-      threadId: message.threadId,
-      to: message.from.email,
+      threadId: incoming.threadId,
+      to: incoming.from.email,
       subject: replySubject,
       bodyText: reply.body,
-      inReplyToMessageId: message.rfcMessageId,
+      inReplyToMessageId: incoming.rfcMessageId,
     });
     recordDraft({
-      threadId: message.threadId,
+      threadId: incoming.threadId,
       connectorDraftId: draft.id,
       variant: reply.variant,
       label: reply.label,
     });
   }
-  setThreadStatus(message.threadId, "drafts_ready");
-  console.log(`[brouillons prets] ${replies.length} propositions pour ${message.from.email}`);
+  setThreadStatus(incoming.threadId, "drafts_ready");
+  console.log(`[brouillons prets] ${replies.length} propositions pour ${incoming.from.email}`);
 }

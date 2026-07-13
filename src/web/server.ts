@@ -8,6 +8,9 @@ import { GmailConnector } from "../connectors/gmailConnector.js";
 import { GraphConnector } from "../connectors/graphConnector.js";
 import { createEmailConnector } from "../connectors/index.js";
 import { cleanupUnusedDrafts } from "../pipeline/draftCleanup.js";
+import { checkThread } from "../pipeline/relanceCheck.js";
+import { sendAcknowledgementAndDrafts } from "../pipeline/processIncoming.js";
+import { getCategory } from "../settings.js";
 import {
   addCategoryRelanceStep,
   addThreadRelanceStep,
@@ -17,6 +20,7 @@ import {
   deleteThreadRelanceStep,
   getCategoryRelanceSteps,
   getEffectiveRelanceSteps,
+  getThreadRelanceOverride,
   getThreadRow,
   hasThreadRelanceOverride,
   listCategories,
@@ -27,6 +31,7 @@ import {
   recordPipelineError,
   setThreadStatus,
   updateCategory,
+  upsertThreadReceived,
   type PipelineErrorRow,
   type ReminderRow,
   type ThreadRow,
@@ -55,16 +60,16 @@ function query(req: Request): Record<string, string> {
   return req.query as unknown as Record<string, string>;
 }
 
-function parseStep(body: Record<string, string>): { channel: RelanceChannel; delayHours: number } {
+function parseStep(body: Record<string, string>): { channel: RelanceChannel; delayMinutes: number } {
   const channel: RelanceChannel = body.channel === "external" ? "external" : "internal";
-  const delayHours = Math.max(0, Number(body.delayHours) || 0);
-  return { channel, delayHours };
+  const delayMinutes = Math.max(0, Number(body.delayMinutes) || 0);
+  return { channel, delayMinutes };
 }
 
 /** Empeche une nouvelle etape d'avoir un delai plus court que la precedente (sequence croissante). */
-function clampAfterLastStep(steps: RelanceStep[], delayHours: number): number {
-  const lastDelay = steps.length ? steps[steps.length - 1].delayHours : 0;
-  return Math.max(delayHours, lastDelay);
+function clampAfterLastStep(steps: RelanceStep[], delayMinutes: number): number {
+  const lastDelay = steps.length ? steps[steps.length - 1].delayMinutes : 0;
+  return Math.max(delayMinutes, lastDelay);
 }
 
 // ---------- Sceau (public, avant l'authentification) ----------
@@ -239,6 +244,24 @@ app.post("/dossiers/:threadId/nettoyer-brouillons", requireCsrf, async (req: Req
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 });
 
+app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  const thread = getThreadRow(threadId);
+  if (thread) {
+    const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id);
+    const nextStep = steps[thread.relance_count];
+    if (nextStep) {
+      try {
+        await checkThread(createEmailConnector(), thread, nextStep);
+      } catch (err) {
+        console.error(`[relance manuelle] erreur sur le dossier ${threadId}:`, err);
+        recordPipelineError("relance_check", threadId, (err as Error).message);
+      }
+    }
+  }
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+});
+
 /** Nettoyage best-effort: une messagerie non connectee ou une erreur API ne doit jamais bloquer l'action principale de la route appelante. */
 async function attemptCleanup(threadId: string): Promise<void> {
   try {
@@ -250,9 +273,13 @@ async function attemptCleanup(threadId: string): Promise<void> {
 
 app.post("/dossiers/:threadId/relance-steps", requireCsrf, (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  const existing = getEffectiveRelanceSteps(threadId, getThreadRow(threadId)?.category_id ?? "").steps;
+  // Le clamp doit porter sur la propre sequence du dossier (vide au premier
+  // ajout), pas sur celle de la categorie de repli — sinon la premiere etape
+  // d'une nouvelle surcharge se retrouve poussee au delai de la derniere
+  // etape de la categorie au lieu de rester libre.
+  const existing = getThreadRelanceOverride(threadId);
   const parsed = parseStep(req.body as Record<string, string>);
-  addThreadRelanceStep(threadId, { ...parsed, delayHours: clampAfterLastStep(existing, parsed.delayHours) });
+  addThreadRelanceStep(threadId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 });
 
@@ -261,8 +288,8 @@ app.post("/dossiers/:threadId/relance-steps/personnaliser", requireCsrf, (req: R
   const thread = getThreadRow(threadId);
   if (thread && !hasThreadRelanceOverride(threadId)) {
     const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id);
-    const base = steps.length > 0 ? steps : [{ channel: "internal" as const, delayHours: 24 }];
-    for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayHours: step.delayHours });
+    const base = steps.length > 0 ? steps : [{ channel: "internal" as const, delayMinutes: 1440 }];
+    for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayMinutes: step.delayMinutes });
   }
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}`);
 });
@@ -275,6 +302,46 @@ app.post("/dossiers/:threadId/relance-steps/reset", requireCsrf, (req: Request, 
 app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
   deleteThreadRelanceStep(req.params.threadId, Number(req.params.order));
   res.redirect(`/dossiers/${encodeURIComponent(req.params.threadId)}?saved=1`);
+});
+
+/**
+ * Recuperation manuelle d'un dossier mal classifie: un vrai email client
+ * marque a tort "sans suite requise" (ex: confondu avec une newsletter) n'a
+ * jamais reçu d'accuse ni de brouillons. Cette route reprend le fil depuis
+ * la messagerie, applique la categorie choisie par l'admin, et declenche
+ * l'accuse + les 3 brouillons comme si la classification avait ete bonne
+ * des le depart.
+ */
+app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  const threadRow = getThreadRow(threadId);
+  const body = req.body as Record<string, string>;
+  if (threadRow && body.categoryId) {
+    try {
+      const connector = createEmailConnector();
+      const thread = await connector.getThread(threadId);
+      const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
+      if (!lastInbound) throw new Error("Aucun message entrant trouve dans ce fil.");
+      const category = getCategory(body.categoryId);
+      const dueAt = new Date(Date.now() + category.slaHours * 3600_000).toISOString();
+      upsertThreadReceived({
+        threadId,
+        subject: threadRow.subject,
+        senderEmail: lastInbound.from.email,
+        senderName: lastInbound.from.name ?? null,
+        categoryId: category.id,
+        urgency: threadRow.urgency,
+        slaHours: category.slaHours,
+        status: "received",
+        dueAt,
+      });
+      await sendAcknowledgementAndDrafts(connector, thread, lastInbound, category);
+    } catch (err) {
+      console.error(`[traitement manuel] erreur sur le dossier ${threadId}:`, err);
+      recordPipelineError("manual_override", threadId, (err as Error).message);
+    }
+  }
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 });
 
 // ---------- Reglages (categories + sequences de relance) ----------
@@ -300,7 +367,7 @@ app.post("/reglages/categories/:id/relance-steps", requireCsrf, (req: Request, r
   const categoryId = req.params.id;
   const existing = getCategoryRelanceSteps(categoryId);
   const parsed = parseStep(req.body as Record<string, string>);
-  addCategoryRelanceStep(categoryId, { ...parsed, delayHours: clampAfterLastStep(existing, parsed.delayHours) });
+  addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
   res.redirect("/reglages?saved=1");
 });
 
@@ -518,7 +585,7 @@ function sharedStyles(primaryColor: string): string {
   }
   .step-item .step-order { font-family: var(--font-mono); color: var(--ink-faint); font-size: 12px; width: 18px; }
   .step-item .step-delay { font-family: var(--font-mono); font-weight: 600; min-width: 52px; }
-  .step-item .step-hours { color: var(--ink-faint); font-size: 11px; }
+  .step-item .step-raw { color: var(--ink-faint); font-size: 11px; }
   .step-item form { margin-left: auto; }
   .step-add-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .step-add-form select, .step-add-form input[type=number] {
@@ -554,10 +621,11 @@ function csrfField(csrfToken: string | undefined): string {
   return `<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken ?? "")}" />`;
 }
 
-function formatDelay(hours: number): string {
-  if (hours === 0) return "immédiat";
-  if (hours < 24) return `+${trimNumber(hours)}h`;
-  return `J+${trimNumber(hours / 24)}`;
+function formatDelay(minutes: number): string {
+  if (minutes === 0) return "immédiat";
+  if (minutes < 60) return `+${trimNumber(minutes)}min`;
+  if (minutes < 1440) return `+${trimNumber(minutes / 60)}h`;
+  return `J+${trimNumber(minutes / 1440)}`;
 }
 
 function trimNumber(n: number): string {
@@ -809,6 +877,11 @@ function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefine
 
   const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id);
   const draftCount = listDraftsForThread(thread.thread_id).length;
+  const nextStep = steps[thread.relance_count];
+  const canTriggerNow =
+    thread.due_at !== null &&
+    ["ack_sent", "drafts_ready", "relance_sent"].includes(thread.status) &&
+    Boolean(nextStep);
 
   const header = `
     <div class="detail-header">
@@ -824,6 +897,15 @@ function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefine
         <div class="ledger-fact"><span class="fact-label">Brouillons déposés</span><span class="fact-value">${draftCount}</span></div>
       </div>
       <div class="detail-actions">
+        ${
+          canTriggerNow
+            ? `<form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relancer-maintenant"
+                     onsubmit="return confirm('Declencher l\\'etape ${nextStep!.order} (${escapeHtml(channelLabel(nextStep!.channel))}) maintenant, sans attendre l\\'echeance ?');">
+                 ${csrfField(csrfToken)}
+                 <button class="btn btn-primary btn-sm" type="submit">Déclencher la relance maintenant</button>
+               </form>`
+            : ""
+        }
         ${
           canClose
             ? `<form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/cloturer">
@@ -878,7 +960,7 @@ function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefine
     ? `<form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps">
         ${csrfField(csrfToken)}
         ${stepTypeSelect()}
-        <input type="number" name="delayHours" min="0" step="0.5" placeholder="Délai (h)" required />
+        <input type="number" name="delayMinutes" min="0" step="1" placeholder="Délai (min)" required />
         <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
       </form>`
     : "";
@@ -892,11 +974,34 @@ function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefine
       ${addForm}
     </div>`;
 
+  const misclassifiedSection =
+    thread.status === "skipped"
+      ? `<div class="settings-section">
+          <div class="banner banner-error" style="margin-bottom: 14px;">
+            Classé « sans suite requise » — aucun accusé n'a été envoyé. Si c'est une erreur
+            (un vrai message classé par erreur en newsletter/spam/interne), choisissez la bonne
+            catégorie ci-dessous pour envoyer l'accusé et générer les 3 brouillons maintenant.
+          </div>
+          <form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/traiter">
+            ${csrfField(csrfToken)}
+            <select name="categoryId">
+              ${listCategories()
+                .map(
+                  (c) =>
+                    `<option value="${escapeHtml(c.id)}" ${c.id === thread.category_id ? "selected" : ""}>${escapeHtml(c.label)}</option>`
+                )
+                .join("")}
+            </select>
+            <button class="btn btn-primary btn-sm" type="submit">Traiter ce dossier</button>
+          </form>
+        </div>`
+      : "";
+
   return pageShell(
     "dossiers",
     "Dossier",
     "Détail du dossier, statut de traitement, et séquence de relance appliquée.",
-    banner + header + stepsSection,
+    banner + header + misclassifiedSection + stepsSection,
     "/dossiers"
   );
 }
@@ -930,8 +1035,8 @@ function renderStepList(opts: {
         : "";
       return `<div class="step-item">
         <span class="step-order">${step.order}.</span>
-        <span class="step-delay">${escapeHtml(formatDelay(step.delayHours))}</span>
-        <span class="step-hours">(${step.delayHours}h)</span>
+        <span class="step-delay">${escapeHtml(formatDelay(step.delayMinutes))}</span>
+        <span class="step-raw">(${step.delayMinutes} min)</span>
         <span class="stamp ${stampClass}">${escapeHtml(channelLabel(step.channel))}</span>
         ${done ? `<span class="stamp stamp-done">Effectuée</span>` : ""}
         ${deleteForm}
@@ -976,7 +1081,7 @@ function renderReglagesPage(categories: CategoryConfig[], csrfToken: string | un
           <form class="step-add-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}/relance-steps">
             ${csrfField(csrfToken)}
             ${stepTypeSelect()}
-            <input type="number" name="delayHours" min="0" step="0.5" placeholder="Délai (h)" required />
+            <input type="number" name="delayMinutes" min="0" step="1" placeholder="Délai (min)" required />
             <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
           </form>
         </div>

@@ -16,7 +16,7 @@ import type { EmailConnector, RelanceStep } from "../types.js";
 /**
  * Verifie, pour chaque dossier ouvert, si la prochaine etape de sa sequence
  * de relance (celle du dossier si une surcharge existe, sinon celle de sa
- * categorie) est arrivee a echeance (due_at + delayHours de l'etape).
+ * categorie) est arrivee a echeance (due_at + delayMinutes de l'etape).
  * relance_count sert d'index dans la sequence: chaque execution — qu'elle
  * soit un simple rappel interne journalise ou une relance externe envoyee
  * au demandeur, selon le "channel" de l'etape — avance au dossier a
@@ -32,7 +32,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
     const nextStep = steps[row.relance_count];
     if (!nextStep) continue;
 
-    const fireAt = new Date(row.due_at).getTime() + nextStep.delayHours * 3600_000;
+    const fireAt = new Date(row.due_at).getTime() + nextStep.delayMinutes * 60_000;
     if (now < fireAt) continue;
 
     // Isole chaque dossier: un echec (Claude, API email, dossier corrompu)
@@ -46,7 +46,8 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
   }
 }
 
-async function checkThread(connector: EmailConnector, row: ThreadRow, step: RelanceStep): Promise<void> {
+/** Exportee pour permettre un declenchement manuel immediat d'une seule etape depuis l'UI admin (voir web/server.ts). */
+export async function checkThread(connector: EmailConnector, row: ThreadRow, step: RelanceStep): Promise<void> {
   const thread = await connector.getThread(row.thread_id);
 
   const repliedAfterAck =
@@ -84,7 +85,7 @@ async function checkThread(connector: EmailConnector, row: ThreadRow, step: Rela
   recordReminder(
     row.thread_id,
     "internal",
-    `Dossier "${row.subject}" en attente depuis plus de ${step.delayHours}h apres l'echeance — aucune reponse envoyee.`
+    `Dossier "${row.subject}" en attente depuis plus de ${step.delayMinutes} min apres l'echeance — aucune reponse envoyee.`
   );
   console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
 }

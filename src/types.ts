@@ -49,16 +49,19 @@ export interface CategoryConfig {
 export type RelanceChannel = "internal" | "external";
 
 /**
- * Une etape d'une sequence de relance: se declenche a due_at + delayHours,
+ * Une etape d'une sequence de relance: se declenche a due_at + delayMinutes,
  * "internal" ne fait que journaliser un rappel, "external" envoie une
  * relance au demandeur. Une sequence appartient soit a une categorie
  * (comportement par defaut), soit a un dossier precis (surcharge qui
  * remplace entierement la sequence de la categorie pour ce dossier).
+ * En minutes (pas en heures) pour permettre des delais courts en test
+ * sans attendre des heures, tout en restant utilisable en production
+ * (1440 = 1 jour).
  */
 export interface RelanceStep {
   order: number;
   channel: RelanceChannel;
-  delayHours: number;
+  delayMinutes: number;
 }
 
 export interface ClassificationResult {

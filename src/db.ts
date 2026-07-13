@@ -63,7 +63,8 @@ db.exec(`
     owner_id TEXT NOT NULL,
     step_order INTEGER NOT NULL,
     channel TEXT NOT NULL CHECK (channel IN ('internal', 'external')),
-    delay_hours REAL NOT NULL,
+    delay_hours REAL,
+    delay_minutes REAL,
     UNIQUE(owner_type, owner_id, step_order)
   );
 
@@ -76,7 +77,23 @@ db.exec(`
   );
 `);
 
+ensureDelayMinutesColumn();
 seedIfNeeded();
+
+/**
+ * Migration additive: les deploiements anterieurs a la bascule heures->minutes
+ * n'ont que delay_hours. Ajoute delay_minutes si absente (ALTER TABLE ADD
+ * COLUMN, sans danger sur une table existante) et retro-remplit a partir de
+ * delay_hours * 60 pour ne pas perdre les sequences deja configurees.
+ */
+function ensureDelayMinutesColumn(): void {
+  const columns = db.prepare("PRAGMA table_info(relance_steps)").all() as unknown as {
+    name: string;
+  }[];
+  if (columns.some((c) => c.name === "delay_minutes")) return;
+  db.exec("ALTER TABLE relance_steps ADD COLUMN delay_minutes REAL");
+  db.exec("UPDATE relance_steps SET delay_minutes = delay_hours * 60 WHERE delay_minutes IS NULL");
+}
 
 /** Forme du fichier JSON d'amorçage historique (config/categories.json) — figee, distincte du modele runtime actuel. */
 interface CategoriesSeedFile {
@@ -124,13 +141,14 @@ function seedIfNeeded(): void {
       const fromSeed = seedById.get(categoryId);
       const steps = fromSeed
         ? [
-            { channel: "internal" as const, delayHours: seed.relance.internalReminderAfterHours },
+            { channel: "internal" as const, delayMinutes: seed.relance.internalReminderAfterHours * 60 },
             {
               channel: fromSeed.allowExternalRelance ? ("external" as const) : ("internal" as const),
-              delayHours: seed.relance.internalReminderAfterHours + seed.relance.externalRelanceAfterHours,
+              delayMinutes:
+                (seed.relance.internalReminderAfterHours + seed.relance.externalRelanceAfterHours) * 60,
             },
           ]
-        : [{ channel: "internal" as const, delayHours: 24 }];
+        : [{ channel: "internal" as const, delayMinutes: 24 * 60 }];
       writeSteps("category", categoryId, steps);
     }
   }
@@ -324,33 +342,33 @@ export function updateCategory(
 interface RelanceStepRow {
   step_order: number;
   channel: string;
-  delay_hours: number;
+  delay_minutes: number;
 }
 
 function readSteps(ownerType: "category" | "thread", ownerId: string): RelanceStep[] {
   const rows = db
     .prepare(
-      "SELECT step_order, channel, delay_hours FROM relance_steps WHERE owner_type = ? AND owner_id = ? ORDER BY step_order ASC"
+      "SELECT step_order, channel, delay_minutes FROM relance_steps WHERE owner_type = ? AND owner_id = ? ORDER BY step_order ASC"
     )
     .all(ownerType, ownerId) as unknown as RelanceStepRow[];
   return rows.map((r) => ({
     order: r.step_order,
     channel: r.channel as RelanceChannel,
-    delayHours: r.delay_hours,
+    delayMinutes: r.delay_minutes,
   }));
 }
 
 function writeSteps(
   ownerType: "category" | "thread",
   ownerId: string,
-  steps: Array<{ channel: RelanceChannel; delayHours: number }>
+  steps: Array<{ channel: RelanceChannel; delayMinutes: number }>
 ): void {
   db.prepare("DELETE FROM relance_steps WHERE owner_type = ? AND owner_id = ?").run(ownerType, ownerId);
   const insert = db.prepare(
-    "INSERT INTO relance_steps (owner_type, owner_id, step_order, channel, delay_hours) VALUES (?, ?, ?, ?, ?)"
+    "INSERT INTO relance_steps (owner_type, owner_id, step_order, channel, delay_minutes) VALUES (?, ?, ?, ?, ?)"
   );
   steps.forEach((step, index) => {
-    insert.run(ownerType, ownerId, index + 1, step.channel, step.delayHours);
+    insert.run(ownerType, ownerId, index + 1, step.channel, step.delayMinutes);
   });
 }
 
@@ -360,7 +378,7 @@ export function getCategoryRelanceSteps(categoryId: string): RelanceStep[] {
 
 export function addCategoryRelanceStep(
   categoryId: string,
-  step: { channel: RelanceChannel; delayHours: number }
+  step: { channel: RelanceChannel; delayMinutes: number }
 ): void {
   writeSteps("category", categoryId, [...readSteps("category", categoryId), step]);
 }
@@ -386,7 +404,7 @@ export function getThreadRelanceOverride(threadId: string): RelanceStep[] {
 
 export function addThreadRelanceStep(
   threadId: string,
-  step: { channel: RelanceChannel; delayHours: number }
+  step: { channel: RelanceChannel; delayMinutes: number }
 ): void {
   writeSteps("thread", threadId, [...readSteps("thread", threadId), step]);
 }
