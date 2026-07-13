@@ -41,6 +41,10 @@ export const config = {
   // repos. Generer avec: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   // Si absente, les jetons restent en clair sur disque (avertissement au demarrage).
   encryptionKey: process.env.ENCRYPTION_KEY ?? "",
+  // Destinataire des rappels internes (email). Vide par defaut: la
+  // notification part alors vers la messagerie connectee elle-meme, comme
+  // un pense-bete dans sa propre boite plutot que dans le vide.
+  notificationEmail: process.env.NOTIFICATION_EMAIL ?? "",
   auth: {
     username: process.env.SETUP_USERNAME ?? "",
     // Format "salt:hash" genere par `npm run auth:hash-password -- "motdepasse"`.

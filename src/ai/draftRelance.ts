@@ -11,6 +11,14 @@ export interface RelanceDraft {
   body: string;
 }
 
+/**
+ * "pre_reply": personne chez nous n'a encore repondu de fond au client —
+ * relance qui rassure ("toujours en cours de traitement"). "post_reply":
+ * un humain a deja envoye une reponse de fond (ex: le devis) et le client
+ * reste silencieux — relance qui fait un suivi sur cette reponse precise.
+ */
+export type RelancePhase = "pre_reply" | "post_reply";
+
 const relanceSchema = z.object({
   subject: z.string().min(1),
   body: z.string().min(1),
@@ -18,36 +26,21 @@ const relanceSchema = z.object({
 
 export async function draftRelance(
   thread: EmailThread,
-  lastInbound: EmailMessage,
-  category: CategoryConfig
+  anchorMessage: EmailMessage,
+  category: CategoryConfig,
+  phase: RelancePhase = "pre_reply"
 ): Promise<RelanceDraft> {
-  return withRetry(() => draftRelanceOnce(thread, lastInbound, category));
+  return withRetry(() => draftRelanceOnce(thread, anchorMessage, category, phase));
 }
 
 async function draftRelanceOnce(
   thread: EmailThread,
-  lastInbound: EmailMessage,
-  category: CategoryConfig
+  anchorMessage: EmailMessage,
+  category: CategoryConfig,
+  phase: RelancePhase
 ): Promise<RelanceDraft> {
   const client = getClient();
   const brandVoice = loadBrandVoice();
-
-  // Le fil complet (formatThreadContext ci-dessous) contient deja nos
-  // messages precedents, mais noyes dans l'historique general — on extrait
-  // et met en avant explicitement le dernier message QUE NOUS avons envoye
-  // (accuse ou relance precedente) pour que chaque relance s'appuie dessus
-  // et assure une continuite naturelle, plutot que de repartir de zero a
-  // chaque fois.
-  const lastOutbound = [...thread.messages].reverse().find((m) => m.isFromUs);
-  const continuityBlock = lastOutbound
-    ? [
-        "",
-        "Notre dernier message envoye a ce demandeur dans ce fil (a ne pas repeter mot pour",
-        "mot, mais dont tu dois assurer la continuite naturelle — ne pas redemander une",
-        "information deja demandee ici, ne pas repeter une promesse deja faite):",
-        `"""${lastOutbound.bodyText.slice(0, 2000)}"""`,
-      ]
-    : [];
 
   const tool: Anthropic.Tool = {
     name: "write_relance",
@@ -62,26 +55,65 @@ async function draftRelanceOnce(
     },
   };
 
+  const system =
+    phase === "post_reply"
+      ? [
+          "Tu rediges un email de relance, en francais, pour un client qui n'a pas repondu",
+          "a notre reponse de fond precedente (ex: un devis envoye).",
+          "",
+          "IMPORTANT: le message affiche ci-dessous comme \"Nouveau message a traiter\" est",
+          "NOTRE PROPRE dernier message envoye au client, pas le sien. Ne redige pas une",
+          "reponse a ce message: redige une relance A SON SUJET, adressee au client, qui",
+          "fait suite a ce que nous lui avons deja envoye.",
+          "",
+          brandVoice,
+          "",
+          "Regles:",
+          "- Ton courtois, jamais insistant ni culpabilisant.",
+          "- Rappelle brievement l'objet de notre reponse precedente (ex: le devis envoye),",
+          "  sans en repeter le contenu detaille.",
+          "- Demande si le client a des questions ou une decision a partager, sans mettre",
+          "  la pression ni fixer d'ultimatum.",
+          `- Cette demande relevait de la categorie "${category.label}".`,
+        ].join("\n")
+      : (() => {
+          // pre_reply: on met en avant notre dernier message envoye (accuse ou
+          // relance precedente) pour que chaque relance assure une continuite
+          // naturelle plutot que de repartir de zero a chaque fois.
+          const lastOutbound = [...thread.messages].reverse().find((m) => m.isFromUs);
+          const continuityBlock = lastOutbound
+            ? [
+                "",
+                "Notre dernier message envoye a ce demandeur dans ce fil (a ne pas repeter mot",
+                "pour mot, mais dont tu dois assurer la continuite naturelle — ne pas",
+                "redemander une information deja demandee ici, ne pas repeter une promesse",
+                "deja faite):",
+                `"""${lastOutbound.bodyText.slice(0, 2000)}"""`,
+              ]
+            : [];
+          return [
+            "Tu rediges un email de relance, en francais, pour un dossier client reste sans",
+            "reponse malgre l'accuse de reception deja envoye.",
+            "",
+            brandVoice,
+            "",
+            "Regles:",
+            "- Ton courtois, jamais culpabilisant envers le destinataire.",
+            "- Rappelle brievement l'objet de la demande initiale.",
+            "- Indique que le dossier est toujours en cours de traitement.",
+            "- Ne promets pas de nouveau delai precis s'il n'est pas confirme.",
+            `- Cette demande relevait de la categorie "${category.label}".`,
+            ...continuityBlock,
+          ].join("\n");
+        })();
+
   const response = await client.messages.create({
     model: CLAUDE_MODEL,
     max_tokens: 700,
-    system: [
-      "Tu rediges un email de relance, en francais, pour un dossier client reste sans",
-      "reponse malgre l'accuse de reception deja envoye.",
-      "",
-      brandVoice,
-      "",
-      "Regles:",
-      "- Ton courtois, jamais culpabilisant envers le destinataire.",
-      "- Rappelle brievement l'objet de la demande initiale.",
-      "- Indique que le dossier est toujours en cours de traitement.",
-      "- Ne promets pas de nouveau delai precis s'il n'est pas confirme.",
-      `- Cette demande relevait de la categorie "${category.label}".`,
-      ...continuityBlock,
-    ].join("\n"),
+    system,
     tools: [tool],
     tool_choice: { type: "tool", name: "write_relance" },
-    messages: [{ role: "user", content: formatThreadContext(thread, lastInbound) }],
+    messages: [{ role: "user", content: formatThreadContext(thread, anchorMessage) }],
   });
 
   const toolUse = response.content.find(

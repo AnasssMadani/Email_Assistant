@@ -1,26 +1,37 @@
+import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { draftRelance } from "../ai/draftRelance.js";
 import { cleanupUnusedDrafts } from "./draftCleanup.js";
 import { buildReplySubject } from "../utils.js";
 import {
   getEffectiveRelanceSteps,
+  incrementPostReplyRelance,
   incrementRelance,
+  listThreadsAwaitingClientReply,
   listThreadsAwaitingReply,
   recordPipelineError,
   recordReminder,
+  setThreadHumanReplied,
   setThreadStatus,
   type ThreadRow,
 } from "../db.js";
 import type { EmailConnector, RelanceStep } from "../types.js";
 
 /**
- * Verifie, pour chaque dossier ouvert, si la prochaine etape de sa sequence
- * de relance (celle du dossier si une surcharge existe, sinon celle de sa
- * categorie) est arrivee a echeance (due_at + delayMinutes de l'etape).
- * relance_count sert d'index dans la sequence: chaque execution — qu'elle
- * soit un simple rappel interne journalise ou une relance externe envoyee
- * au demandeur, selon le "channel" de l'etape — avance au dossier a
- * l'etape suivante. Une sequence vide ou epuisee ne declenche plus rien.
+ * Deux boucles independantes, une par phase du cycle de vie d'un dossier:
+ *
+ * 1. "pre_reply" — personne chez nous n'a encore repondu de fond au client.
+ *    On nudge notre equipe (rappel interne) puis, si ca continue, on
+ *    rassure le client (relance externe generique "toujours en cours").
+ *    S'arrete des qu'un humain envoie une reponse de fond.
+ *
+ * 2. "post_reply" — un humain a envoye une reponse de fond (ex: le devis).
+ *    On attend maintenant la reponse DU CLIENT a ce message. S'il reste
+ *    silencieux, on le relance lui, en reference a ce qu'on lui a envoye.
+ *    S'arrete des que le client repond.
+ *
+ * Chaque etape (des deux sequences) se declenche a son propre ancrage +
+ * son delai: due_at pour pre_reply, human_replied_at pour post_reply.
  */
 export async function runRelanceCheck(connector: EmailConnector): Promise<void> {
   const now = Date.now();
@@ -28,26 +39,46 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
   for (const row of listThreadsAwaitingReply()) {
     if (!row.due_at) continue;
 
-    const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id);
+    const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "pre_reply");
     const nextStep = steps[row.relance_count];
     if (!nextStep) continue;
 
     const fireAt = new Date(row.due_at).getTime() + nextStep.delayMinutes * 60_000;
     if (now < fireAt) continue;
 
-    // Isole chaque dossier: un echec (Claude, API email, dossier corrompu)
-    // ne doit jamais empecher la verification des autres dossiers du cycle.
     try {
-      await checkThread(connector, row, nextStep);
+      await checkPreReplyThread(connector, row, nextStep);
     } catch (err) {
       console.error(`[verification relances] erreur sur le dossier ${row.thread_id}:`, err);
       recordPipelineError("relance_check", row.thread_id, (err as Error).message);
     }
   }
+
+  for (const row of listThreadsAwaitingClientReply()) {
+    if (!row.human_replied_at) continue;
+
+    const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "post_reply");
+    const nextStep = steps[row.post_reply_relance_count];
+    if (!nextStep) continue;
+
+    const fireAt = new Date(row.human_replied_at).getTime() + nextStep.delayMinutes * 60_000;
+    if (now < fireAt) continue;
+
+    try {
+      await checkPostReplyThread(connector, row, nextStep);
+    } catch (err) {
+      console.error(`[verification relances post-reponse] erreur sur le dossier ${row.thread_id}:`, err);
+      recordPipelineError("relance_check", row.thread_id, (err as Error).message);
+    }
+  }
 }
 
-/** Exportee pour permettre un declenchement manuel immediat d'une seule etape depuis l'UI admin (voir web/server.ts). */
-export async function checkThread(connector: EmailConnector, row: ThreadRow, step: RelanceStep): Promise<void> {
+/** Exportee pour permettre un declenchement manuel immediat depuis l'UI admin (voir web/server.ts). */
+export async function checkPreReplyThread(
+  connector: EmailConnector,
+  row: ThreadRow,
+  step: RelanceStep
+): Promise<void> {
   const thread = await connector.getThread(row.thread_id);
 
   const repliedAfterAck =
@@ -57,17 +88,26 @@ export async function checkThread(connector: EmailConnector, row: ThreadRow, ste
     );
 
   if (repliedAfterAck) {
-    setThreadStatus(row.thread_id, "responded");
+    // Un humain vient de repondre de fond: ce n'est plus "notre equipe est
+    // en retard", c'est desormais "on attend le client" — nouvelle phase.
+    setThreadHumanReplied(row.thread_id);
     await cleanupUnusedDrafts(connector, row.thread_id);
     return;
   }
 
   if (step.channel === "external") {
     const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
-    if (!lastInbound) return;
+    if (!lastInbound) {
+      recordPipelineError(
+        "relance_check",
+        row.thread_id,
+        "Relance externe annulee: aucun message entrant trouve dans le fil recupere depuis la messagerie."
+      );
+      return;
+    }
 
     const category = getCategory(row.category_id);
-    const relance = await draftRelance(thread, lastInbound, category);
+    const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
     await connector.sendReply({
       threadId: row.thread_id,
       to: row.sender_email,
@@ -81,11 +121,93 @@ export async function checkThread(connector: EmailConnector, row: ThreadRow, ste
     return;
   }
 
+  const note = `Dossier "${row.subject}" en attente depuis plus de ${step.delayMinutes} min apres l'echeance — aucune reponse envoyee.`;
+  await sendInternalNotification(connector, row, note);
   incrementRelance(row.thread_id, row.status);
-  recordReminder(
-    row.thread_id,
-    "internal",
-    `Dossier "${row.subject}" en attente depuis plus de ${step.delayMinutes} min apres l'echeance — aucune reponse envoyee.`
-  );
+  recordReminder(row.thread_id, "internal", note);
   console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
+}
+
+/** Exportee pour permettre un declenchement manuel immediat depuis l'UI admin (voir web/server.ts). */
+export async function checkPostReplyThread(
+  connector: EmailConnector,
+  row: ThreadRow,
+  step: RelanceStep
+): Promise<void> {
+  const thread = await connector.getThread(row.thread_id);
+
+  const clientRepliedAfterOurReply =
+    row.human_replied_at !== null &&
+    thread.messages.some(
+      (m) => !m.isFromUs && m.receivedAt.getTime() > new Date(row.human_replied_at as string).getTime()
+    );
+
+  if (clientRepliedAfterOurReply) {
+    setThreadStatus(row.thread_id, "responded");
+    return;
+  }
+
+  if (step.channel === "external") {
+    const lastOutbound = [...thread.messages].reverse().find((m) => m.isFromUs);
+    if (!lastOutbound) {
+      recordPipelineError(
+        "relance_check",
+        row.thread_id,
+        "Relance post-reponse annulee: aucun message sortant trouve dans le fil recupere depuis la messagerie."
+      );
+      return;
+    }
+
+    const category = getCategory(row.category_id);
+    const relance = await draftRelance(thread, lastOutbound, category, "post_reply");
+    await connector.sendReply({
+      threadId: row.thread_id,
+      to: row.sender_email,
+      subject: buildReplySubject(row.subject),
+      bodyText: relance.body,
+      inReplyToMessageId: lastOutbound.rfcMessageId,
+    });
+    incrementPostReplyRelance(row.thread_id, "relance_sent");
+    recordReminder(row.thread_id, "external", "Relance post-reponse envoyee au client (suivi de notre reponse).");
+    console.log(`[relance post-reponse] ${row.sender_email} — "${row.subject}"`);
+    return;
+  }
+
+  const note = `Dossier "${row.subject}": client silencieux depuis plus de ${step.delayMinutes} min apres notre reponse.`;
+  await sendInternalNotification(connector, row, note);
+  incrementPostReplyRelance(row.thread_id, row.status);
+  recordReminder(row.thread_id, "internal", note);
+  console.log(`[rappel interne post-reponse] "${row.subject}" — client silencieux.`);
+}
+
+/**
+ * Envoie une vraie notification email pour un rappel interne — auparavant
+ * seulement journalise en base (invisible sans ouvrir l'application). Part
+ * vers NOTIFICATION_EMAIL si defini, sinon vers la messagerie connectee
+ * elle-meme (un pense-bete dans sa propre boite). Best-effort: un echec
+ * d'envoi ne doit pas empecher le rappel d'etre journalise normalement.
+ */
+async function sendInternalNotification(connector: EmailConnector, row: ThreadRow, note: string): Promise<void> {
+  try {
+    const ownEmail = await connector.getOwnEmailAddress();
+    const to = config.notificationEmail || ownEmail;
+    await connector.sendNotification({
+      to,
+      subject: `[Rappel] ${row.subject}`,
+      bodyText: [
+        note,
+        "",
+        `Client: ${row.sender_name ? `${row.sender_name} ` : ""}<${row.sender_email}>`,
+        `Categorie: ${row.category_id}`,
+        "",
+        "Ouvrez le dossier dans l'application (onglet Registre des dossiers) pour le traiter.",
+      ].join("\n"),
+    });
+  } catch (err) {
+    recordPipelineError(
+      "relance_check",
+      row.thread_id,
+      `Echec envoi de la notification de rappel interne: ${(err as Error).message}`
+    );
+  }
 }

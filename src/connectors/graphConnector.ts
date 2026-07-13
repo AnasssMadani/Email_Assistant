@@ -1,5 +1,11 @@
 import { getValidGraphAccessToken } from "./graphAuth.js";
-import type { EmailConnector, EmailMessage, EmailThread, SendReplyParams } from "../types.js";
+import type {
+  EmailConnector,
+  EmailMessage,
+  EmailThread,
+  NotificationParams,
+  SendReplyParams,
+} from "../types.js";
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
@@ -156,5 +162,21 @@ export class GraphConnector implements EmailConnector {
       if ((err as Error).message.includes("-> 404:")) return;
       throw err;
     }
+  }
+
+  async sendNotification(params: NotificationParams): Promise<{ id: string }> {
+    // Pas de conversationId: notification autonome, pas une reponse dans le
+    // fil du client. sendMail repond 202 Accepted sans corps (id inconnu).
+    await graphFetch("/me/sendMail", {
+      method: "POST",
+      body: JSON.stringify({
+        message: {
+          subject: params.subject,
+          body: { contentType: "Text", content: params.bodyText },
+          toRecipients: [{ emailAddress: { address: params.to } }],
+        },
+      }),
+    });
+    return { id: "" };
   }
 }

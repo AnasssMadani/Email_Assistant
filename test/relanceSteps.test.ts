@@ -9,7 +9,11 @@ import {
   deleteThreadData,
   getCategoryRelanceSteps,
   getEffectiveRelanceSteps,
+  getThreadRow,
   hasThreadRelanceOverride,
+  incrementPostReplyRelance,
+  listThreadsAwaitingClientReply,
+  setThreadHumanReplied,
   upsertThreadReceived,
 } from "../src/db.js";
 
@@ -114,4 +118,68 @@ test("deleteThreadData removes a dossier's custom relance override", () => {
 
   deleteThreadData("t-delete");
   assert.equal(hasThreadRelanceOverride("t-delete"), false);
+});
+
+test("pre_reply and post_reply sequences for the same category are independent", () => {
+  const preSteps = getCategoryRelanceSteps("devis", "pre_reply");
+  const postSteps = getCategoryRelanceSteps("devis", "post_reply");
+  assert.ok(preSteps.length > 0);
+  assert.ok(postSteps.length > 0);
+  assert.notDeepEqual(preSteps, postSteps);
+
+  addCategoryRelanceStep("devis", { channel: "external", delayMinutes: 99999 }, "post_reply");
+  const preAfter = getCategoryRelanceSteps("devis", "pre_reply");
+  const postAfter = getCategoryRelanceSteps("devis", "post_reply");
+  assert.deepEqual(preAfter, preSteps);
+  assert.equal(postAfter.length, postSteps.length + 1);
+});
+
+test("a thread-scoped post_reply override does not affect the pre_reply sequence", () => {
+  upsertThreadReceived({
+    threadId: "t-two-phase",
+    subject: "Test",
+    senderEmail: "e@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaHours: 24,
+    status: "ack_sent",
+    dueAt: new Date().toISOString(),
+  });
+
+  addThreadRelanceStep("t-two-phase", { channel: "external", delayMinutes: 4320 }, "post_reply");
+
+  const preReply = getEffectiveRelanceSteps("t-two-phase", "devis", "pre_reply");
+  const postReply = getEffectiveRelanceSteps("t-two-phase", "devis", "post_reply");
+  assert.equal(preReply.isCustom, false);
+  assert.equal(postReply.isCustom, true);
+  assert.equal(postReply.steps.length, 1);
+  assert.equal(postReply.steps[0].delayMinutes, 4320);
+});
+
+test("setThreadHumanReplied transitions a dossier into awaiting_client_reply", () => {
+  upsertThreadReceived({
+    threadId: "t-human-replied",
+    subject: "Devis conteneur",
+    senderEmail: "f@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaHours: 24,
+    status: "ack_sent",
+    dueAt: new Date().toISOString(),
+  });
+
+  setThreadHumanReplied("t-human-replied");
+  const row = getThreadRow("t-human-replied");
+  assert.equal(row?.status, "awaiting_client_reply");
+  assert.ok(row?.human_replied_at);
+
+  const awaiting = listThreadsAwaitingClientReply();
+  assert.ok(awaiting.some((r) => r.thread_id === "t-human-replied"));
+
+  incrementPostReplyRelance("t-human-replied", "relance_sent");
+  const updated = getThreadRow("t-human-replied");
+  assert.equal(updated?.post_reply_relance_count, 1);
+  assert.equal(updated?.status, "relance_sent");
 });

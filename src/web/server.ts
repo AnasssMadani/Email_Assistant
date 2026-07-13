@@ -8,7 +8,7 @@ import { GmailConnector } from "../connectors/gmailConnector.js";
 import { GraphConnector } from "../connectors/graphConnector.js";
 import { createEmailConnector } from "../connectors/index.js";
 import { cleanupUnusedDrafts } from "../pipeline/draftCleanup.js";
-import { checkThread } from "../pipeline/relanceCheck.js";
+import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCheck.js";
 import { sendAcknowledgementAndDrafts } from "../pipeline/processIncoming.js";
 import { getCategory } from "../settings.js";
 import {
@@ -33,6 +33,7 @@ import {
   updateCategory,
   upsertThreadReceived,
   type PipelineErrorRow,
+  type RelancePhase,
   type ReminderRow,
   type ThreadRow,
 } from "../db.js";
@@ -250,11 +251,18 @@ app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Req
   const threadId = req.params.threadId;
   const thread = getThreadRow(threadId);
   if (thread) {
-    const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id);
-    const nextStep = steps[thread.relance_count];
+    const isPostReply = thread.status === "awaiting_client_reply";
+    const phase = isPostReply ? "post_reply" : "pre_reply";
+    const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id, phase);
+    const nextStep = steps[isPostReply ? thread.post_reply_relance_count : thread.relance_count];
     if (nextStep) {
       try {
-        await checkThread(createEmailConnector(), thread, nextStep);
+        const connector = createEmailConnector();
+        if (isPostReply) {
+          await checkPostReplyThread(connector, thread, nextStep);
+        } else {
+          await checkPreReplyThread(connector, thread, nextStep);
+        }
       } catch (err) {
         console.error(`[relance manuelle] erreur sur le dossier ${threadId}:`, err);
         recordPipelineError("relance_check", threadId, (err as Error).message);
@@ -286,42 +294,51 @@ function runOrRedirectError(res: Response, context: string, threadId: string, ac
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 }
 
+function phaseFromBody(body: Record<string, string>): RelancePhase {
+  return body.phase === "post_reply" ? "post_reply" : "pre_reply";
+}
+
 app.post("/dossiers/:threadId/relance-steps", requireCsrf, (req: Request, res: Response) => {
   const threadId = req.params.threadId;
+  const body = req.body as Record<string, string>;
+  const phase = phaseFromBody(body);
   runOrRedirectError(res, "relance_step_add", threadId, () => {
     // Le clamp doit porter sur la propre sequence du dossier (vide au premier
     // ajout), pas sur celle de la categorie de repli — sinon la premiere etape
     // d'une nouvelle surcharge se retrouve poussee au delai de la derniere
     // etape de la categorie au lieu de rester libre.
-    const existing = getThreadRelanceOverride(threadId);
-    const parsed = parseStep(req.body as Record<string, string>);
-    addThreadRelanceStep(threadId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
+    const existing = getThreadRelanceOverride(threadId, phase);
+    const parsed = parseStep(body);
+    addThreadRelanceStep(threadId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) }, phase);
   });
 });
 
 app.post("/dossiers/:threadId/relance-steps/personnaliser", requireCsrf, (req: Request, res: Response) => {
   const threadId = req.params.threadId;
+  const phase = phaseFromBody(req.body as Record<string, string>);
   runOrRedirectError(res, "relance_step_personnaliser", threadId, () => {
     const thread = getThreadRow(threadId);
-    if (thread && !hasThreadRelanceOverride(threadId)) {
-      const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id);
+    if (thread && !hasThreadRelanceOverride(threadId, phase)) {
+      const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id, phase);
       const base = steps.length > 0 ? steps : [{ channel: "internal" as const, delayMinutes: 1440 }];
-      for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayMinutes: step.delayMinutes });
+      for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayMinutes: step.delayMinutes }, phase);
     }
   });
 });
 
 app.post("/dossiers/:threadId/relance-steps/reset", requireCsrf, (req: Request, res: Response) => {
   const threadId = req.params.threadId;
+  const phase = phaseFromBody(req.body as Record<string, string>);
   runOrRedirectError(res, "relance_step_reset", threadId, () => {
-    clearThreadRelanceOverride(threadId);
+    clearThreadRelanceOverride(threadId, phase);
   });
 });
 
 app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
   const threadId = req.params.threadId;
+  const phase = phaseFromBody(req.body as Record<string, string>);
   runOrRedirectError(res, "relance_step_delete", threadId, () => {
-    deleteThreadRelanceStep(threadId, Number(req.params.order));
+    deleteThreadRelanceStep(threadId, Number(req.params.order), phase);
   });
 });
 
@@ -405,16 +422,19 @@ app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) 
 
 app.post("/reglages/categories/:id/relance-steps", requireCsrf, (req: Request, res: Response) => {
   const categoryId = req.params.id;
+  const body = req.body as Record<string, string>;
+  const phase = phaseFromBody(body);
   runOrRedirectReglagesError(res, "category_relance_step_add", () => {
-    const existing = getCategoryRelanceSteps(categoryId);
-    const parsed = parseStep(req.body as Record<string, string>);
-    addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) });
+    const existing = getCategoryRelanceSteps(categoryId, phase);
+    const parsed = parseStep(body);
+    addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) }, phase);
   });
 });
 
 app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
+  const phase = phaseFromBody(req.body as Record<string, string>);
   runOrRedirectReglagesError(res, "category_relance_step_delete", () => {
-    deleteCategoryRelanceStep(req.params.id, Number(req.params.order));
+    deleteCategoryRelanceStep(req.params.id, Number(req.params.order), phase);
   });
 });
 
@@ -663,6 +683,10 @@ function csrfField(csrfToken: string | undefined): string {
   return `<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken ?? "")}" />`;
 }
 
+function phaseField(phase: RelancePhase): string {
+  return `<input type="hidden" name="phase" value="${phase}" />`;
+}
+
 function formatDelay(minutes: number): string {
   if (minutes === 0) return "immédiat";
   if (minutes < 60) return `+${trimNumber(minutes)}min`;
@@ -860,15 +884,19 @@ const STATUS_LABELS: Record<string, { label: string; stampClass: string }> = {
   drafts_ready: { label: "Brouillons prêts", stampClass: "stamp-wait" },
   responded: { label: "Répondu", stampClass: "stamp-done" },
   relance_sent: { label: "Relancé", stampClass: "stamp-late" },
+  awaiting_client_reply: { label: "En attente du client", stampClass: "stamp-internal" },
   closed: { label: "Clôturé", stampClass: "stamp-done" },
 };
 
 function statusStamp(row: ThreadRow): { label: string; stampClass: string } {
   const info = STATUS_LABELS[row.status] ?? { label: row.status, stampClass: "stamp-skip" };
+  // "Échéance" (due_at) est l'ancrage du cycle pre_reply — non pertinent une
+  // fois qu'on est passe en attente de la reponse du client (son propre
+  // ancrage est human_replied_at), donc jamais marque "en retard" ici.
   const isOverdue =
     row.due_at !== null &&
     new Date(row.due_at).getTime() < Date.now() &&
-    !["responded", "closed", "skipped"].includes(row.status);
+    !["responded", "closed", "skipped", "awaiting_client_reply"].includes(row.status);
   return isOverdue ? { label: `${info.label} (en retard)`, stampClass: "stamp-late" } : info;
 }
 
@@ -926,24 +954,31 @@ function renderDossierDetailPage(
       ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>`
       : "";
 
-  const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id);
+  const isPostReply = thread.status === "awaiting_client_reply";
+  const phase: RelancePhase = isPostReply ? "post_reply" : "pre_reply";
+  const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id, phase);
   const draftCount = listDraftsForThread(thread.thread_id).length;
-  const nextStep = steps[thread.relance_count];
+  const nextStep = steps[isPostReply ? thread.post_reply_relance_count : thread.relance_count];
+  const anchorAt = isPostReply ? thread.human_replied_at : thread.due_at;
   const canTriggerNow =
-    thread.due_at !== null &&
-    ["ack_sent", "drafts_ready", "relance_sent"].includes(thread.status) &&
+    anchorAt !== null &&
+    ["ack_sent", "drafts_ready", "relance_sent", "awaiting_client_reply"].includes(thread.status) &&
     Boolean(nextStep);
-  // L'echeance (due_at) est l'ancrage fixe (reception + SLA de la categorie) —
-  // elle ne bouge pas apres une relance, par design: c'est la date de depart
-  // dont chaque etape de la sequence calcule son propre delai. Ce qui bouge
-  // reellement, c'est la prochaine action prevue (echeance + delai de
-  // l'etape a venir), qu'on affiche separement pour eviter la confusion
+  // L'echeance (due_at) est l'ancrage fixe du cycle pre_reply (reception +
+  // SLA de la categorie) — elle ne bouge pas apres une relance, par design.
+  // Une fois passe en attente du client, l'ancrage devient human_replied_at
+  // (date de notre reponse de fond). Dans les deux cas, ce qui bouge
+  // reellement c'est la prochaine action prevue (ancrage + delai de l'etape
+  // a venir), affichee separement pour eviter la confusion
   // "l'echeance est passee mais rien ne s'est passe".
   const nextActionAt =
-    thread.due_at && nextStep
-      ? new Date(new Date(thread.due_at).getTime() + nextStep.delayMinutes * 60_000)
-      : null;
-  const triggerLabel = nextStep?.channel === "external" ? "Envoyer la relance maintenant" : "Déclencher le rappel interne maintenant";
+    anchorAt && nextStep ? new Date(new Date(anchorAt).getTime() + nextStep.delayMinutes * 60_000) : null;
+  const triggerLabel =
+    nextStep?.channel === "external"
+      ? isPostReply
+        ? "Relancer le client maintenant"
+        : "Envoyer la relance maintenant"
+      : "Déclencher le rappel interne maintenant";
 
   const header = `
     <div class="detail-header">
@@ -955,12 +990,18 @@ function renderDossierDetailPage(
         <div class="ledger-fact"><span class="fact-label">Reçu le</span><span class="fact-value">${escapeHtml(new Date(thread.received_at).toLocaleString("fr-FR"))}</span></div>
         <div class="ledger-fact"><span class="fact-label">Accusé le</span><span class="fact-value">${thread.ack_sent_at ? escapeHtml(new Date(thread.ack_sent_at).toLocaleString("fr-FR")) : "—"}</span></div>
         <div class="ledger-fact"><span class="fact-label">Échéance (SLA initial)</span><span class="fact-value">${thread.due_at ? escapeHtml(new Date(thread.due_at).toLocaleString("fr-FR")) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Répondu par nous le</span><span class="fact-value">${thread.human_replied_at ? escapeHtml(new Date(thread.human_replied_at).toLocaleString("fr-FR")) : "—"}</span></div>
         <div class="ledger-fact"><span class="fact-label">Prochaine action prévue</span><span class="fact-value">${
           nextActionAt
             ? `${escapeHtml(nextActionAt.toLocaleString("fr-FR"))} — ${escapeHtml(channelLabel(nextStep!.channel))}`
             : "—"
         }</span></div>
-        <div class="ledger-fact"><span class="fact-label">Relances</span><span class="fact-value">${thread.relance_count}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Relances (avant réponse)</span><span class="fact-value">${thread.relance_count}</span></div>
+        ${
+          thread.human_replied_at
+            ? `<div class="ledger-fact"><span class="fact-label">Relances (après réponse)</span><span class="fact-value">${thread.post_reply_relance_count}</span></div>`
+            : ""
+        }
         <div class="ledger-fact"><span class="fact-label">Brouillons déposés</span><span class="fact-value">${draftCount}</span></div>
       </div>
       <div class="detail-actions">
@@ -1004,6 +1045,7 @@ function renderDossierDetailPage(
         <span>Ce dossier utilise une séquence de relance personnalisée, distincte de la catégorie "${escapeHtml(categoryLabel)}".</span>
         <form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps/reset">
           ${csrfField(csrfToken)}
+          ${phaseField(phase)}
           <button class="btn btn-secondary btn-sm" type="submit">Revenir à la règle de la catégorie</button>
         </form>
       </div>`
@@ -1011,6 +1053,7 @@ function renderDossierDetailPage(
         <span>Ce dossier suit la séquence de relance par défaut de la catégorie "${escapeHtml(categoryLabel)}".</span>
         <form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps/personnaliser">
           ${csrfField(csrfToken)}
+          ${phaseField(phase)}
           <button class="btn btn-secondary btn-sm" type="submit">Personnaliser pour ce dossier</button>
         </form>
       </div>`;
@@ -1020,12 +1063,14 @@ function renderDossierDetailPage(
     editable: isCustom,
     deleteAction: (order) => `/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps/${order}/delete`,
     csrfToken,
-    executedCount: thread.relance_count,
+    executedCount: isPostReply ? thread.post_reply_relance_count : thread.relance_count,
+    phase,
   });
 
   const addForm = isCustom
     ? `<form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps">
         ${csrfField(csrfToken)}
+        ${phaseField(phase)}
         ${stepTypeSelect()}
         <input type="number" name="delayMinutes" min="0" step="1" placeholder="Délai (min)" required />
         <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
@@ -1034,8 +1079,12 @@ function renderDossierDetailPage(
 
   const stepsSection = `
     <div class="settings-section">
-      <h2>Séquence de relance</h2>
-      <p class="section-hint">Chaque étape se déclenche à l'échéance + le délai indiqué. Un rappel interne journalise seulement; une relance externe envoie un email au demandeur.</p>
+      <h2>${isPostReply ? "Séquence de relance (après notre réponse)" : "Séquence de relance (avant notre réponse)"}</h2>
+      <p class="section-hint">${
+        isPostReply
+          ? "Un humain a envoyé une réponse de fond (ex: le devis) — ces étapes relancent le CLIENT s'il reste silencieux, à partir de la date de cette réponse."
+          : "Personne n'a encore répondu de fond au client — ces étapes nudgent notre équipe, à partir de l'échéance SLA. Elles s'arrêtent dès qu'un humain répond."
+      }</p>
       ${overrideBanner}
       ${stepsList}
       ${addForm}
@@ -1086,6 +1135,7 @@ function renderStepList(opts: {
   deleteAction: (order: number) => string;
   csrfToken: string | undefined;
   executedCount: number;
+  phase: RelancePhase;
 }): string {
   if (opts.steps.length === 0) {
     return `<div class="step-empty">Aucune étape configurée — ce dossier ne sera jamais relancé automatiquement.</div>`;
@@ -1097,6 +1147,7 @@ function renderStepList(opts: {
       const deleteForm = opts.editable
         ? `<form method="POST" action="${opts.deleteAction(step.order)}" onsubmit="return confirm('Supprimer cette étape ?');">
             ${csrfField(opts.csrfToken)}
+            ${phaseField(opts.phase)}
             <button class="btn btn-ghost btn-sm" type="submit">Supprimer</button>
           </form>`
         : "";
@@ -1111,6 +1162,35 @@ function renderStepList(opts: {
     })
     .join("");
   return `<div class="step-list">${items}</div>`;
+}
+
+function renderCategoryStepsPanel(
+  categoryId: string,
+  phase: RelancePhase,
+  title: string,
+  csrfToken: string | undefined
+): string {
+  const steps = getCategoryRelanceSteps(categoryId, phase);
+  const stepsList = renderStepList({
+    steps,
+    editable: true,
+    deleteAction: (order) =>
+      `/reglages/categories/${encodeURIComponent(categoryId)}/relance-steps/${order}/delete`,
+    csrfToken,
+    executedCount: -1,
+    phase,
+  });
+  return `<div class="steps-panel">
+    <div class="steps-title">${escapeHtml(title)}</div>
+    ${stepsList}
+    <form class="step-add-form" method="POST" action="/reglages/categories/${encodeURIComponent(categoryId)}/relance-steps">
+      ${csrfField(csrfToken)}
+      ${phaseField(phase)}
+      ${stepTypeSelect()}
+      <input type="number" name="delayMinutes" min="0" step="1" placeholder="Délai (min)" required />
+      <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
+    </form>
+  </div>`;
 }
 
 // ---------- Reglages ----------
@@ -1129,14 +1209,6 @@ function renderReglagesPage(
 
   const categoryBlocks = categories
     .map((cat) => {
-      const steps = getCategoryRelanceSteps(cat.id);
-      const stepsList = renderStepList({
-        steps,
-        editable: true,
-        deleteAction: (order) => `/reglages/categories/${encodeURIComponent(cat.id)}/relance-steps/${order}/delete`,
-        csrfToken,
-        executedCount: -1,
-      });
       return `<div class="category-block">
         <form class="category-head-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}">
           ${csrfField(csrfToken)}
@@ -1151,16 +1223,8 @@ function renderReglagesPage(
           </div>
           <div><button class="btn btn-primary btn-sm" type="submit">Enregistrer</button></div>
         </form>
-        <div class="steps-panel">
-          <div class="steps-title">Séquence de relance</div>
-          ${stepsList}
-          <form class="step-add-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}/relance-steps">
-            ${csrfField(csrfToken)}
-            ${stepTypeSelect()}
-            <input type="number" name="delayMinutes" min="0" step="1" placeholder="Délai (min)" required />
-            <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
-          </form>
-        </div>
+        ${renderCategoryStepsPanel(cat.id, "pre_reply", "Avant notre réponse (nudge équipe)", csrfToken)}
+        ${renderCategoryStepsPanel(cat.id, "post_reply", "Après notre réponse (relance client)", csrfToken)}
       </div>`;
     })
     .join("");

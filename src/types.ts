@@ -29,6 +29,12 @@ export interface SendReplyParams {
   inReplyToMessageId?: string;
 }
 
+export interface NotificationParams {
+  to: string;
+  subject: string;
+  bodyText: string;
+}
+
 export interface EmailConnector {
   readonly name: "gmail" | "graph";
   getOwnEmailAddress(): Promise<string>;
@@ -37,6 +43,8 @@ export interface EmailConnector {
   sendReply(params: SendReplyParams): Promise<{ id: string }>;
   createDraftReply(params: SendReplyParams): Promise<{ id: string }>;
   deleteDraft(draftId: string): Promise<void>;
+  /** Email autonome, hors fil client (pas de threadId) — utilise pour les notifications internes (rappels). */
+  sendNotification(params: NotificationParams): Promise<{ id: string }>;
 }
 
 export interface CategoryConfig {
@@ -85,4 +93,6 @@ export type ThreadStatus =
   | "drafts_ready"
   | "responded"
   | "relance_sent"
+  /** Un humain a envoye une reponse de fond (ex: le devis) — on attend maintenant la reponse DU CLIENT a ce message. */
+  | "awaiting_client_reply"
   | "closed";

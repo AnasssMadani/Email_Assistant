@@ -1,7 +1,13 @@
 import { google, type gmail_v1 } from "googleapis";
 import { getAuthorizedClient } from "./gmailAuth.js";
 import { extractPlainText, getHeader, parseAddress, buildRawMimeMessage } from "./mime.js";
-import type { EmailConnector, EmailMessage, EmailThread, SendReplyParams } from "../types.js";
+import type {
+  EmailConnector,
+  EmailMessage,
+  EmailThread,
+  NotificationParams,
+  SendReplyParams,
+} from "../types.js";
 
 export class GmailConnector implements EmailConnector {
   readonly name = "gmail" as const;
@@ -132,5 +138,20 @@ export class GmailConnector implements EmailConnector {
       if ((err as { status?: number }).status === 404) return;
       throw err;
     }
+  }
+
+  async sendNotification(params: NotificationParams): Promise<{ id: string }> {
+    const gmail = await this.getGmail();
+    const ownEmail = await this.getOwnEmailAddress();
+    const raw = buildRawMimeMessage({
+      from: ownEmail,
+      to: params.to,
+      subject: params.subject,
+      bodyText: params.bodyText,
+    });
+    // Pas de threadId: c'est une notification autonome, pas une reponse dans
+    // le fil du client — sinon elle apparaitrait melangee a sa conversation.
+    const res = await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+    return { id: res.data.id ?? "" };
   }
 }
