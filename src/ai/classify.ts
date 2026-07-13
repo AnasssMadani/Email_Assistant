@@ -1,15 +1,31 @@
+import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
-import { loadCategories } from "../settings.js";
+import { withRetry } from "./structured.js";
+import { listCategories } from "../db.js";
 import { formatThreadContext } from "./prompts.js";
 import type { ClassificationResult, EmailMessage, EmailThread } from "../types.js";
+
+const classificationSchema = z.object({
+  categoryId: z.string().min(1),
+  urgency: z.enum(["low", "normal", "high"]),
+  summary: z.string().min(1),
+  requiresAcknowledgement: z.boolean(),
+});
 
 export async function classifyEmail(
   thread: EmailThread,
   incoming: EmailMessage
 ): Promise<ClassificationResult> {
+  return withRetry(() => classifyEmailOnce(thread, incoming));
+}
+
+async function classifyEmailOnce(
+  thread: EmailThread,
+  incoming: EmailMessage
+): Promise<ClassificationResult> {
   const client = getClient();
-  const { categories } = loadCategories();
+  const categories = listCategories();
   const categoryList = categories.map((c) => `- ${c.id}: ${c.label}`).join("\n");
 
   const tool: Anthropic.Tool = {
@@ -56,5 +72,5 @@ export async function classifyEmail(
   if (!toolUse) {
     throw new Error("Claude n'a pas retourne de classification structuree.");
   }
-  return toolUse.input as ClassificationResult;
+  return classificationSchema.parse(toolUse.input);
 }

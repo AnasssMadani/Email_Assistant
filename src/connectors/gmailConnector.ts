@@ -122,4 +122,15 @@ export class GmailConnector implements EmailConnector {
     });
     return { id: res.data.id ?? "" };
   }
+
+  async deleteDraft(draftId: string): Promise<void> {
+    const gmail = await this.getGmail();
+    try {
+      await gmail.users.drafts.delete({ userId: "me", id: draftId });
+    } catch (err) {
+      // Deja envoye ou supprime manuellement par un agent: pas une erreur.
+      if ((err as { status?: number }).status === 404) return;
+      throw err;
+    }
+  }
 }

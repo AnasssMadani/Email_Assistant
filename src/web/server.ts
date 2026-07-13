@@ -6,19 +6,32 @@ import { buildGmailAuthUrl, exchangeCodeForGmailToken } from "../connectors/gmai
 import { buildGraphAuthUrl, exchangeCodeForGraphToken } from "../connectors/graphAuth.js";
 import { GmailConnector } from "../connectors/gmailConnector.js";
 import { GraphConnector } from "../connectors/graphConnector.js";
+import { createEmailConnector } from "../connectors/index.js";
+import { cleanupUnusedDrafts } from "../pipeline/draftCleanup.js";
 import {
+  addCategoryRelanceStep,
+  addThreadRelanceStep,
+  clearThreadRelanceOverride,
+  deleteCategoryRelanceStep,
   deleteThreadData,
+  deleteThreadRelanceStep,
+  getCategoryRelanceSteps,
+  getEffectiveRelanceSteps,
+  getThreadRow,
+  hasThreadRelanceOverride,
   listCategories,
+  listDraftsForThread,
+  listPipelineErrors,
   listReminders,
   listRecentThreads,
-  getRelanceSettingsRow,
+  recordPipelineError,
   setThreadStatus,
   updateCategory,
-  updateRelanceSettingsRow,
+  type PipelineErrorRow,
   type ReminderRow,
   type ThreadRow,
 } from "../db.js";
-import type { CategoryConfig, RelanceConfig } from "../types.js";
+import type { CategoryConfig, RelanceChannel, RelanceStep } from "../types.js";
 import {
   authConfigured,
   clearSessionCookie,
@@ -42,7 +55,19 @@ function query(req: Request): Record<string, string> {
   return req.query as unknown as Record<string, string>;
 }
 
-// ---------- Favicon (public, avant l'authentification) ----------
+function parseStep(body: Record<string, string>): { channel: RelanceChannel; delayHours: number } {
+  const channel: RelanceChannel = body.channel === "external" ? "external" : "internal";
+  const delayHours = Math.max(0, Number(body.delayHours) || 0);
+  return { channel, delayHours };
+}
+
+/** Empeche une nouvelle etape d'avoir un delai plus court que la precedente (sequence croissante). */
+function clampAfterLastStep(steps: RelanceStep[], delayHours: number): number {
+  const lastDelay = steps.length ? steps[steps.length - 1].delayHours : 0;
+  return Math.max(delayHours, lastDelay);
+}
+
+// ---------- Sceau (public, avant l'authentification) ----------
 
 app.get("/favicon.svg", (_req: Request, res: Response) => {
   const initial = escapeHtml(config.branding.name.trim().charAt(0).toUpperCase() || "A");
@@ -51,8 +76,8 @@ app.get("/favicon.svg", (_req: Request, res: Response) => {
   res.setHeader("Cache-Control", "public, max-age=86400");
   res.send(
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">` +
-      `<rect width="64" height="64" rx="14" fill="${color}"/>` +
-      `<text x="32" y="43" font-family="Arial, sans-serif" font-size="30" font-weight="700" ` +
+      `<circle cx="32" cy="32" r="30" fill="${color}"/>` +
+      `<text x="32" y="43" font-family="Georgia, serif" font-size="30" font-weight="700" ` +
       `fill="#ffffff" text-anchor="middle">${initial}</text></svg>`
   );
 });
@@ -184,27 +209,80 @@ app.get("/dossiers", (_req: Request, res: Response) => {
   res.send(renderDossiersPage(listRecentThreads(150), res.locals.csrfToken as string | undefined));
 });
 
-app.post("/dossiers/:threadId/cloturer", requireCsrf, (req: Request, res: Response) => {
-  setThreadStatus(req.params.threadId, "closed");
+app.get("/dossiers/:threadId", (req: Request, res: Response) => {
+  const thread = getThreadRow(req.params.threadId);
+  if (!thread) {
+    res.redirect("/dossiers");
+    return;
+  }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderDossierDetailPage(thread, res.locals.csrfToken as string | undefined, query(req).saved));
+});
+
+app.post("/dossiers/:threadId/cloturer", requireCsrf, async (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  setThreadStatus(threadId, "closed");
+  await attemptCleanup(threadId);
+  res.redirect(req.body?._redirect === "detail" ? `/dossiers/${encodeURIComponent(threadId)}` : "/dossiers");
+});
+
+app.post("/dossiers/:threadId/supprimer", requireCsrf, async (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  await attemptCleanup(threadId);
+  deleteThreadData(threadId);
   res.redirect("/dossiers");
 });
 
-app.post("/dossiers/:threadId/supprimer", requireCsrf, (req: Request, res: Response) => {
-  deleteThreadData(req.params.threadId);
-  res.redirect("/dossiers");
+app.post("/dossiers/:threadId/nettoyer-brouillons", requireCsrf, async (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  await attemptCleanup(threadId);
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 });
 
-// ---------- Reglages (categories + seuils de relance) ----------
+/** Nettoyage best-effort: une messagerie non connectee ou une erreur API ne doit jamais bloquer l'action principale de la route appelante. */
+async function attemptCleanup(threadId: string): Promise<void> {
+  try {
+    await cleanupUnusedDrafts(createEmailConnector(), threadId);
+  } catch (err) {
+    recordPipelineError("draft_cleanup", threadId, (err as Error).message);
+  }
+}
+
+app.post("/dossiers/:threadId/relance-steps", requireCsrf, (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  const existing = getEffectiveRelanceSteps(threadId, getThreadRow(threadId)?.category_id ?? "").steps;
+  const parsed = parseStep(req.body as Record<string, string>);
+  addThreadRelanceStep(threadId, { ...parsed, delayHours: clampAfterLastStep(existing, parsed.delayHours) });
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+});
+
+app.post("/dossiers/:threadId/relance-steps/personnaliser", requireCsrf, (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  const thread = getThreadRow(threadId);
+  if (thread && !hasThreadRelanceOverride(threadId)) {
+    const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id);
+    const base = steps.length > 0 ? steps : [{ channel: "internal" as const, delayHours: 24 }];
+    for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayHours: step.delayHours });
+  }
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}`);
+});
+
+app.post("/dossiers/:threadId/relance-steps/reset", requireCsrf, (req: Request, res: Response) => {
+  clearThreadRelanceOverride(req.params.threadId);
+  res.redirect(`/dossiers/${encodeURIComponent(req.params.threadId)}?saved=1`);
+});
+
+app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
+  deleteThreadRelanceStep(req.params.threadId, Number(req.params.order));
+  res.redirect(`/dossiers/${encodeURIComponent(req.params.threadId)}?saved=1`);
+});
+
+// ---------- Reglages (categories + sequences de relance) ----------
 
 app.get("/reglages", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(
-    renderReglagesPage(
-      listCategories(),
-      getRelanceSettingsRow(),
-      res.locals.csrfToken as string | undefined,
-      query(req).saved
-    )
+    renderReglagesPage(listCategories(), res.locals.csrfToken as string | undefined, query(req).saved)
   );
 });
 
@@ -214,18 +292,20 @@ app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) 
     label: (body.label ?? "").trim() || req.params.id,
     slaHours: Math.max(0, Number(body.slaHours) || 0),
     acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
-    allowExternalRelance: body.allowExternalRelance === "on",
   });
   res.redirect("/reglages?saved=1");
 });
 
-app.post("/reglages/relance", requireCsrf, (req: Request, res: Response) => {
-  const body = req.body as Record<string, string>;
-  updateRelanceSettingsRow({
-    internalReminderAfterHours: Math.max(0, Number(body.internalReminderAfterHours) || 0),
-    externalRelanceAfterHours: Math.max(0, Number(body.externalRelanceAfterHours) || 0),
-    maxRelances: Math.max(0, Math.floor(Number(body.maxRelances) || 0)),
-  });
+app.post("/reglages/categories/:id/relance-steps", requireCsrf, (req: Request, res: Response) => {
+  const categoryId = req.params.id;
+  const existing = getCategoryRelanceSteps(categoryId);
+  const parsed = parseStep(req.body as Record<string, string>);
+  addCategoryRelanceStep(categoryId, { ...parsed, delayHours: clampAfterLastStep(existing, parsed.delayHours) });
+  res.redirect("/reglages?saved=1");
+});
+
+app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
+  deleteCategoryRelanceStep(req.params.id, Number(req.params.order));
   res.redirect("/reglages?saved=1");
 });
 
@@ -233,7 +313,7 @@ app.post("/reglages/relance", requireCsrf, (req: Request, res: Response) => {
 
 app.get("/journal", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderJournalPage(listReminders(150)));
+  res.send(renderJournalPage(listReminders(150), listPipelineErrors(100)));
 });
 
 // ---------- Confidentialite / retention ----------
@@ -247,7 +327,7 @@ app.get("/confidentialite", (_req: Request, res: Response) => {
 
 type ActivePage = "connexion" | "dossiers" | "reglages" | "journal" | "confidentialite";
 
-function pageShell(active: ActivePage, title: string, sub: string, body: string): string {
+function pageShell(active: ActivePage, title: string, sub: string, body: string, backLink?: string): string {
   const brand = config.branding;
   return `<!doctype html>
 <html lang="fr">
@@ -256,144 +336,7 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string)
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <title>${escapeHtml(brand.name)} — ${escapeHtml(title)}</title>
-<style>
-  :root { color-scheme: light dark; --brand-primary: ${brand.primaryColor}; --brand-primary-ink: #ffffff; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 0 20px 60px; min-height: 100vh;
-    background: #F3F5F4; color: #16202A;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-    display: flex; justify-content: center;
-  }
-  @media (prefers-color-scheme: dark) { body { background: #12181F; color: #E7ECE9; } }
-  main { width: 100%; max-width: 780px; }
-  header.brand { display: flex; align-items: center; gap: 10px; padding: 28px 0 18px; }
-  header.brand img, header.brand .logo {
-    width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
-  }
-  header.brand .logo {
-    background: var(--brand-primary); color: var(--brand-primary-ink);
-    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px;
-  }
-  header.brand .name { font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
-  nav { display: flex; gap: 18px; margin-bottom: 26px; font-size: 13.5px; flex-wrap: wrap; }
-  nav a { color: #7C8B92; text-decoration: none; padding-bottom: 4px; border-bottom: 2px solid transparent; }
-  nav a.active { color: #16202A; font-weight: 600; border-color: var(--brand-primary); }
-  @media (prefers-color-scheme: dark) {
-    nav a.active { color: #E7ECE9; }
-  }
-  nav form { margin-left: auto; }
-  nav .btn-link {
-    background: none; border: none; color: #7C8B92; font-size: 13.5px; cursor: pointer; padding: 0;
-    text-decoration: underline;
-  }
-  h1 { font-size: 22px; margin: 0 0 6px; }
-  p.sub { color: #5B6B72; margin: 0 0 28px; font-size: 14.5px; max-width: 60ch; }
-  @media (prefers-color-scheme: dark) { p.sub { color: #92A3AA; } }
-  .banner { padding: 12px 16px; border-radius: 6px; font-size: 14px; margin-bottom: 20px; }
-  .banner-ok { background: #E4F3EA; color: #205C3C; }
-  .banner-error { background: #FBE7E4; color: #8A2E20; }
-  .banner-info { background: #E9EEF3; color: #2B4A5E; }
-  @media (prefers-color-scheme: dark) {
-    .banner-ok { background: #163827; color: #8FD8AE; }
-    .banner-error { background: #3A2019; color: #F1A493; }
-    .banner-info { background: #1B2A34; color: #9FC2D8; }
-  }
-  .status {
-    border: 1px solid #D8DEDA; border-radius: 8px; padding: 16px 20px;
-    margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center;
-    background: #FFFFFF; flex-wrap: wrap; gap: 12px;
-  }
-  @media (prefers-color-scheme: dark) { .status { background: #182028; border-color: #2C3841; } }
-  .status .label { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #7C8B92; margin-bottom: 4px; }
-  .status .value { font-size: 15px; font-weight: 600; }
-  .cards { display: grid; gap: 14px; }
-  .card {
-    border: 1px solid #D8DEDA; border-radius: 8px; padding: 20px;
-    background: #FFFFFF; display: flex; justify-content: space-between; align-items: center; gap: 16px;
-  }
-  @media (prefers-color-scheme: dark) { .card { background: #182028; border-color: #2C3841; } }
-  .card h2 { font-size: 16px; margin: 0 0 4px; }
-  .card p { font-size: 13.5px; color: #5B6B72; margin: 0; }
-  @media (prefers-color-scheme: dark) { .card p { color: #92A3AA; } }
-  .btn {
-    display: inline-block; padding: 10px 18px; border-radius: 6px; text-decoration: none;
-    font-size: 14px; font-weight: 600; white-space: nowrap; border: none; cursor: pointer;
-  }
-  .btn-sm { padding: 6px 12px; font-size: 12.5px; }
-  .btn-primary { background: var(--brand-primary); color: var(--brand-primary-ink); }
-  .btn-ghost { background: transparent; color: #8A2E20; border: 1px solid #D8B7B0; }
-  .btn-disabled { background: #E9ECEA; color: #97A2A0; pointer-events: none; }
-  @media (prefers-color-scheme: dark) { .btn-disabled { background: #222C33; color: #5A6870; } }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #E4F3EA; color: #205C3C; margin-left: 8px; white-space: nowrap; }
-  @media (prefers-color-scheme: dark) { .badge { background: #163827; color: #8FD8AE; } }
-  .badge-wait { background: #FBF0DA; color: #8A5A0F; }
-  @media (prefers-color-scheme: dark) { .badge-wait { background: #3A2E12; color: #E0B15C; } }
-  .badge-late { background: #FBE7E4; color: #8A2E20; }
-  @media (prefers-color-scheme: dark) { .badge-late { background: #3A2019; color: #F1A493; } }
-  .badge-done { background: #E4F3EA; color: #205C3C; }
-  @media (prefers-color-scheme: dark) { .badge-done { background: #163827; color: #8FD8AE; } }
-  .badge-skip { background: #E9ECEA; color: #6B7A80; }
-  @media (prefers-color-scheme: dark) { .badge-skip { background: #222C33; color: #92A3AA; } }
-  .badge-internal { background: #E9EEF3; color: #2B4A5E; }
-  @media (prefers-color-scheme: dark) { .badge-internal { background: #1B2A34; color: #9FC2D8; } }
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: #7C8B92; padding: 8px 10px; border-bottom: 1px solid #D8DEDA; }
-  @media (prefers-color-scheme: dark) { th { border-color: #2C3841; } }
-  td { padding: 10px; border-bottom: 1px solid #E7EBE7; vertical-align: top; }
-  @media (prefers-color-scheme: dark) { td { border-color: #202A31; } }
-  .subject { font-weight: 600; }
-  .meta { color: #7C8B92; font-size: 12px; }
-  .table-wrap { overflow-x: auto; border: 1px solid #D8DEDA; border-radius: 8px; background: #FFFFFF; }
-  @media (prefers-color-scheme: dark) { .table-wrap { background: #182028; border-color: #2C3841; } }
-  .table-wrap table { min-width: 620px; }
-  .empty { padding: 40px 20px; text-align: center; color: #7C8B92; font-size: 14px; }
-  footer { margin-top: 28px; font-size: 12.5px; color: #7C8B72; }
-  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-  .settings-section { margin-bottom: 32px; }
-  .settings-section h2 { font-size: 15px; margin: 0 0 12px; }
-  .settings-table { border: 1px solid #D8DEDA; border-radius: 8px; overflow: hidden; background: #FFFFFF; }
-  @media (prefers-color-scheme: dark) { .settings-table { background: #182028; border-color: #2C3841; } }
-  .settings-head, .settings-row {
-    display: grid; grid-template-columns: 1.6fr .8fr 1fr 1.1fr .6fr;
-    gap: 10px; align-items: center; padding: 10px 14px;
-  }
-  .settings-head {
-    font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: #7C8B92;
-    border-bottom: 1px solid #D8DEDA;
-  }
-  @media (prefers-color-scheme: dark) { .settings-head { border-color: #2C3841; } }
-  .settings-row { border-bottom: 1px solid #E7EBE7; }
-  .settings-row:last-child { border-bottom: none; }
-  @media (prefers-color-scheme: dark) { .settings-row { border-color: #202A31; } }
-  .settings-row input[type=text], .settings-row input[type=number], .relance-form input[type=number] {
-    width: 100%; padding: 7px 9px; border-radius: 6px; border: 1px solid #D8DEDA;
-    background: #F8F9F8; color: inherit; font-size: 13.5px;
-  }
-  @media (prefers-color-scheme: dark) {
-    .settings-row input[type=text], .settings-row input[type=number], .relance-form input[type=number] {
-      background: #12181F; border-color: #2C3841;
-    }
-  }
-  .settings-row .cat-id { font-size: 11px; color: #97A2A0; display: block; margin-top: 2px; }
-  .checkbox-cell { display: flex; align-items: center; gap: 6px; font-size: 12.5px; }
-  .relance-form {
-    border: 1px solid #D8DEDA; border-radius: 8px; padding: 18px 20px; background: #FFFFFF;
-    display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    align-items: end;
-  }
-  @media (prefers-color-scheme: dark) { .relance-form { background: #182028; border-color: #2C3841; } }
-  .relance-form label { font-size: 12px; color: #7C8B92; display: block; margin-bottom: 6px; }
-  .field-group { display: grid; gap: 4px; }
-  .login-wrap { max-width: 360px; margin: 60px auto 0; }
-  .login-wrap form { display: grid; gap: 14px; }
-  .login-wrap input {
-    width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid #D8DEDA;
-    background: #F8F9F8; color: inherit; font-size: 14px;
-  }
-  @media (prefers-color-scheme: dark) { .login-wrap input { background: #12181F; border-color: #2C3841; } }
-  .login-wrap label { font-size: 13px; font-weight: 600; }
-</style>
+<style>${sharedStyles(brand.primaryColor)}</style>
 </head>
 <body>
 <main>
@@ -401,17 +344,18 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string)
     ${
       brand.logoUrl
         ? `<img src="${escapeHtml(brand.logoUrl)}" alt="${escapeHtml(brand.name)}" />`
-        : `<span class="logo">${escapeHtml(brand.name.trim().charAt(0).toUpperCase() || "A")}</span>`
+        : `<span class="seal">${escapeHtml(brand.name.trim().charAt(0).toUpperCase() || "A")}</span>`
     }
     <span class="name">${escapeHtml(brand.name)}</span>
   </header>
   <nav>
     <a href="/" class="${active === "connexion" ? "active" : ""}">Connexion</a>
-    <a href="/dossiers" class="${active === "dossiers" ? "active" : ""}">Suivi des dossiers</a>
+    <a href="/dossiers" class="${active === "dossiers" ? "active" : ""}">Registre des dossiers</a>
     <a href="/reglages" class="${active === "reglages" ? "active" : ""}">Réglages</a>
     <a href="/journal" class="${active === "journal" ? "active" : ""}">Journal</a>
     <form method="POST" action="/logout"><button class="btn-link" type="submit">Déconnexion</button></form>
   </nav>
+  ${backLink ? `<a class="back-link" href="${backLink}">&larr; Retour</a>` : ""}
   <h1>${escapeHtml(title)}</h1>
   <p class="sub">${sub}</p>
   ${body}
@@ -420,8 +364,208 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string)
 </html>`;
 }
 
+function sharedStyles(primaryColor: string): string {
+  return `
+  :root {
+    color-scheme: light dark;
+    --brand-primary: ${primaryColor};
+    --brand-primary-ink: #ffffff;
+    --paper: #F6F1E7;
+    --paper-raised: #FFFDF9;
+    --ink: #211D17;
+    --ink-soft: #6E6455;
+    --ink-faint: #9C927E;
+    --rule: #E2D8C3;
+    --rule-strong: #CBBEA0;
+    --stamp-wait: #8A5D16;
+    --stamp-late: #A23B2E;
+    --stamp-done: #3F6B4A;
+    --stamp-skip: #8C8371;
+    --stamp-internal: #3D5A73;
+    --font-display: Georgia, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #1A1712; --paper-raised: #242019; --ink: #EDE6D6; --ink-soft: #B0A48D; --ink-faint: #7C7361;
+      --rule: #392F22; --rule-strong: #4A3E2C;
+      --stamp-wait: #D2A64C; --stamp-late: #E08573; --stamp-done: #7FBE93; --stamp-skip: #A79C89; --stamp-internal: #8FB4D1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 20px 60px; min-height: 100vh;
+    background-color: var(--paper); color: var(--ink);
+    background-image: radial-gradient(circle at 1px 1px, rgba(0,0,0,.035) 1px, transparent 0);
+    background-size: 15px 15px;
+    font-family: var(--font-body);
+    display: flex; justify-content: center;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,.03) 1px, transparent 0); }
+  }
+  main { width: 100%; max-width: 820px; }
+  header.brand { display: flex; align-items: center; gap: 11px; padding: 30px 0 20px; }
+  header.brand img, header.brand .seal { width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0; }
+  header.brand .seal {
+    background: var(--brand-primary); color: var(--brand-primary-ink); font-family: var(--font-display);
+    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px;
+    transform: rotate(-4deg); box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  }
+  header.brand .name { font-family: var(--font-display); font-weight: 700; font-size: 16.5px; letter-spacing: -.01em; }
+  nav {
+    display: flex; gap: 22px; margin-bottom: 30px; font-size: 12.5px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--rule); padding-bottom: 0;
+  }
+  nav a {
+    color: var(--ink-soft); text-decoration: none; padding-bottom: 10px; border-bottom: 2px solid transparent;
+    text-transform: uppercase; letter-spacing: .06em; font-weight: 600;
+  }
+  nav a.active { color: var(--ink); border-color: var(--brand-primary); }
+  nav a:hover { color: var(--ink); }
+  nav form { margin-left: auto; }
+  nav .btn-link {
+    background: none; border: none; color: var(--ink-soft); font-size: 12.5px; cursor: pointer; padding: 0 0 10px;
+    text-transform: uppercase; letter-spacing: .06em; font-weight: 600; font-family: inherit;
+  }
+  nav .btn-link:hover { color: var(--ink); }
+  .back-link {
+    display: inline-block; font-size: 12.5px; color: var(--ink-soft); text-decoration: none; margin-bottom: 14px;
+  }
+  .back-link:hover { color: var(--ink); text-decoration: underline; }
+  h1 { font-family: var(--font-display); font-size: 25px; margin: 0 0 6px; font-weight: 700; }
+  p.sub { color: var(--ink-soft); margin: 0 0 28px; font-size: 14px; max-width: 62ch; line-height: 1.5; }
+  .banner { padding: 12px 16px; border-radius: 3px; font-size: 13.5px; margin-bottom: 20px; border-left: 3px solid; }
+  .banner-ok { background: rgba(63,107,74,.1); color: var(--stamp-done); border-color: var(--stamp-done); }
+  .banner-error { background: rgba(162,59,46,.1); color: var(--stamp-late); border-color: var(--stamp-late); }
+  .banner-info { background: rgba(61,90,115,.1); color: var(--stamp-internal); border-color: var(--stamp-internal); }
+  .status {
+    border: 1px solid var(--rule); border-radius: 4px; padding: 16px 20px;
+    margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center;
+    background: var(--paper-raised); flex-wrap: wrap; gap: 12px;
+  }
+  .status .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); margin-bottom: 4px; }
+  .status .value { font-size: 15px; font-weight: 600; }
+  .cards { display: grid; gap: 14px; }
+  .card {
+    border: 1px solid var(--rule); border-radius: 4px; padding: 20px;
+    background: var(--paper-raised); display: flex; justify-content: space-between; align-items: center; gap: 16px;
+  }
+  .card h2 { font-family: var(--font-display); font-size: 16.5px; margin: 0 0 4px; }
+  .card p { font-size: 13.5px; color: var(--ink-soft); margin: 0; line-height: 1.5; }
+  .btn {
+    display: inline-block; padding: 9px 16px; border-radius: 3px; text-decoration: none;
+    font-size: 13.5px; font-weight: 600; white-space: nowrap; border: 1px solid transparent; cursor: pointer;
+    font-family: var(--font-body);
+  }
+  .btn-sm { padding: 6px 11px; font-size: 12px; }
+  .btn-primary { background: var(--brand-primary); color: var(--brand-primary-ink); }
+  .btn-secondary { background: transparent; color: var(--ink); border-color: var(--rule-strong); }
+  .btn-secondary:hover { border-color: var(--ink-soft); }
+  .btn-ghost { background: transparent; color: var(--stamp-late); border-color: var(--stamp-late); opacity: .85; }
+  .btn-ghost:hover { opacity: 1; }
+  .btn-disabled { background: var(--rule); color: var(--ink-faint); pointer-events: none; border-color: var(--rule); }
+  .stamp {
+    display: inline-block; font-size: 10.5px; padding: 2px 8px; border-radius: 3px; margin-left: 8px;
+    text-transform: uppercase; letter-spacing: .05em; font-weight: 700; border: 1px solid currentColor;
+    white-space: nowrap; line-height: 1.6;
+  }
+  .stamp-wait { color: var(--stamp-wait); }
+  .stamp-late { color: var(--stamp-late); }
+  .stamp-done { color: var(--stamp-done); }
+  .stamp-skip { color: var(--stamp-skip); }
+  .stamp-internal { color: var(--stamp-internal); }
+  .stamp-external { color: var(--brand-primary); }
+  .ledger { border: 1px solid var(--rule); border-radius: 4px; background: var(--paper-raised); overflow: hidden; }
+  .ledger-head {
+    display: flex; gap: 16px; padding: 10px 18px; font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--ink-faint); border-bottom: 1px solid var(--rule);
+  }
+  .ledger-row { display: flex; gap: 16px; padding: 15px 18px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; align-items: flex-start; }
+  .ledger-row:last-child { border-bottom: none; }
+  .ledger-main { flex: 1 1 240px; min-width: 0; }
+  .ledger-main a.subject-link { font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--ink); text-decoration: none; }
+  .ledger-main a.subject-link:hover { text-decoration: underline; }
+  .ledger-main .subject-static { font-family: var(--font-display); font-size: 15px; font-weight: 700; }
+  .ledger-meta { color: var(--ink-soft); font-size: 12px; margin-top: 3px; }
+  .ledger-facts { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; font-size: 12px; }
+  .ledger-fact .fact-label { text-transform: uppercase; font-size: 9.5px; letter-spacing: .06em; color: var(--ink-faint); display: block; margin-bottom: 2px; }
+  .ledger-fact .fact-value { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .ledger-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; align-items: flex-start; }
+  .empty { padding: 48px 20px; text-align: center; color: var(--ink-faint); font-size: 14px; font-family: var(--font-display); }
+  footer { margin-top: 28px; font-size: 12px; color: var(--ink-faint); }
+  .settings-section { margin-bottom: 34px; }
+  .settings-section h2 { font-family: var(--font-display); font-size: 16.5px; margin: 0 0 4px; }
+  .settings-section .section-hint { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 14px; }
+  .category-block { border: 1px solid var(--rule); border-radius: 4px; background: var(--paper-raised); margin-bottom: 14px; overflow: hidden; }
+  .category-head-form {
+    display: grid; grid-template-columns: 2fr .9fr 1.2fr auto; gap: 12px; align-items: center;
+    padding: 14px 16px; border-bottom: 1px solid var(--rule);
+  }
+  .category-head-form input[type=text], .category-head-form input[type=number] {
+    width: 100%; padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong);
+    background: var(--paper); color: inherit; font-size: 13.5px; font-family: inherit;
+  }
+  .category-head-form .cat-id { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); display: block; margin-top: 3px; }
+  .checkbox-cell { display: flex; align-items: center; gap: 6px; font-size: 12.5px; }
+  .steps-panel { padding: 14px 16px; }
+  .steps-panel .steps-title { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); margin-bottom: 10px; }
+  .step-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+  .step-item {
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--rule);
+    border-radius: 3px; background: var(--paper); font-size: 13px; flex-wrap: wrap;
+  }
+  .step-item .step-order { font-family: var(--font-mono); color: var(--ink-faint); font-size: 12px; width: 18px; }
+  .step-item .step-delay { font-family: var(--font-mono); font-weight: 600; min-width: 52px; }
+  .step-item .step-hours { color: var(--ink-faint); font-size: 11px; }
+  .step-item form { margin-left: auto; }
+  .step-add-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .step-add-form select, .step-add-form input[type=number] {
+    padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong); background: var(--paper);
+    color: inherit; font-size: 13px; font-family: inherit;
+  }
+  .step-add-form input[type=number] { width: 90px; }
+  .step-empty { font-size: 12.5px; color: var(--ink-faint); font-style: italic; margin-bottom: 12px; }
+  .detail-header { border: 1px solid var(--rule); border-radius: 4px; background: var(--paper-raised); padding: 20px 22px; margin-bottom: 24px; }
+  .detail-header .subject-static { font-family: var(--font-display); font-size: 19px; font-weight: 700; margin-bottom: 4px; }
+  .detail-header .ledger-meta { margin-bottom: 14px; }
+  .detail-facts { display: flex; gap: 26px; flex-wrap: wrap; margin-bottom: 16px; }
+  .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .override-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; border-radius: 3px; margin-bottom: 14px; font-size: 12.5px; }
+  .override-banner.is-custom { background: rgba(61,90,115,.1); color: var(--stamp-internal); }
+  .override-banner.is-default { background: var(--rule); color: var(--ink-soft); }
+  .field-group { display: grid; gap: 4px; }
+  .login-wrap { max-width: 360px; margin: 60px auto 0; }
+  .login-wrap form { display: grid; gap: 14px; }
+  .login-wrap input {
+    width: 100%; padding: 10px 12px; border-radius: 3px; border: 1px solid var(--rule-strong);
+    background: var(--paper-raised); color: inherit; font-size: 14px; font-family: inherit;
+  }
+  .login-wrap label { font-size: 13px; font-weight: 600; }
+  @media (max-width: 640px) {
+    .category-head-form { grid-template-columns: 1fr; }
+    .ledger-actions { margin-left: 0; }
+  }`;
+}
+
 function csrfField(csrfToken: string | undefined): string {
   return `<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken ?? "")}" />`;
+}
+
+function formatDelay(hours: number): string {
+  if (hours === 0) return "immédiat";
+  if (hours < 24) return `+${trimNumber(hours)}h`;
+  return `J+${trimNumber(hours / 24)}`;
+}
+
+function trimNumber(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
+function channelLabel(channel: RelanceChannel): string {
+  return channel === "external" ? "Relance externe" : "Rappel interne";
 }
 
 // ---------- Page de connexion applicative (login) ----------
@@ -437,39 +581,36 @@ function renderLoginPage(opts: { next: string; error?: string }): string {
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <title>${escapeHtml(brand.name)} — Connexion</title>
 <style>
-  :root { color-scheme: light dark; --brand-primary: ${brand.primaryColor}; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    background: #F3F5F4; color: #16202A; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  ${sharedStyles(brand.primaryColor)}
+  body { align-items: center; padding: 20px; }
+  .login-card {
+    width: 100%; max-width: 380px; border: 1px solid var(--rule); border-radius: 4px;
+    background: var(--paper-raised); padding: 34px 32px; box-shadow: 0 2px 14px rgba(0,0,0,.06);
   }
-  @media (prefers-color-scheme: dark) { body { background: #12181F; color: #E7ECE9; } }
-  .login-wrap { width: 100%; max-width: 360px; padding: 20px; }
-  .brand-row { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; }
-  .logo {
-    width: 32px; height: 32px; border-radius: 8px; background: var(--brand-primary); color: #fff;
+  .brand-row { display: flex; align-items: center; gap: 11px; margin-bottom: 26px; }
+  .seal {
+    width: 34px; height: 34px; border-radius: 50%; background: var(--brand-primary); color: #fff;
     display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px;
+    font-family: var(--font-display); transform: rotate(-4deg); box-shadow: 0 1px 2px rgba(0,0,0,.25);
   }
-  h1 { font-size: 19px; margin: 0 0 20px; }
-  form { display: grid; gap: 14px; }
-  label { font-size: 13px; font-weight: 600; }
-  input {
-    width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid #D8DEDA;
-    background: #FFFFFF; color: inherit; font-size: 14px; margin-top: 6px;
+  .brand-row strong { font-family: var(--font-display); font-size: 16px; }
+  .login-card h1 { font-size: 19px; margin: 0 0 20px; }
+  .login-card form { display: grid; gap: 14px; }
+  .login-card label { font-size: 12.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-soft); }
+  .login-card input {
+    width: 100%; padding: 10px 12px; border-radius: 3px; border: 1px solid var(--rule-strong);
+    background: var(--paper); color: inherit; font-size: 14px; margin-top: 6px; font-family: inherit;
   }
-  @media (prefers-color-scheme: dark) { input { background: #182028; border-color: #2C3841; } }
-  button {
-    padding: 11px 18px; border-radius: 6px; border: none; background: var(--brand-primary); color: #fff;
-    font-size: 14px; font-weight: 600; cursor: pointer;
+  .login-card button {
+    padding: 11px 18px; border-radius: 3px; border: none; background: var(--brand-primary); color: var(--brand-primary-ink);
+    font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit;
   }
-  .banner-error { background: #FBE7E4; color: #8A2E20; padding: 12px 16px; border-radius: 6px; font-size: 14px; margin-bottom: 16px; }
-  @media (prefers-color-scheme: dark) { .banner-error { background: #3A2019; color: #F1A493; } }
 </style>
 </head>
 <body>
-  <div class="login-wrap">
+  <div class="login-card">
     <div class="brand-row">
-      <span class="logo">${escapeHtml(brand.name.trim().charAt(0).toUpperCase() || "A")}</span>
+      <span class="seal">${escapeHtml(brand.name.trim().charAt(0).toUpperCase() || "A")}</span>
       <strong>${escapeHtml(brand.name)}</strong>
     </div>
     <h1>Connexion</h1>
@@ -546,7 +687,7 @@ function renderStatus(state: ReturnType<typeof getConnectionState>, csrfToken: s
   return `<div class="status">
     <div>
       <div class="label">Statut</div>
-      <div class="value">${escapeHtml(state.email)} <span class="badge">${providerLabel}</span></div>
+      <div class="value">${escapeHtml(state.email)} <span class="stamp stamp-done">${providerLabel}</span></div>
       <div class="label" style="margin-top:6px;">Connecté depuis le ${escapeHtml(since)}</div>
     </div>
     <form method="POST" action="/auth/disconnect">
@@ -573,196 +714,367 @@ function renderProviderCard(opts: {
 
   return `<div class="card">
     <div>
-      <h2>${escapeHtml(opts.title)}${isActive ? '<span class="badge">Active</span>' : ""}</h2>
+      <h2>${escapeHtml(opts.title)}${isActive ? '<span class="stamp stamp-done">Active</span>' : ""}</h2>
       <p>${escapeHtml(opts.description)}</p>
     </div>
     ${button}
   </div>`;
 }
 
-// ---------- Suivi des dossiers ----------
+// ---------- Registre des dossiers ----------
 
 function renderDossiersPage(threads: ThreadRow[], csrfToken: string | undefined): string {
   const categoryLabels = new Map(listCategories().map((c) => [c.id, c.label]));
   const rows = threads.map((row) => renderThreadRow(row, csrfToken, categoryLabels)).join("");
-  const table = threads.length
-    ? `<div class="table-wrap"><table>
-        <thead><tr>
-          <th>Dossier</th><th>Catégorie</th><th>Statut</th><th>Échéance</th><th>Relances</th><th></th>
-        </tr></thead>
-        <tbody>${rows}</tbody>
-      </table></div>`
-    : `<div class="table-wrap"><div class="empty">Aucun dossier pour le moment — ils apparaissent ici dès qu'un email entrant est traité.</div></div>`;
+  const list = threads.length
+    ? `<div class="ledger">
+        <div class="ledger-head"><span>Dossier</span></div>
+        ${rows}
+      </div>`
+    : `<div class="ledger"><div class="empty">Aucun dossier pour le moment — ils apparaissent ici dès qu'un email entrant est traité.</div></div>`;
 
   const retentionBanner = `<div class="banner banner-info">Les données des dossiers (sujet, expéditeur, dates, nombre de relances) sont conservées indéfiniment tant qu'elles ne sont pas supprimées manuellement. Voir la <a href="/confidentialite">page confidentialité &amp; rétention</a>.</div>`;
 
   return pageShell(
     "dossiers",
-    "Suivi des dossiers",
-    "Détection automatique de réponse à partir du fil email connecté. Si un dossier a été traité autrement (autre boîte, téléphone), clôturez-le ici manuellement.",
-    retentionBanner + table
+    "Registre des dossiers",
+    "Détection automatique de réponse à partir du fil email connecté. Ouvrez un dossier pour consulter ou personnaliser sa séquence de relance.",
+    retentionBanner + list
   );
 }
 
-const STATUS_LABELS: Record<string, { label: string; badgeClass: string }> = {
-  received: { label: "Reçu", badgeClass: "badge-wait" },
-  skipped: { label: "Sans suite requise", badgeClass: "badge-skip" },
-  ack_sent: { label: "Accusé envoyé", badgeClass: "badge-wait" },
-  drafts_ready: { label: "Brouillons prêts", badgeClass: "badge-wait" },
-  responded: { label: "Répondu", badgeClass: "badge-done" },
-  relance_sent: { label: "Relancé", badgeClass: "badge-late" },
-  closed: { label: "Clôturé", badgeClass: "badge-done" },
+const STATUS_LABELS: Record<string, { label: string; stampClass: string }> = {
+  received: { label: "Reçu", stampClass: "stamp-wait" },
+  skipped: { label: "Sans suite requise", stampClass: "stamp-skip" },
+  ack_sent: { label: "Accusé envoyé", stampClass: "stamp-wait" },
+  drafts_ready: { label: "Brouillons prêts", stampClass: "stamp-wait" },
+  responded: { label: "Répondu", stampClass: "stamp-done" },
+  relance_sent: { label: "Relancé", stampClass: "stamp-late" },
+  closed: { label: "Clôturé", stampClass: "stamp-done" },
 };
+
+function statusStamp(row: ThreadRow): { label: string; stampClass: string } {
+  const info = STATUS_LABELS[row.status] ?? { label: row.status, stampClass: "stamp-skip" };
+  const isOverdue =
+    row.due_at !== null &&
+    new Date(row.due_at).getTime() < Date.now() &&
+    !["responded", "closed", "skipped"].includes(row.status);
+  return isOverdue ? { label: `${info.label} (en retard)`, stampClass: "stamp-late" } : info;
+}
 
 function renderThreadRow(
   row: ThreadRow,
   csrfToken: string | undefined,
   categoryLabels: Map<string, string>
 ): string {
-  const statusInfo = STATUS_LABELS[row.status] ?? { label: row.status, badgeClass: "badge-skip" };
-  const isOverdue =
-    row.due_at !== null &&
-    new Date(row.due_at).getTime() < Date.now() &&
-    !["responded", "closed", "skipped"].includes(row.status);
-  const badgeClass = isOverdue ? "badge-late" : statusInfo.badgeClass;
-  const statusLabel = isOverdue ? `${statusInfo.label} (en retard)` : statusInfo.label;
-
+  const stamp = statusStamp(row);
   const dueLabel = row.due_at ? new Date(row.due_at).toLocaleString("fr-FR") : "—";
   const canClose = !["responded", "closed", "skipped"].includes(row.status);
   const categoryLabel = categoryLabels.get(row.category_id) ?? row.category_id;
+  const detailHref = `/dossiers/${encodeURIComponent(row.thread_id)}`;
 
-  return `<tr>
-    <td>
-      <div class="subject">${escapeHtml(row.subject)}</div>
-      <div class="meta">${escapeHtml(row.sender_name ? `${row.sender_name} — ` : "")}${escapeHtml(row.sender_email)}</div>
-    </td>
-    <td>${escapeHtml(categoryLabel)}</td>
-    <td><span class="badge ${badgeClass}">${escapeHtml(statusLabel)}</span></td>
-    <td>${escapeHtml(dueLabel)}</td>
-    <td>${row.relance_count}</td>
-    <td>
-      <div class="row-actions">
+  return `<div class="ledger-row">
+    <div class="ledger-main">
+      <a class="subject-link" href="${detailHref}">${escapeHtml(row.subject)}</a>
+      <div class="ledger-meta">${escapeHtml(row.sender_name ? `${row.sender_name} — ` : "")}${escapeHtml(row.sender_email)}</div>
+    </div>
+    <div class="ledger-facts">
+      <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Échéance</span><span class="fact-value">${escapeHtml(dueLabel)}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Relances</span><span class="fact-value">${row.relance_count}</span></div>
+    </div>
+    <div class="ledger-actions">
+      ${
+        canClose
+          ? `<form method="POST" action="/dossiers/${encodeURIComponent(row.thread_id)}/cloturer">
+               ${csrfField(csrfToken)}
+               <button class="btn btn-secondary btn-sm" type="submit">Marquer répondu</button>
+             </form>`
+          : ""
+      }
+      <a class="btn btn-secondary btn-sm" href="${detailHref}">Ouvrir</a>
+    </div>
+  </div>`;
+}
+
+// ---------- Detail d'un dossier ----------
+
+function renderDossierDetailPage(thread: ThreadRow, csrfToken: string | undefined, saved: string | undefined): string {
+  const categoryLabels = new Map(listCategories().map((c) => [c.id, c.label]));
+  const categoryLabel = categoryLabels.get(thread.category_id) ?? thread.category_id;
+  const stamp = statusStamp(thread);
+  const canClose = !["responded", "closed", "skipped"].includes(thread.status);
+  const banner = saved ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>` : "";
+
+  const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id);
+  const draftCount = listDraftsForThread(thread.thread_id).length;
+
+  const header = `
+    <div class="detail-header">
+      <div class="subject-static">${escapeHtml(thread.subject)}</div>
+      <div class="ledger-meta">${escapeHtml(thread.sender_name ? `${thread.sender_name} — ` : "")}${escapeHtml(thread.sender_email)}</div>
+      <div class="detail-facts">
+        <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Reçu le</span><span class="fact-value">${escapeHtml(new Date(thread.received_at).toLocaleString("fr-FR"))}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Accusé le</span><span class="fact-value">${thread.ack_sent_at ? escapeHtml(new Date(thread.ack_sent_at).toLocaleString("fr-FR")) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Échéance</span><span class="fact-value">${thread.due_at ? escapeHtml(new Date(thread.due_at).toLocaleString("fr-FR")) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Relances</span><span class="fact-value">${thread.relance_count}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Brouillons déposés</span><span class="fact-value">${draftCount}</span></div>
+      </div>
+      <div class="detail-actions">
         ${
           canClose
-            ? `<form method="POST" action="/dossiers/${encodeURIComponent(row.thread_id)}/cloturer">
+            ? `<form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/cloturer">
+                 <input type="hidden" name="_redirect" value="detail" />
                  ${csrfField(csrfToken)}
-                 <button class="btn btn-ghost btn-sm" type="submit">Marquer répondu</button>
+                 <button class="btn btn-secondary btn-sm" type="submit">Marquer répondu</button>
                </form>`
             : ""
         }
-        <form method="POST" action="/dossiers/${encodeURIComponent(row.thread_id)}/supprimer"
+        ${
+          draftCount > 0
+            ? `<form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/nettoyer-brouillons"
+                     onsubmit="return confirm('Supprimer les ${draftCount} brouillon(s) restants de la messagerie ?');">
+                 ${csrfField(csrfToken)}
+                 <button class="btn btn-secondary btn-sm" type="submit">Nettoyer les brouillons</button>
+               </form>`
+            : ""
+        }
+        <form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/supprimer"
               onsubmit="return confirm('Supprimer definitivement les donnees de ce dossier ?');">
           ${csrfField(csrfToken)}
           <button class="btn btn-ghost btn-sm" type="submit">Supprimer les données</button>
         </form>
       </div>
-    </td>
-  </tr>`;
+    </div>`;
+
+  const overrideBanner = isCustom
+    ? `<div class="override-banner is-custom">
+        <span>Ce dossier utilise une séquence de relance personnalisée, distincte de la catégorie "${escapeHtml(categoryLabel)}".</span>
+        <form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps/reset">
+          ${csrfField(csrfToken)}
+          <button class="btn btn-secondary btn-sm" type="submit">Revenir à la règle de la catégorie</button>
+        </form>
+      </div>`
+    : `<div class="override-banner is-default">
+        <span>Ce dossier suit la séquence de relance par défaut de la catégorie "${escapeHtml(categoryLabel)}".</span>
+        <form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps/personnaliser">
+          ${csrfField(csrfToken)}
+          <button class="btn btn-secondary btn-sm" type="submit">Personnaliser pour ce dossier</button>
+        </form>
+      </div>`;
+
+  const stepsList = renderStepList({
+    steps,
+    editable: isCustom,
+    deleteAction: (order) => `/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps/${order}/delete`,
+    csrfToken,
+    executedCount: thread.relance_count,
+  });
+
+  const addForm = isCustom
+    ? `<form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/relance-steps">
+        ${csrfField(csrfToken)}
+        ${stepTypeSelect()}
+        <input type="number" name="delayHours" min="0" step="0.5" placeholder="Délai (h)" required />
+        <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
+      </form>`
+    : "";
+
+  const stepsSection = `
+    <div class="settings-section">
+      <h2>Séquence de relance</h2>
+      <p class="section-hint">Chaque étape se déclenche à l'échéance + le délai indiqué. Un rappel interne journalise seulement; une relance externe envoie un email au demandeur.</p>
+      ${overrideBanner}
+      ${stepsList}
+      ${addForm}
+    </div>`;
+
+  return pageShell(
+    "dossiers",
+    "Dossier",
+    "Détail du dossier, statut de traitement, et séquence de relance appliquée.",
+    banner + header + stepsSection,
+    "/dossiers"
+  );
+}
+
+function stepTypeSelect(): string {
+  return `<select name="channel">
+    <option value="internal">Rappel interne</option>
+    <option value="external">Relance externe</option>
+  </select>`;
+}
+
+function renderStepList(opts: {
+  steps: RelanceStep[];
+  editable: boolean;
+  deleteAction: (order: number) => string;
+  csrfToken: string | undefined;
+  executedCount: number;
+}): string {
+  if (opts.steps.length === 0) {
+    return `<div class="step-empty">Aucune étape configurée — ce dossier ne sera jamais relancé automatiquement.</div>`;
+  }
+  const items = opts.steps
+    .map((step) => {
+      const done = step.order <= opts.executedCount;
+      const stampClass = step.channel === "external" ? "stamp-external" : "stamp-internal";
+      const deleteForm = opts.editable
+        ? `<form method="POST" action="${opts.deleteAction(step.order)}" onsubmit="return confirm('Supprimer cette étape ?');">
+            ${csrfField(opts.csrfToken)}
+            <button class="btn btn-ghost btn-sm" type="submit">Supprimer</button>
+          </form>`
+        : "";
+      return `<div class="step-item">
+        <span class="step-order">${step.order}.</span>
+        <span class="step-delay">${escapeHtml(formatDelay(step.delayHours))}</span>
+        <span class="step-hours">(${step.delayHours}h)</span>
+        <span class="stamp ${stampClass}">${escapeHtml(channelLabel(step.channel))}</span>
+        ${done ? `<span class="stamp stamp-done">Effectuée</span>` : ""}
+        ${deleteForm}
+      </div>`;
+    })
+    .join("");
+  return `<div class="step-list">${items}</div>`;
 }
 
 // ---------- Reglages ----------
 
-function renderReglagesPage(
-  categories: CategoryConfig[],
-  relance: RelanceConfig,
-  csrfToken: string | undefined,
-  saved: string | undefined
-): string {
+function renderReglagesPage(categories: CategoryConfig[], csrfToken: string | undefined, saved: string | undefined): string {
   const banner = saved ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>` : "";
 
-  const categoryRows = categories
-    .map(
-      (cat) => `
-    <form class="settings-row" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}">
-      ${csrfField(csrfToken)}
-      <div>
-        <input type="text" name="label" value="${escapeHtml(cat.label)}" />
-        <span class="cat-id">${escapeHtml(cat.id)}</span>
-      </div>
-      <div><input type="number" name="slaHours" value="${cat.slaHours}" min="0" step="0.5" /></div>
-      <div class="checkbox-cell">
-        <input type="checkbox" id="ack-${escapeHtml(cat.id)}" name="acknowledgeAutomatically" ${cat.acknowledgeAutomatically ? "checked" : ""} />
-        <label for="ack-${escapeHtml(cat.id)}">Accusé auto.</label>
-      </div>
-      <div class="checkbox-cell">
-        <input type="checkbox" id="ext-${escapeHtml(cat.id)}" name="allowExternalRelance" ${cat.allowExternalRelance ? "checked" : ""} />
-        <label for="ext-${escapeHtml(cat.id)}">Relance externe</label>
-      </div>
-      <div><button class="btn btn-primary btn-sm" type="submit">Enregistrer</button></div>
-    </form>`
-    )
+  const categoryBlocks = categories
+    .map((cat) => {
+      const steps = getCategoryRelanceSteps(cat.id);
+      const stepsList = renderStepList({
+        steps,
+        editable: true,
+        deleteAction: (order) => `/reglages/categories/${encodeURIComponent(cat.id)}/relance-steps/${order}/delete`,
+        csrfToken,
+        executedCount: -1,
+      });
+      return `<div class="category-block">
+        <form class="category-head-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}">
+          ${csrfField(csrfToken)}
+          <div>
+            <input type="text" name="label" value="${escapeHtml(cat.label)}" />
+            <span class="cat-id">${escapeHtml(cat.id)}</span>
+          </div>
+          <div><input type="number" name="slaHours" value="${cat.slaHours}" min="0" step="0.5" /></div>
+          <div class="checkbox-cell">
+            <input type="checkbox" id="ack-${escapeHtml(cat.id)}" name="acknowledgeAutomatically" ${cat.acknowledgeAutomatically ? "checked" : ""} />
+            <label for="ack-${escapeHtml(cat.id)}">Accusé auto.</label>
+          </div>
+          <div><button class="btn btn-primary btn-sm" type="submit">Enregistrer</button></div>
+        </form>
+        <div class="steps-panel">
+          <div class="steps-title">Séquence de relance</div>
+          ${stepsList}
+          <form class="step-add-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}/relance-steps">
+            ${csrfField(csrfToken)}
+            ${stepTypeSelect()}
+            <input type="number" name="delayHours" min="0" step="0.5" placeholder="Délai (h)" required />
+            <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
+          </form>
+        </div>
+      </div>`;
+    })
     .join("");
 
   const body = `
     ${banner}
     <div class="settings-section">
-      <h2>Catégories</h2>
-      <div class="settings-table">
-        <div class="settings-head">
-          <div>Libellé</div><div>SLA (h)</div><div>Accusé</div><div>Relance externe</div><div></div>
-        </div>
-        ${categoryRows}
-      </div>
-    </div>
-    <div class="settings-section">
-      <h2>Seuils de relance globaux</h2>
-      <form class="relance-form" method="POST" action="/reglages/relance">
-        ${csrfField(csrfToken)}
-        <div class="field-group">
-          <label for="internalReminderAfterHours">Rappel interne après (h)</label>
-          <input id="internalReminderAfterHours" type="number" name="internalReminderAfterHours" min="0" step="0.5" value="${relance.internalReminderAfterHours}" />
-        </div>
-        <div class="field-group">
-          <label for="externalRelanceAfterHours">Relance externe après (h)</label>
-          <input id="externalRelanceAfterHours" type="number" name="externalRelanceAfterHours" min="0" step="0.5" value="${relance.externalRelanceAfterHours}" />
-        </div>
-        <div class="field-group">
-          <label for="maxRelances">Nombre max. de relances</label>
-          <input id="maxRelances" type="number" name="maxRelances" min="0" step="1" value="${relance.maxRelances}" />
-        </div>
-        <div><button class="btn btn-primary" type="submit">Enregistrer les seuils</button></div>
-      </form>
+      <h2>Catégories &amp; séquences de relance</h2>
+      <p class="section-hint">Libellé, SLA et accusé automatique par catégorie, plus la séquence de relance qui s'applique par défaut à tout dossier de cette catégorie (sauf s'il a sa propre séquence — voir sa page de détail).</p>
+      ${categoryBlocks}
     </div>`;
 
   return pageShell(
     "reglages",
     "Réglages",
-    "SLA par catégorie, accusé automatique, autorisation de relance externe, et seuils globaux de relance — modifiables ici, sans redéploiement.",
+    "SLA par catégorie, accusé automatique, et séquences de relance — modifiables ici, sans redéploiement.",
     body
   );
 }
 
 // ---------- Journal (audit) ----------
 
-function renderJournalPage(reminders: ReminderRow[]): string {
+function renderJournalPage(reminders: ReminderRow[], errors: PipelineErrorRow[]): string {
   const rows = reminders.map(renderReminderRow).join("");
-  const table = reminders.length
-    ? `<div class="table-wrap"><table>
-        <thead><tr><th>Dossier</th><th>Type</th><th>Note</th><th>Date</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table></div>`
-    : `<div class="table-wrap"><div class="empty">Aucune entrée pour le moment — les rappels internes et relances externes apparaissent ici.</div></div>`;
+  const list = reminders.length
+    ? `<div class="ledger">
+        <div class="ledger-head"><span>Entrée</span></div>
+        ${rows}
+      </div>`
+    : `<div class="ledger"><div class="empty">Aucune entrée pour le moment — les rappels internes et relances externes apparaissent ici.</div></div>`;
+
+  const errorRows = errors.map(renderErrorRow).join("");
+  const errorList = errors.length
+    ? `<div class="ledger">
+        <div class="ledger-head"><span>Erreur</span></div>
+        ${errorRows}
+      </div>`
+    : `<div class="ledger"><div class="empty">Aucune erreur — le pipeline tourne sans incident depuis le dernier vidage de ce journal.</div></div>`;
+
+  const body = `
+    <div class="settings-section">
+      <h2>Relances &amp; rappels</h2>
+      <p class="section-hint">Trace de chaque rappel interne journalisé et de chaque relance externe envoyée automatiquement par le pipeline.</p>
+      ${list}
+    </div>
+    <div class="settings-section">
+      <h2>Erreurs du pipeline</h2>
+      <p class="section-hint">Echecs de traitement (email, generation IA, envoi, nettoyage de brouillons) — un dossier concerne par une erreur n'est pas bloqué pour les suivants, mais reste à traiter manuellement si l'erreur persiste.</p>
+      ${errorList}
+    </div>`;
 
   return pageShell(
     "journal",
     "Journal",
-    "Historique des rappels internes et relances externes envoyées automatiquement par le pipeline.",
-    table
+    "Ce qui a été fait automatiquement par le pipeline, et ce qui a échoué — pour intervenir sans avoir à rouvrir la boîte mail ou les logs du serveur.",
+    body
   );
 }
 
+function renderErrorRow(row: PipelineErrorRow): string {
+  const contextLabels: Record<string, string> = {
+    process_incoming: "Traitement d'un email entrant",
+    relance_check: "Vérification des relances",
+    draft_cleanup: "Nettoyage des brouillons",
+  };
+  const contextLabel = contextLabels[row.context] ?? row.context;
+  return `<div class="ledger-row">
+    <div class="ledger-main">
+      ${
+        row.thread_id
+          ? `<a class="subject-link" href="/dossiers/${encodeURIComponent(row.thread_id)}">${escapeHtml(contextLabel)}</a>`
+          : `<span class="subject-static">${escapeHtml(contextLabel)}</span>`
+      }
+      <div class="ledger-meta">${escapeHtml(row.message)}</div>
+    </div>
+    <div class="ledger-facts">
+      <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(new Date(row.created_at).toLocaleString("fr-FR"))}</span></div>
+    </div>
+  </div>`;
+}
+
 function renderReminderRow(row: ReminderRow): string {
-  const kindLabel = row.kind === "external" ? "Relance externe" : "Rappel interne";
-  const kindClass = row.kind === "external" ? "badge-late" : "badge-internal";
-  return `<tr>
-    <td>
-      <div class="subject">${escapeHtml(row.subject)}</div>
-      <div class="meta">${escapeHtml(row.sender_email)}</div>
-    </td>
-    <td><span class="badge ${kindClass}">${escapeHtml(kindLabel)}</span></td>
-    <td>${escapeHtml(row.note ?? "—")}</td>
-    <td>${escapeHtml(new Date(row.created_at).toLocaleString("fr-FR"))}</td>
-  </tr>`;
+  const kindLabel = channelLabel(row.kind);
+  const stampClass = row.kind === "external" ? "stamp-external" : "stamp-internal";
+  return `<div class="ledger-row">
+    <div class="ledger-main">
+      <a class="subject-link" href="/dossiers/${encodeURIComponent(row.thread_id)}">${escapeHtml(row.subject)}</a>
+      <div class="ledger-meta">${escapeHtml(row.sender_email)}</div>
+    </div>
+    <div class="ledger-facts">
+      <div class="ledger-fact"><span class="fact-label">Type</span><span class="stamp ${stampClass}">${escapeHtml(kindLabel)}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Note</span><span class="fact-value">${escapeHtml(row.note ?? "—")}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(new Date(row.created_at).toLocaleString("fr-FR"))}</span></div>
+    </div>
+  </div>`;
 }
 
 // ---------- Confidentialite / retention ----------
@@ -780,14 +1092,13 @@ function renderConfidentialitePage(): string {
       <div class="card" style="flex-direction:column; align-items:flex-start; gap:8px;">
         <h2>Durée de conservation</h2>
         <p>Les données sont conservées indéfiniment tant qu'un dossier n'est pas supprimé manuellement depuis
-        la page <a href="/dossiers">Suivi des dossiers</a> (bouton "Supprimer les données"). Il n'y a pas de
-        purge automatique à ce jour.</p>
+        sa page de détail (bouton "Supprimer les données"). Il n'y a pas de purge automatique à ce jour.</p>
       </div>
       <div class="card" style="flex-direction:column; align-items:flex-start; gap:8px;">
         <h2>Demande de suppression</h2>
-        <p>Pour supprimer les données d'un dossier précis, utilisez le bouton "Supprimer les données" sur la
-        ligne correspondante dans <a href="/dossiers">Suivi des dossiers</a>. Cette action supprime le dossier,
-        ses brouillons associés et son historique de relances.</p>
+        <p>Pour supprimer les données d'un dossier précis, ouvrez-le depuis <a href="/dossiers">Registre des dossiers</a>
+        et utilisez le bouton "Supprimer les données". Cette action supprime le dossier, ses brouillons associés,
+        son historique de relances, et toute séquence de relance personnalisée.</p>
       </div>
     </div>`;
 

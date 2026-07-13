@@ -147,4 +147,14 @@ export class GraphConnector implements EmailConnector {
     const draftId = await this.buildReplyDraft(params);
     return { id: draftId };
   }
+
+  async deleteDraft(draftId: string): Promise<void> {
+    try {
+      await graphFetch(`/me/messages/${draftId}`, { method: "DELETE" });
+    } catch (err) {
+      // Deja envoye ou supprime manuellement par un agent: pas une erreur.
+      if ((err as Error).message.includes("-> 404:")) return;
+      throw err;
+    }
+  }
 }

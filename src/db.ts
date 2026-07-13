@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
-import type { CategoryConfig, RelanceConfig, ThreadStatus } from "./types.js";
+import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus } from "./types.js";
 
 mkdirSync(path.dirname(path.resolve(config.dbPath)), { recursive: true });
 const db = new DatabaseSync(path.resolve(config.dbPath));
@@ -54,61 +54,85 @@ db.exec(`
     label TEXT NOT NULL,
     sla_hours REAL NOT NULL,
     acknowledge_automatically INTEGER NOT NULL,
-    allow_external_relance INTEGER NOT NULL,
     sort_order INTEGER NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS relance_settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    internal_reminder_after_hours REAL NOT NULL,
-    external_relance_after_hours REAL NOT NULL,
-    max_relances INTEGER NOT NULL
+  CREATE TABLE IF NOT EXISTS relance_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_type TEXT NOT NULL CHECK (owner_type IN ('category', 'thread')),
+    owner_id TEXT NOT NULL,
+    step_order INTEGER NOT NULL,
+    channel TEXT NOT NULL CHECK (channel IN ('internal', 'external')),
+    delay_hours REAL NOT NULL,
+    UNIQUE(owner_type, owner_id, step_order)
+  );
+
+  CREATE TABLE IF NOT EXISTS pipeline_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    context TEXT NOT NULL,
+    thread_id TEXT,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL
   );
 `);
 
-seedSettingsIfEmpty();
+seedIfNeeded();
 
+/** Forme du fichier JSON d'amorçage historique (config/categories.json) — figee, distincte du modele runtime actuel. */
 interface CategoriesSeedFile {
-  categories: CategoryConfig[];
-  relance: RelanceConfig;
+  categories: Array<{
+    id: string;
+    label: string;
+    slaHours: number;
+    acknowledgeAutomatically: boolean;
+    allowExternalRelance: boolean;
+  }>;
+  relance: {
+    internalReminderAfterHours: number;
+    externalRelanceAfterHours: number;
+    maxRelances: number;
+  };
 }
 
-function seedSettingsIfEmpty(): void {
+function seedIfNeeded(): void {
   const categoryCount = db.prepare("SELECT COUNT(*) AS n FROM categories").get() as { n: number };
-  const settingsCount = db.prepare("SELECT COUNT(*) AS n FROM relance_settings").get() as {
-    n: number;
-  };
-  if (categoryCount.n > 0 && settingsCount.n > 0) return;
+  const stepOwnerCount = db
+    .prepare("SELECT COUNT(*) AS n FROM relance_steps WHERE owner_type = 'category'")
+    .get() as { n: number };
+  if (categoryCount.n > 0 && stepOwnerCount.n > 0) return;
 
   const raw = readFileSync(path.resolve(config.categoriesConfigPath), "utf-8");
   const seed = JSON.parse(raw) as CategoriesSeedFile;
+  const seedById = new Map(seed.categories.map((cat) => [cat.id, cat]));
 
   if (categoryCount.n === 0) {
     const insert = db.prepare(
-      `INSERT INTO categories (id, label, sla_hours, acknowledge_automatically, allow_external_relance, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO categories (id, label, sla_hours, acknowledge_automatically, sort_order)
+       VALUES (?, ?, ?, ?, ?)`
     );
     seed.categories.forEach((cat, index) => {
-      insert.run(
-        cat.id,
-        cat.label,
-        cat.slaHours,
-        cat.acknowledgeAutomatically ? 1 : 0,
-        cat.allowExternalRelance ? 1 : 0,
-        index
-      );
+      insert.run(cat.id, cat.label, cat.slaHours, cat.acknowledgeAutomatically ? 1 : 0, index);
     });
   }
 
-  if (settingsCount.n === 0) {
-    db.prepare(
-      `INSERT INTO relance_settings (id, internal_reminder_after_hours, external_relance_after_hours, max_relances)
-       VALUES (1, ?, ?, ?)`
-    ).run(
-      seed.relance.internalReminderAfterHours,
-      seed.relance.externalRelanceAfterHours,
-      seed.relance.maxRelances
-    );
+  if (stepOwnerCount.n === 0) {
+    const existingCategoryIds = (
+      db.prepare("SELECT id FROM categories").all() as unknown as { id: string }[]
+    ).map((r) => r.id);
+
+    for (const categoryId of existingCategoryIds) {
+      const fromSeed = seedById.get(categoryId);
+      const steps = fromSeed
+        ? [
+            { channel: "internal" as const, delayHours: seed.relance.internalReminderAfterHours },
+            {
+              channel: fromSeed.allowExternalRelance ? ("external" as const) : ("internal" as const),
+              delayHours: seed.relance.internalReminderAfterHours + seed.relance.externalRelanceAfterHours,
+            },
+          ]
+        : [{ channel: "internal" as const, delayHours: 24 }];
+      writeSteps("category", categoryId, steps);
+    }
   }
 }
 
@@ -254,6 +278,7 @@ export function deleteThreadData(threadId: string): void {
   db.prepare("DELETE FROM reminders WHERE thread_id = ?").run(threadId);
   db.prepare("DELETE FROM drafts WHERE thread_id = ?").run(threadId);
   db.prepare("DELETE FROM processed_messages WHERE thread_id = ?").run(threadId);
+  db.prepare("DELETE FROM relance_steps WHERE owner_type = 'thread' AND owner_id = ?").run(threadId);
   db.prepare("DELETE FROM threads WHERE thread_id = ?").run(threadId);
 }
 
@@ -262,7 +287,6 @@ interface CategoryRow {
   label: string;
   sla_hours: number;
   acknowledge_automatically: number;
-  allow_external_relance: number;
   sort_order: number;
 }
 
@@ -272,7 +296,6 @@ function toCategoryConfig(row: CategoryRow): CategoryConfig {
     label: row.label,
     slaHours: row.sla_hours,
     acknowledgeAutomatically: row.acknowledge_automatically === 1,
-    allowExternalRelance: row.allow_external_relance === 1,
   };
 }
 
@@ -285,49 +308,108 @@ export function listCategories(): CategoryConfig[] {
 
 export function updateCategory(
   id: string,
-  patch: { label: string; slaHours: number; acknowledgeAutomatically: boolean; allowExternalRelance: boolean }
+  patch: { label: string; slaHours: number; acknowledgeAutomatically: boolean }
 ): void {
   db.prepare(
     `UPDATE categories SET
       label = ?,
       sla_hours = ?,
-      acknowledge_automatically = ?,
-      allow_external_relance = ?
+      acknowledge_automatically = ?
      WHERE id = ?`
-  ).run(
-    patch.label,
-    patch.slaHours,
-    patch.acknowledgeAutomatically ? 1 : 0,
-    patch.allowExternalRelance ? 1 : 0,
-    id
+  ).run(patch.label, patch.slaHours, patch.acknowledgeAutomatically ? 1 : 0, id);
+}
+
+// ---------- Sequences de relance (par categorie ou surcharge par dossier) ----------
+
+interface RelanceStepRow {
+  step_order: number;
+  channel: string;
+  delay_hours: number;
+}
+
+function readSteps(ownerType: "category" | "thread", ownerId: string): RelanceStep[] {
+  const rows = db
+    .prepare(
+      "SELECT step_order, channel, delay_hours FROM relance_steps WHERE owner_type = ? AND owner_id = ? ORDER BY step_order ASC"
+    )
+    .all(ownerType, ownerId) as unknown as RelanceStepRow[];
+  return rows.map((r) => ({
+    order: r.step_order,
+    channel: r.channel as RelanceChannel,
+    delayHours: r.delay_hours,
+  }));
+}
+
+function writeSteps(
+  ownerType: "category" | "thread",
+  ownerId: string,
+  steps: Array<{ channel: RelanceChannel; delayHours: number }>
+): void {
+  db.prepare("DELETE FROM relance_steps WHERE owner_type = ? AND owner_id = ?").run(ownerType, ownerId);
+  const insert = db.prepare(
+    "INSERT INTO relance_steps (owner_type, owner_id, step_order, channel, delay_hours) VALUES (?, ?, ?, ?, ?)"
+  );
+  steps.forEach((step, index) => {
+    insert.run(ownerType, ownerId, index + 1, step.channel, step.delayHours);
+  });
+}
+
+export function getCategoryRelanceSteps(categoryId: string): RelanceStep[] {
+  return readSteps("category", categoryId);
+}
+
+export function addCategoryRelanceStep(
+  categoryId: string,
+  step: { channel: RelanceChannel; delayHours: number }
+): void {
+  writeSteps("category", categoryId, [...readSteps("category", categoryId), step]);
+}
+
+export function deleteCategoryRelanceStep(categoryId: string, order: number): void {
+  writeSteps(
+    "category",
+    categoryId,
+    readSteps("category", categoryId).filter((s) => s.order !== order)
   );
 }
 
-interface RelanceSettingsRow {
-  internal_reminder_after_hours: number;
-  external_relance_after_hours: number;
-  max_relances: number;
-}
-
-export function getRelanceSettingsRow(): RelanceConfig {
+export function hasThreadRelanceOverride(threadId: string): boolean {
   const row = db
-    .prepare("SELECT * FROM relance_settings WHERE id = 1")
-    .get() as unknown as RelanceSettingsRow;
-  return {
-    internalReminderAfterHours: row.internal_reminder_after_hours,
-    externalRelanceAfterHours: row.external_relance_after_hours,
-    maxRelances: row.max_relances,
-  };
+    .prepare("SELECT 1 FROM relance_steps WHERE owner_type = 'thread' AND owner_id = ? LIMIT 1")
+    .get(threadId);
+  return row !== undefined;
 }
 
-export function updateRelanceSettingsRow(patch: RelanceConfig): void {
-  db.prepare(
-    `UPDATE relance_settings SET
-      internal_reminder_after_hours = ?,
-      external_relance_after_hours = ?,
-      max_relances = ?
-     WHERE id = 1`
-  ).run(patch.internalReminderAfterHours, patch.externalRelanceAfterHours, patch.maxRelances);
+export function getThreadRelanceOverride(threadId: string): RelanceStep[] {
+  return readSteps("thread", threadId);
+}
+
+export function addThreadRelanceStep(
+  threadId: string,
+  step: { channel: RelanceChannel; delayHours: number }
+): void {
+  writeSteps("thread", threadId, [...readSteps("thread", threadId), step]);
+}
+
+export function deleteThreadRelanceStep(threadId: string, order: number): void {
+  writeSteps(
+    "thread",
+    threadId,
+    readSteps("thread", threadId).filter((s) => s.order !== order)
+  );
+}
+
+export function clearThreadRelanceOverride(threadId: string): void {
+  db.prepare("DELETE FROM relance_steps WHERE owner_type = 'thread' AND owner_id = ?").run(threadId);
+}
+
+export function getEffectiveRelanceSteps(
+  threadId: string,
+  categoryId: string
+): { steps: RelanceStep[]; isCustom: boolean } {
+  const overrideSteps = readSteps("thread", threadId);
+  if (overrideSteps.length > 0) return { steps: overrideSteps, isCustom: true };
+  return { steps: readSteps("category", categoryId), isCustom: false };
 }
 
 export interface ReminderRow {
@@ -350,6 +432,49 @@ export function listReminders(limit = 150): ReminderRow[] {
        LIMIT ?`
     )
     .all(limit) as unknown as ReminderRow[];
+}
+
+// ---------- Erreurs du pipeline (visibles depuis le Journal) ----------
+
+export interface PipelineErrorRow {
+  id: number;
+  context: string;
+  thread_id: string | null;
+  message: string;
+  created_at: string;
+}
+
+export function recordPipelineError(context: string, threadId: string | null, message: string): void {
+  db.prepare(
+    "INSERT INTO pipeline_errors (context, thread_id, message, created_at) VALUES (?, ?, ?, ?)"
+  ).run(context, threadId, message, new Date().toISOString());
+}
+
+export function listPipelineErrors(limit = 100): PipelineErrorRow[] {
+  return db
+    .prepare("SELECT * FROM pipeline_errors ORDER BY created_at DESC LIMIT ?")
+    .all(limit) as unknown as PipelineErrorRow[];
+}
+
+// ---------- Brouillons deposes (pour nettoyage a la cloture d'un dossier) ----------
+
+export interface DraftRow {
+  id: number;
+  thread_id: string;
+  connector_draft_id: string;
+  variant: string;
+  label: string;
+  created_at: string;
+}
+
+export function listDraftsForThread(threadId: string): DraftRow[] {
+  return db
+    .prepare("SELECT * FROM drafts WHERE thread_id = ?")
+    .all(threadId) as unknown as DraftRow[];
+}
+
+export function deleteDraftRows(threadId: string): void {
+  db.prepare("DELETE FROM drafts WHERE thread_id = ?").run(threadId);
 }
 
 export default db;

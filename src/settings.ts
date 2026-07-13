@@ -1,9 +1,5 @@
-import { getRelanceSettingsRow, listCategories } from "./db.js";
-import type { CategoriesFile, CategoryConfig } from "./types.js";
-
-export function loadCategories(): CategoriesFile {
-  return { categories: listCategories(), relance: getRelanceSettingsRow() };
-}
+import { listCategories } from "./db.js";
+import type { CategoryConfig } from "./types.js";
 
 export function getCategory(categoryId: string): CategoryConfig {
   const categories = listCategories();

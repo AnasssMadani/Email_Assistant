@@ -3,6 +3,7 @@ import { config } from "./config.js";
 import { createEmailConnector } from "./connectors/index.js";
 import { processIncomingMessage } from "./pipeline/processIncoming.js";
 import { runRelanceCheck } from "./pipeline/relanceCheck.js";
+import { recordPipelineError } from "./db.js";
 import type { EmailConnector } from "./types.js";
 
 // Un traitement d'email (classification + accuse + 3 brouillons, plusieurs
@@ -22,10 +23,19 @@ async function pollInbox(connector: EmailConnector): Promise<void> {
   try {
     const messages = await connector.listRecentInboxMessages(25);
     for (const message of messages) {
-      await processIncomingMessage(connector, message);
+      // Isole chaque message: une erreur (Claude, API email, etc.) ne doit
+      // jamais empecher le traitement des messages suivants du meme cycle,
+      // ni des cycles suivants si le meme message echoue de facon repetee.
+      try {
+        await processIncomingMessage(connector, message);
+      } catch (err) {
+        console.error(`[scrutation boite] erreur sur le message ${message.id}:`, err);
+        recordPipelineError("process_incoming", message.threadId || null, (err as Error).message);
+      }
     }
   } catch (err) {
     console.error("[scrutation boite] erreur:", err);
+    recordPipelineError("process_incoming", null, (err as Error).message);
   } finally {
     pollInProgress = false;
   }

@@ -36,6 +36,7 @@ export interface EmailConnector {
   getThread(threadId: string): Promise<EmailThread>;
   sendReply(params: SendReplyParams): Promise<{ id: string }>;
   createDraftReply(params: SendReplyParams): Promise<{ id: string }>;
+  deleteDraft(draftId: string): Promise<void>;
 }
 
 export interface CategoryConfig {
@@ -43,18 +44,21 @@ export interface CategoryConfig {
   label: string;
   slaHours: number;
   acknowledgeAutomatically: boolean;
-  allowExternalRelance: boolean;
 }
 
-export interface RelanceConfig {
-  internalReminderAfterHours: number;
-  externalRelanceAfterHours: number;
-  maxRelances: number;
-}
+export type RelanceChannel = "internal" | "external";
 
-export interface CategoriesFile {
-  categories: CategoryConfig[];
-  relance: RelanceConfig;
+/**
+ * Une etape d'une sequence de relance: se declenche a due_at + delayHours,
+ * "internal" ne fait que journaliser un rappel, "external" envoie une
+ * relance au demandeur. Une sequence appartient soit a une categorie
+ * (comportement par defaut), soit a un dossier precis (surcharge qui
+ * remplace entierement la sequence de la categorie pour ce dossier).
+ */
+export interface RelanceStep {
+  order: number;
+  channel: RelanceChannel;
+  delayHours: number;
 }
 
 export interface ClassificationResult {

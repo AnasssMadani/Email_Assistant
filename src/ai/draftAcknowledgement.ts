@@ -1,5 +1,7 @@
+import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
+import { withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
 import { formatThreadContext } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
@@ -9,7 +11,20 @@ export interface AckDraft {
   body: string;
 }
 
+const ackSchema = z.object({
+  subject: z.string().min(1),
+  body: z.string().min(1),
+});
+
 export async function draftAcknowledgement(
+  thread: EmailThread,
+  incoming: EmailMessage,
+  category: CategoryConfig
+): Promise<AckDraft> {
+  return withRetry(() => draftAcknowledgementOnce(thread, incoming, category));
+}
+
+async function draftAcknowledgementOnce(
   thread: EmailThread,
   incoming: EmailMessage,
   category: CategoryConfig
@@ -32,7 +47,7 @@ export async function draftAcknowledgement(
 
   const response = await client.messages.create({
     model: CLAUDE_MODEL,
-    max_tokens: 700,
+    max_tokens: 900,
     system: [
       "Tu rediges des accuses de reception au nom d'une entreprise, en francais.",
       "",
@@ -59,5 +74,5 @@ export async function draftAcknowledgement(
   if (!toolUse) {
     throw new Error("Claude n'a pas retourne d'accuse de reception structure.");
   }
-  return toolUse.input as AckDraft;
+  return ackSchema.parse(toolUse.input);
 }

@@ -1,38 +1,52 @@
-import { getCategory, loadCategories } from "../settings.js";
+import { getCategory } from "../settings.js";
 import { draftRelance } from "../ai/draftRelance.js";
+import { cleanupUnusedDrafts } from "./draftCleanup.js";
 import { buildReplySubject } from "../utils.js";
 import {
+  getEffectiveRelanceSteps,
   incrementRelance,
   listThreadsAwaitingReply,
+  recordPipelineError,
   recordReminder,
   setThreadStatus,
   type ThreadRow,
 } from "../db.js";
-import type { EmailConnector } from "../types.js";
+import type { EmailConnector, RelanceStep } from "../types.js";
 
 /**
- * Verifie, pour chaque dossier ouvert, si le delai (due_at) est depasse sans
- * qu'une reponse ait ete envoyee depuis l'accuse de reception. Si c'est le
- * cas: un rappel interne est journalise (a brancher sur Slack/Teams/email
- * d'equipe), ou une relance externe est envoyee au demandeur si la
- * categorie l'autorise et qu'un premier rappel interne est deja passe.
+ * Verifie, pour chaque dossier ouvert, si la prochaine etape de sa sequence
+ * de relance (celle du dossier si une surcharge existe, sinon celle de sa
+ * categorie) est arrivee a echeance (due_at + delayHours de l'etape).
+ * relance_count sert d'index dans la sequence: chaque execution — qu'elle
+ * soit un simple rappel interne journalise ou une relance externe envoyee
+ * au demandeur, selon le "channel" de l'etape — avance au dossier a
+ * l'etape suivante. Une sequence vide ou epuisee ne declenche plus rien.
  */
 export async function runRelanceCheck(connector: EmailConnector): Promise<void> {
-  const { relance } = loadCategories();
   const now = Date.now();
-  const cooldownMs = relance.internalReminderAfterHours * 3600_000;
 
   for (const row of listThreadsAwaitingReply()) {
-    if (row.relance_count >= relance.maxRelances) continue;
-    if (!row.due_at || new Date(row.due_at).getTime() > now) continue;
-    if (row.last_relance_at && now - new Date(row.last_relance_at).getTime() < cooldownMs) continue;
+    if (!row.due_at) continue;
 
-    await checkThread(connector, row);
+    const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id);
+    const nextStep = steps[row.relance_count];
+    if (!nextStep) continue;
+
+    const fireAt = new Date(row.due_at).getTime() + nextStep.delayHours * 3600_000;
+    if (now < fireAt) continue;
+
+    // Isole chaque dossier: un echec (Claude, API email, dossier corrompu)
+    // ne doit jamais empecher la verification des autres dossiers du cycle.
+    try {
+      await checkThread(connector, row, nextStep);
+    } catch (err) {
+      console.error(`[verification relances] erreur sur le dossier ${row.thread_id}:`, err);
+      recordPipelineError("relance_check", row.thread_id, (err as Error).message);
+    }
   }
 }
 
-async function checkThread(connector: EmailConnector, row: ThreadRow): Promise<void> {
-  const category = getCategory(row.category_id);
+async function checkThread(connector: EmailConnector, row: ThreadRow, step: RelanceStep): Promise<void> {
   const thread = await connector.getThread(row.thread_id);
 
   const repliedAfterAck =
@@ -43,13 +57,15 @@ async function checkThread(connector: EmailConnector, row: ThreadRow): Promise<v
 
   if (repliedAfterAck) {
     setThreadStatus(row.thread_id, "responded");
+    await cleanupUnusedDrafts(connector, row.thread_id);
     return;
   }
 
-  const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
-  const isExternalStep = category.allowExternalRelance && row.relance_count >= 1;
+  if (step.channel === "external") {
+    const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
+    if (!lastInbound) return;
 
-  if (isExternalStep && lastInbound) {
+    const category = getCategory(row.category_id);
     const relance = await draftRelance(thread, lastInbound, category);
     await connector.sendReply({
       threadId: row.thread_id,
@@ -68,7 +84,7 @@ async function checkThread(connector: EmailConnector, row: ThreadRow): Promise<v
   recordReminder(
     row.thread_id,
     "internal",
-    `Dossier "${row.subject}" en attente depuis plus de ${category.slaHours}h — aucune reponse envoyee.`
+    `Dossier "${row.subject}" en attente depuis plus de ${step.delayHours}h apres l'echeance — aucune reponse envoyee.`
   );
   console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
 }

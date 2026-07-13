@@ -1,10 +1,32 @@
+import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
+import { withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
 import { formatThreadContext } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread, ReplyDraft } from "../types.js";
 
+const replyDraftSchema = z.object({
+  variant: z.enum(["A", "B", "C"]),
+  label: z.string().min(1),
+  subject: z.string().min(1),
+  body: z.string().min(1),
+});
+
+// Exactement 3: un tableau tronque ou mal forme (max_tokens atteint en cours
+// de generation, par ex.) doit echouer la validation plutot que produire
+// moins de brouillons que promis, ou un brouillon au contenu incomplet.
+const repliesSchema = z.object({ drafts: z.array(replyDraftSchema).length(3) });
+
 export async function draftThreeReplies(
+  thread: EmailThread,
+  incoming: EmailMessage,
+  category: CategoryConfig
+): Promise<ReplyDraft[]> {
+  return withRetry(() => draftThreeRepliesOnce(thread, incoming, category));
+}
+
+async function draftThreeRepliesOnce(
   thread: EmailThread,
   incoming: EmailMessage,
   category: CategoryConfig
@@ -43,7 +65,7 @@ export async function draftThreeReplies(
 
   const response = await client.messages.create({
     model: CLAUDE_MODEL,
-    max_tokens: 2200,
+    max_tokens: 3200,
     system: [
       `Tu rediges des propositions de reponse au nom d'une entreprise, en francais,`,
       `pour un email de categorie "${category.label}".`,
@@ -73,5 +95,5 @@ export async function draftThreeReplies(
   if (!toolUse) {
     throw new Error("Claude n'a pas retourne de brouillons structures.");
   }
-  return (toolUse.input as { drafts: ReplyDraft[] }).drafts;
+  return repliesSchema.parse(toolUse.input).drafts;
 }

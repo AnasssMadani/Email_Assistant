@@ -1,5 +1,7 @@
+import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
+import { withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
 import { formatThreadContext } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
@@ -9,7 +11,20 @@ export interface RelanceDraft {
   body: string;
 }
 
+const relanceSchema = z.object({
+  subject: z.string().min(1),
+  body: z.string().min(1),
+});
+
 export async function draftRelance(
+  thread: EmailThread,
+  lastInbound: EmailMessage,
+  category: CategoryConfig
+): Promise<RelanceDraft> {
+  return withRetry(() => draftRelanceOnce(thread, lastInbound, category));
+}
+
+async function draftRelanceOnce(
   thread: EmailThread,
   lastInbound: EmailMessage,
   category: CategoryConfig
@@ -32,7 +47,7 @@ export async function draftRelance(
 
   const response = await client.messages.create({
     model: CLAUDE_MODEL,
-    max_tokens: 500,
+    max_tokens: 700,
     system: [
       "Tu rediges un email de relance, en francais, pour un dossier client reste sans",
       "reponse malgre l'accuse de reception deja envoye.",
@@ -57,5 +72,5 @@ export async function draftRelance(
   if (!toolUse) {
     throw new Error("Claude n'a pas retourne de relance structuree.");
   }
-  return toolUse.input as RelanceDraft;
+  return relanceSchema.parse(toolUse.input);
 }

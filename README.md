@@ -23,10 +23,12 @@ lui-même l'un ou l'autre depuis une page web — voir
 4. Génère trois brouillons de réponse distincts (`src/ai/draftReplies.ts`)
    et les dépose en brouillon dans la messagerie — **aucun envoi automatique
    de réponse**, un humain choisit et envoie.
-5. Toutes les 30 minutes, vérifie les dossiers dont le délai (SLA) est
-   dépassé sans réponse envoyée (`src/pipeline/relanceCheck.ts`): rappel
-   interne journalisé, ou relance externe automatique si la catégorie
-   l'autorise.
+5. Toutes les 30 minutes, vérifie chaque dossier ouvert contre sa
+   **séquence de relance** (`src/pipeline/relanceCheck.ts`): une suite
+   d'étapes ordonnées, chacune déclenchée à échéance + un délai, qui est
+   soit un simple rappel interne journalisé, soit une relance externe
+   envoyée automatiquement au demandeur. Voir
+   [Séquences de relance](#séquences-de-relance).
 
 ## Où sont stockées les données
 
@@ -77,7 +79,7 @@ Il a des angles morts, à connaître avant de compter dessus à 100%:
 
 Pour couvrir ces cas, une page de suivi manuel existe:
 
-### Suivi des dossiers (`npm run setup` → onglet "Suivi des dossiers")
+### Registre des dossiers (`npm run setup` → onglet "Registre des dossiers")
 
 Liste tous les dossiers avec leur statut, échéance et nombre de relances,
 et propose un bouton **"Marquer répondu"** pour clôturer manuellement un
@@ -85,6 +87,36 @@ dossier que la détection automatique n'a pas vu passer. Règle d'usage à
 donner à l'équipe: toujours répondre en utilisant un des 3 brouillons
 générés (ou au moins en répondant dans le même fil) pour que la détection
 automatique fonctionne; le bouton manuel reste le filet de sécurité.
+
+Cliquer sur un dossier ouvre sa **page de détail**: dates, statut, séquence
+de relance appliquée (avec quelles étapes sont déjà passées), et les
+actions "Marquer répondu" / "Supprimer les données".
+
+## Séquences de relance
+
+Chaque **catégorie** a sa propre séquence de relance: une liste ordonnée
+d'étapes, chacune définie par un délai (en heures après l'échéance du
+dossier) et un canal — **rappel interne** (journalisé, visible sur la page
+Journal, à brancher sur l'outil d'équipe) ou **relance externe** (email
+envoyé automatiquement au demandeur, rédigé par Claude). Exemple typique:
+étape 1 à +24h en rappel interne, étape 2 à +96h en relance externe. Se
+règle depuis **Réglages** (`/reglages`), par catégorie — pas de
+redéploiement nécessaire.
+
+Un **dossier précis** peut avoir sa propre séquence, indépendante de celle
+de sa catégorie: depuis sa page de détail, "Personnaliser pour ce dossier"
+pré-remplit une séquence modifiable à partir de la séquence effective du
+moment; tant qu'elle existe, elle remplace entièrement la règle de la
+catégorie pour ce dossier. "Revenir à la règle de la catégorie" la supprime.
+
+Techniquement, une seule table (`relance_steps` dans `src/db.ts`) porte les
+deux cas — étapes rattachées à une catégorie (`owner_type='category'`) ou
+à un dossier (`owner_type='thread'`) — et
+`getEffectiveRelanceSteps(threadId, categoryId)` résout laquelle
+s'applique: la séquence du dossier si elle existe, sinon celle de sa
+catégorie. `relance_count` sur le dossier sert d'index dans cette séquence
+(combien d'étapes ont déjà été exécutées, rappel interne ou relance
+externe confondus).
 
 ## Installation
 
@@ -170,9 +202,9 @@ ascendante mais est déprécié — préférez `SETUP_PASSWORD_HASH`.
 
 ### 4. Personnalisation métier
 
-- **Catégories et seuils de relance** (SLA par catégorie, accusé
-  automatique, autorisation de relance externe, délais de rappel
-  interne/relance externe, nombre max de relances) se règlent désormais
+- **Catégories et séquences de relance** (SLA par catégorie, accusé
+  automatique, et la séquence d'étapes de relance de chaque catégorie —
+  voir [Séquences de relance](#séquences-de-relance)) se règlent désormais
   depuis l'application, onglet **Réglages** (`npm run setup` →
   `/reglages`) — **aucun redéploiement nécessaire**. Le fichier
   [`config/categories.json`](config/categories.json) ne sert plus qu'à
@@ -189,7 +221,7 @@ ascendante mais est déprécié — préférez `SETUP_PASSWORD_HASH`.
   externes envoyées automatiquement (table `reminders`).
 - **Confidentialité & rétention** (`/confidentialite`) — ce qui est stocké,
   pendant combien de temps, et comment supprimer les données d'un dossier
-  (bouton "Supprimer les données" sur la page Suivi des dossiers).
+  (bouton "Supprimer les données" sur la page de détail du dossier).
 
 ### 5. Lancement
 
@@ -331,7 +363,8 @@ npm run test:pipeline   # test manuel de bout en bout de la couche IA (nécessit
 ```
 
 `npm test` couvre les unités isolables (utilitaires, chiffrement des jetons,
-authentification/session/CSRF, résolution des catégories) — voir
+authentification/session/CSRF, résolution des catégories, résolution des
+séquences de relance catégorie/dossier) — voir
 [`test/`](test). La logique du pipeline complet (classification + rédaction
 + envoi réel) reste couverte par le script manuel `test:pipeline`, pas par
 des tests automatisés, car elle suppose un accès Claude/connecteur réel.
@@ -354,7 +387,7 @@ src/
   pipeline/                  orchestration (email entrant, vérification des relances)
   scripts/                   auth Gmail en CLI (fallback), test de la couche IA sans email, hash de mot de passe
   connectionState.ts         messagerie active (écrit par la page de connexion)
-  db.ts                      suivi des dossiers, catégories, réglages de relance, journal (SQLite local)
+  db.ts                      dossiers, catégories, séquences de relance (par catégorie ou par dossier), journal (SQLite local)
   scheduler.ts, index.ts     pipeline seul
   main.ts                    pipeline + page web dans un seul process (prod/Docker)
 test/                      tests unitaires (node:test, exécutés via tsx)
@@ -382,7 +415,7 @@ sans `&` (ex. `SRA and Co`).
   Slack/Teams/email d'équipe selon l'outil du client pour une notification
   active plutôt qu'une simple consultation.
 - Aucune purge automatique des données anciennes: suppression uniquement
-  manuelle, dossier par dossier, depuis "Suivi des dossiers" (voir
+  manuelle, dossier par dossier, depuis sa page de détail (voir
   [Confidentialité & rétention](#autres-pages-de-lapplication)).
 - SQLite local convient au pilote; prévoir Postgres pour la production à
   plus grande échelle (voir [Où sont stockées les données](#où-sont-stockées-les-données)).
