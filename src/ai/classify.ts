@@ -17,7 +17,7 @@ export async function classifyEmail(
   thread: EmailThread,
   incoming: EmailMessage
 ): Promise<ClassificationResult> {
-  return withRetry(() => classifyEmailOnce(thread, incoming));
+  return withRetry(() => classifyEmailOnce(thread, incoming), "classification");
 }
 
 async function classifyEmailOnce(

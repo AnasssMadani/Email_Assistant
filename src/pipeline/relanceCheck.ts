@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { draftRelance } from "../ai/draftRelance.js";
 import { cleanupUnusedDrafts } from "./draftCleanup.js";
+import { tagSource } from "./errorTag.js";
 import { buildReplySubject } from "../utils.js";
 import {
   getEffectiveRelanceSteps,
@@ -79,7 +80,7 @@ export async function checkPreReplyThread(
   row: ThreadRow,
   step: RelanceStep
 ): Promise<void> {
-  const thread = await connector.getThread(row.thread_id);
+  const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(row.thread_id));
 
   const repliedAfterAck =
     row.ack_sent_at !== null &&
@@ -108,13 +109,15 @@ export async function checkPreReplyThread(
 
     const category = getCategory(row.category_id);
     const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
-    await connector.sendReply({
-      threadId: row.thread_id,
-      to: row.sender_email,
-      subject: buildReplySubject(row.subject),
-      bodyText: relance.body,
-      inReplyToMessageId: lastInbound.rfcMessageId,
-    });
+    await tagSource("Messagerie — envoi de la relance", () =>
+      connector.sendReply({
+        threadId: row.thread_id,
+        to: row.sender_email,
+        subject: buildReplySubject(row.subject),
+        bodyText: relance.body,
+        inReplyToMessageId: lastInbound.rfcMessageId,
+      })
+    );
     incrementRelance(row.thread_id, "relance_sent");
     recordReminder(row.thread_id, "external", "Relance envoyee automatiquement au demandeur.");
     console.log(`[relance externe] ${row.sender_email} — "${row.subject}"`);
@@ -134,7 +137,7 @@ export async function checkPostReplyThread(
   row: ThreadRow,
   step: RelanceStep
 ): Promise<void> {
-  const thread = await connector.getThread(row.thread_id);
+  const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(row.thread_id));
 
   const clientRepliedAfterOurReply =
     row.human_replied_at !== null &&
@@ -160,13 +163,15 @@ export async function checkPostReplyThread(
 
     const category = getCategory(row.category_id);
     const relance = await draftRelance(thread, lastOutbound, category, "post_reply");
-    await connector.sendReply({
-      threadId: row.thread_id,
-      to: row.sender_email,
-      subject: buildReplySubject(row.subject),
-      bodyText: relance.body,
-      inReplyToMessageId: lastOutbound.rfcMessageId,
-    });
+    await tagSource("Messagerie — envoi de la relance", () =>
+      connector.sendReply({
+        threadId: row.thread_id,
+        to: row.sender_email,
+        subject: buildReplySubject(row.subject),
+        bodyText: relance.body,
+        inReplyToMessageId: lastOutbound.rfcMessageId,
+      })
+    );
     incrementPostReplyRelance(row.thread_id, "relance_sent");
     recordReminder(row.thread_id, "external", "Relance post-reponse envoyee au client (suivi de notre reponse).");
     console.log(`[relance post-reponse] ${row.sender_email} — "${row.subject}"`);

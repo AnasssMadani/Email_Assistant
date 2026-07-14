@@ -3,7 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
-import { formatThreadContext } from "./prompts.js";
+import { formatThreadContext, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
 
 export interface RelanceDraft {
@@ -30,7 +30,10 @@ export async function draftRelance(
   category: CategoryConfig,
   phase: RelancePhase = "pre_reply"
 ): Promise<RelanceDraft> {
-  return withRetry(() => draftRelanceOnce(thread, anchorMessage, category, phase));
+  return withRetry(
+    () => draftRelanceOnce(thread, anchorMessage, category, phase),
+    phase === "post_reply" ? "relance post-réponse" : "relance"
+  );
 }
 
 async function draftRelanceOnce(
@@ -58,13 +61,15 @@ async function draftRelanceOnce(
   const system =
     phase === "post_reply"
       ? [
-          "Tu rediges un email de relance, en francais, pour un client qui n'a pas repondu",
+          "Tu rediges un email de relance, pour un client qui n'a pas repondu",
           "a notre reponse de fond precedente (ex: un devis envoye).",
           "",
           "IMPORTANT: le message affiche ci-dessous comme \"Nouveau message a traiter\" est",
           "NOTRE PROPRE dernier message envoye au client, pas le sien. Ne redige pas une",
           "reponse a ce message: redige une relance A SON SUJET, adressee au client, qui",
           "fait suite a ce que nous lui avons deja envoye.",
+          "",
+          LANGUAGE_INSTRUCTION,
           "",
           brandVoice,
           "",
@@ -92,8 +97,10 @@ async function draftRelanceOnce(
               ]
             : [];
           return [
-            "Tu rediges un email de relance, en francais, pour un dossier client reste sans",
+            "Tu rediges un email de relance, pour un dossier client reste sans",
             "reponse malgre l'accuse de reception deja envoye.",
+            "",
+            LANGUAGE_INSTRUCTION,
             "",
             brandVoice,
             "",

@@ -3,7 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
-import { formatThreadContext } from "./prompts.js";
+import { formatThreadContext, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread, ReplyDraft } from "../types.js";
 
 const replyDraftSchema = z.object({
@@ -23,7 +23,7 @@ export async function draftThreeReplies(
   incoming: EmailMessage,
   category: CategoryConfig
 ): Promise<ReplyDraft[]> {
-  return withRetry(() => draftThreeRepliesOnce(thread, incoming, category));
+  return withRetry(() => draftThreeRepliesOnce(thread, incoming, category), "3 brouillons de réponse");
 }
 
 async function draftThreeRepliesOnce(
@@ -67,8 +67,10 @@ async function draftThreeRepliesOnce(
     model: CLAUDE_MODEL,
     max_tokens: 3200,
     system: [
-      `Tu rediges des propositions de reponse au nom d'une entreprise, en francais,`,
+      `Tu rediges des propositions de reponse au nom d'une entreprise,`,
       `pour un email de categorie "${category.label}".`,
+      "",
+      LANGUAGE_INSTRUCTION,
       "",
       brandVoice,
       "",

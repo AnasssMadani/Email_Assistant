@@ -7,7 +7,7 @@ test("withRetry returns the result on first success", async () => {
   const result = await withRetry(async () => {
     calls++;
     return "ok";
-  });
+  }, "test-label");
   assert.equal(result, "ok");
   assert.equal(calls, 1);
 });
@@ -18,20 +18,20 @@ test("withRetry retries once after a failure, then succeeds", async () => {
     calls++;
     if (calls === 1) throw new Error("transient");
     return "ok";
-  });
+  }, "test-label");
   assert.equal(result, "ok");
   assert.equal(calls, 2);
 });
 
-test("withRetry throws the last error once attempts are exhausted", async () => {
+test("withRetry throws the last error tagged with the source label once attempts are exhausted", async () => {
   let calls = 0;
   await assert.rejects(
     () =>
       withRetry(async () => {
         calls++;
         throw new Error(`failure ${calls}`);
-      }),
-    /failure 2/
+      }, "classification"),
+    /\[Claude — classification\] failure 2/
   );
   assert.equal(calls, 2);
 });

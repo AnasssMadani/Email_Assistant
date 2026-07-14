@@ -28,7 +28,9 @@ import {
   listPipelineErrors,
   listReminders,
   listRecentThreads,
+  markMessageProcessed,
   recordPipelineError,
+  setThreadHumanReplied,
   setThreadStatus,
   updateCategory,
   upsertThreadReceived,
@@ -37,7 +39,7 @@ import {
   type ReminderRow,
   type ThreadRow,
 } from "../db.js";
-import type { CategoryConfig, RelanceChannel, RelanceStep } from "../types.js";
+import type { CategoryConfig, EmailMessage, RelanceChannel, RelanceStep } from "../types.js";
 import {
   authConfigured,
   clearSessionCookie,
@@ -445,6 +447,66 @@ app.get("/journal", (_req: Request, res: Response) => {
   res.send(renderJournalPage(listReminders(150), listPipelineErrors(100)));
 });
 
+// ---------- Envois sans dossier (suivi manuel) ----------
+
+/**
+ * Complement manuel a la detection automatique (discoverOutbound.ts): celle-ci
+ * ignore volontairement tout ce qui a ete envoye avant le demarrage du
+ * process (pour ne pas suivre des annees d'historique au premier deploiement)
+ * et ne tourne qu'au rythme du polling — un envoi tres recent peut donc ne
+ * pas encore apparaitre. Cette page permet de forcer le suivi immediatement.
+ */
+app.get("/envois", async (req: Request, res: Response) => {
+  try {
+    const connector = createEmailConnector();
+    const sent = await connector.listRecentSentMessages(25);
+    const untracked = sent.filter((m) => !getThreadRow(m.threadId));
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(
+      renderNewSentPage(untracked, res.locals.csrfToken as string | undefined, query(req).saved, undefined)
+    );
+  } catch (err) {
+    recordPipelineError("web_request", null, `[Messagerie — lecture des envois] ${(err as Error).message}`);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(
+      renderNewSentPage(
+        [],
+        res.locals.csrfToken as string | undefined,
+        undefined,
+        "Impossible de récupérer les emails envoyés — voir le Journal pour le détail."
+      )
+    );
+  }
+});
+
+app.post("/envois/suivre", requireCsrf, (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  try {
+    if (!getThreadRow(body.threadId)) {
+      // deja suivi entre-temps (double-clic, etc.) sinon
+      const category = getCategory(body.categoryId || "autre");
+      upsertThreadReceived({
+        threadId: body.threadId,
+        subject: body.subject,
+        senderEmail: body.recipientEmail,
+        senderName: body.recipientName || null,
+        categoryId: category.id,
+        urgency: "normal",
+        slaHours: category.slaHours,
+        status: "awaiting_client_reply",
+        dueAt: null,
+      });
+      setThreadHumanReplied(body.threadId, body.sentAt || undefined);
+      if (body.messageId) markMessageProcessed(body.messageId, body.threadId);
+    }
+    res.redirect(`/dossiers/${encodeURIComponent(body.threadId)}?saved=1`);
+  } catch (err) {
+    console.error(`[suivi manuel d'un envoi] erreur sur ${body.threadId}:`, err);
+    recordPipelineError("discover_outbound", body.threadId || null, (err as Error).message);
+    res.redirect("/envois?error=1");
+  }
+});
+
 // ---------- Confidentialite / retention ----------
 
 app.get("/confidentialite", (_req: Request, res: Response) => {
@@ -454,7 +516,7 @@ app.get("/confidentialite", (_req: Request, res: Response) => {
 
 // ---------- Gabarit commun ----------
 
-type ActivePage = "connexion" | "dossiers" | "reglages" | "journal" | "confidentialite";
+type ActivePage = "connexion" | "dossiers" | "reglages" | "journal" | "envois" | "confidentialite";
 
 function pageShell(active: ActivePage, title: string, sub: string, body: string, backLink?: string): string {
   const brand = config.branding;
@@ -482,6 +544,7 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
     <a href="/dossiers" class="${active === "dossiers" ? "active" : ""}">Registre des dossiers</a>
     <a href="/reglages" class="${active === "reglages" ? "active" : ""}">Réglages</a>
     <a href="/journal" class="${active === "journal" ? "active" : ""}">Journal</a>
+    <a href="/envois" class="${active === "envois" ? "active" : ""}">Envois</a>
     <form method="POST" action="/logout"><button class="btn-link" type="submit">Déconnexion</button></form>
   </nav>
   ${backLink ? `<a class="back-link" href="${backLink}">&larr; Retour</a>` : ""}
@@ -1284,13 +1347,32 @@ function renderJournalPage(reminders: ReminderRow[], errors: PipelineErrorRow[])
   );
 }
 
+const PIPELINE_ERROR_CONTEXT_LABELS: Record<string, string> = {
+  process_incoming: "Traitement d'un email entrant",
+  relance_check: "Vérification des relances",
+  draft_cleanup: "Nettoyage des brouillons",
+  manual_override: "Traitement manuel d'un dossier",
+  discover_outbound: "Détection d'un envoi sans dossier",
+  web_request: "Action dans l'application",
+  category_update: "Modification d'une catégorie",
+  category_relance_step_add: "Ajout d'une étape de relance (catégorie)",
+  category_relance_step_delete: "Suppression d'une étape de relance (catégorie)",
+  relance_step_add: "Ajout d'une étape de relance (dossier)",
+  relance_step_personnaliser: "Personnalisation de la séquence (dossier)",
+  relance_step_reset: "Réinitialisation de la séquence (dossier)",
+  relance_step_delete: "Suppression d'une étape de relance (dossier)",
+};
+
+/** Extrait le prefixe "[Source]" pose par tagSource()/withRetry() (ex: "[Claude — accusé]", "[Messagerie — envoi]") pour l'afficher comme un tampon distinct, au lieu de le laisser noye dans le texte du message. */
+function extractSourceStamp(message: string): { source: string | null; rest: string } {
+  const match = message.match(/^\[([^\]]+)\]\s*(.*)$/s);
+  if (!match) return { source: null, rest: message };
+  return { source: match[1], rest: match[2] };
+}
+
 function renderErrorRow(row: PipelineErrorRow): string {
-  const contextLabels: Record<string, string> = {
-    process_incoming: "Traitement d'un email entrant",
-    relance_check: "Vérification des relances",
-    draft_cleanup: "Nettoyage des brouillons",
-  };
-  const contextLabel = contextLabels[row.context] ?? row.context;
+  const contextLabel = PIPELINE_ERROR_CONTEXT_LABELS[row.context] ?? row.context;
+  const { source, rest } = extractSourceStamp(row.message);
   return `<div class="ledger-row">
     <div class="ledger-main">
       ${
@@ -1298,9 +1380,14 @@ function renderErrorRow(row: PipelineErrorRow): string {
           ? `<a class="subject-link" href="/dossiers/${encodeURIComponent(row.thread_id)}">${escapeHtml(contextLabel)}</a>`
           : `<span class="subject-static">${escapeHtml(contextLabel)}</span>`
       }
-      <div class="ledger-meta">${escapeHtml(row.message)}</div>
+      <div class="ledger-meta">${escapeHtml(rest)}</div>
     </div>
     <div class="ledger-facts">
+      ${
+        source
+          ? `<div class="ledger-fact"><span class="fact-label">Source</span><span class="stamp stamp-internal">${escapeHtml(source)}</span></div>`
+          : ""
+      }
       <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(new Date(row.created_at).toLocaleString("fr-FR"))}</span></div>
     </div>
   </div>`;
@@ -1318,6 +1405,69 @@ function renderReminderRow(row: ReminderRow): string {
       <div class="ledger-fact"><span class="fact-label">Type</span><span class="stamp ${stampClass}">${escapeHtml(kindLabel)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Note</span><span class="fact-value">${escapeHtml(row.note ?? "—")}</span></div>
       <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(new Date(row.created_at).toLocaleString("fr-FR"))}</span></div>
+    </div>
+  </div>`;
+}
+
+// ---------- Envois sans dossier (suivi manuel) ----------
+
+function renderNewSentPage(
+  messages: EmailMessage[],
+  csrfToken: string | undefined,
+  saved: string | undefined,
+  loadError: string | undefined
+): string {
+  const banner = loadError
+    ? `<div class="banner banner-error">${escapeHtml(loadError)}</div>`
+    : saved
+      ? `<div class="banner banner-ok">Suivi démarré pour ce dossier.</div>`
+      : "";
+
+  const list = messages.length
+    ? `<div class="ledger">
+        <div class="ledger-head"><span>Envoi</span></div>
+        ${messages.map((m) => renderNewSentRow(m, csrfToken)).join("")}
+      </div>`
+    : `<div class="ledger"><div class="empty">Aucun envoi récent sans dossier — tout ce que vous avez envoyé récemment est déjà suivi.</div></div>`;
+
+  return pageShell(
+    "envois",
+    "Envois sans dossier",
+    "Emails envoyés depuis votre messagerie qui ne font pas encore partie d'un dossier suivi (devis envoyé à froid, démarchage) — le suivi automatique s'en charge en général, mais un envoi très récent peut ne pas encore y figurer. Choisissez une catégorie et cliquez sur \"Suivre\" pour démarrer la relance immédiatement.",
+    banner + list
+  );
+}
+
+function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined): string {
+  const recipient = message.to[0];
+  const recipientLabel = recipient
+    ? `${recipient.name ? `${recipient.name} — ` : ""}${recipient.email}`
+    : "(destinataire inconnu)";
+  return `<div class="ledger-row">
+    <div class="ledger-main">
+      <span class="subject-static">${escapeHtml(message.subject)}</span>
+      <div class="ledger-meta">${escapeHtml(recipientLabel)} — envoyé le ${escapeHtml(message.receivedAt.toLocaleString("fr-FR"))}</div>
+    </div>
+    <div class="ledger-actions">
+      ${
+        recipient?.email
+          ? `<form class="step-add-form" method="POST" action="/envois/suivre">
+              ${csrfField(csrfToken)}
+              <input type="hidden" name="threadId" value="${escapeHtml(message.threadId)}" />
+              <input type="hidden" name="messageId" value="${escapeHtml(message.id)}" />
+              <input type="hidden" name="subject" value="${escapeHtml(message.subject)}" />
+              <input type="hidden" name="recipientEmail" value="${escapeHtml(recipient.email)}" />
+              <input type="hidden" name="recipientName" value="${escapeHtml(recipient.name ?? "")}" />
+              <input type="hidden" name="sentAt" value="${escapeHtml(message.receivedAt.toISOString())}" />
+              <select name="categoryId">
+                ${listCategories()
+                  .map((c) => `<option value="${escapeHtml(c.id)}" ${c.id === "autre" ? "selected" : ""}>${escapeHtml(c.label)}</option>`)
+                  .join("")}
+              </select>
+              <button class="btn btn-primary btn-sm" type="submit">Suivre</button>
+            </form>`
+          : `<span class="stamp stamp-skip">Destinataire inconnu</span>`
+      }
     </div>
   </div>`;
 }

@@ -3,6 +3,7 @@ import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
 import { draftThreeReplies } from "../ai/draftReplies.js";
 import { buildReplySubject } from "../utils.js";
+import { tagSource } from "./errorTag.js";
 import {
   isMessageProcessed,
   markMessageProcessed,
@@ -20,7 +21,7 @@ export async function processIncomingMessage(
   if (message.isFromUs) return;
   if (isMessageProcessed(message.id)) return;
 
-  const thread = await connector.getThread(message.threadId);
+  const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(message.threadId));
   const classification = await classifyEmail(thread, message);
   const category = getCategory(classification.categoryId);
 
@@ -73,25 +74,29 @@ export async function sendAcknowledgementAndDrafts(
   const replySubject = buildReplySubject(incoming.subject);
 
   const ack = await draftAcknowledgement(thread, incoming, category);
-  await connector.sendReply({
-    threadId: incoming.threadId,
-    to: incoming.from.email,
-    subject: replySubject,
-    bodyText: ack.body,
-    inReplyToMessageId: incoming.rfcMessageId,
-  });
+  await tagSource("Messagerie — envoi de l'accusé", () =>
+    connector.sendReply({
+      threadId: incoming.threadId,
+      to: incoming.from.email,
+      subject: replySubject,
+      bodyText: ack.body,
+      inReplyToMessageId: incoming.rfcMessageId,
+    })
+  );
   setThreadAckSent(incoming.threadId);
   console.log(`[accuse envoye] ${incoming.from.email} — "${incoming.subject}"`);
 
   const replies = await draftThreeReplies(thread, incoming, category);
   for (const reply of replies) {
-    const draft = await connector.createDraftReply({
-      threadId: incoming.threadId,
-      to: incoming.from.email,
-      subject: replySubject,
-      bodyText: reply.body,
-      inReplyToMessageId: incoming.rfcMessageId,
-    });
+    const draft = await tagSource("Messagerie — dépôt du brouillon", () =>
+      connector.createDraftReply({
+        threadId: incoming.threadId,
+        to: incoming.from.email,
+        subject: replySubject,
+        bodyText: reply.body,
+        inReplyToMessageId: incoming.rfcMessageId,
+      })
+    );
     recordDraft({
       threadId: incoming.threadId,
       connectorDraftId: draft.id,

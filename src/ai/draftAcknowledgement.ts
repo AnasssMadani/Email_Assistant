@@ -3,7 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
-import { formatThreadContext } from "./prompts.js";
+import { formatThreadContext, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
 
 export interface AckDraft {
@@ -21,7 +21,7 @@ export async function draftAcknowledgement(
   incoming: EmailMessage,
   category: CategoryConfig
 ): Promise<AckDraft> {
-  return withRetry(() => draftAcknowledgementOnce(thread, incoming, category));
+  return withRetry(() => draftAcknowledgementOnce(thread, incoming, category), "accusé de réception");
 }
 
 async function draftAcknowledgementOnce(
@@ -49,7 +49,9 @@ async function draftAcknowledgementOnce(
     model: CLAUDE_MODEL,
     max_tokens: 900,
     system: [
-      "Tu rediges des accuses de reception au nom d'une entreprise, en francais.",
+      "Tu rediges des accuses de reception au nom d'une entreprise.",
+      "",
+      LANGUAGE_INSTRUCTION,
       "",
       brandVoice,
       "",
