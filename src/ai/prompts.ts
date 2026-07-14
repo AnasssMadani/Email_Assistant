@@ -30,6 +30,20 @@ export function formatThreadContext(thread: EmailThread, incoming: EmailMessage)
   ].join("\n");
 }
 
+/**
+ * Version allegee de formatThreadContext: un seul message, sans l'historique
+ * complet du fil. Utilisee pour les appels ou le contexte des echanges
+ * precedents n'apporte pas assez de valeur pour justifier son cout en tokens
+ * (classification, accuse de reception, relance) — contrairement aux 3
+ * brouillons de reponse, qui eux beneficient reellement de tout l'historique
+ * pour ne pas contredire un echange anterieur. Sur un fil long (nombreux
+ * allers-retours), formatThreadContext peut couter plusieurs milliers de
+ * tokens en entree a chaque appel; ceci reste borne a un seul message.
+ */
+export function formatSingleMessage(message: EmailMessage): string {
+  return ["Message a traiter:", formatMessage(message)].join("\n");
+}
+
 function formatMessage(m: EmailMessage): string {
   return [
     `De: ${m.from.name ? `${m.from.name} <${m.from.email}>` : m.from.email}`,

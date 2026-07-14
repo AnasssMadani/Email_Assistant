@@ -3,7 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { recordUsage, withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
-import { formatThreadContext, LANGUAGE_INSTRUCTION } from "./prompts.js";
+import { formatSingleMessage, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
 
 export interface RelanceDraft {
@@ -130,7 +130,7 @@ async function draftRelanceOnce(
     system,
     tools: [tool],
     tool_choice: { type: "tool", name: "write_relance" },
-    messages: [{ role: "user", content: formatThreadContext(thread, anchorMessage) }],
+    messages: [{ role: "user", content: formatSingleMessage(anchorMessage) }],
   });
   recordUsage(phase === "post_reply" ? "relance_post_reponse" : "relance_pre_reponse", thread.id, response.usage);
 

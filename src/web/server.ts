@@ -1,6 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
-import { config } from "../config.js";
+import { config, loadBrandVoice, saveBrandVoice } from "../config.js";
 import { getConnectionState, saveConnectionState, clearConnectionState } from "../connectionState.js";
 import { buildGmailAuthUrl, exchangeCodeForGmailToken } from "../connectors/gmailAuth.js";
 import { buildGraphAuthUrl, exchangeCodeForGraphToken } from "../connectors/graphAuth.js";
@@ -15,6 +15,7 @@ import {
   addCategoryRelanceStep,
   addThreadRelanceStep,
   clearThreadRelanceOverride,
+  createCategory,
   deleteCategoryRelanceStep,
   deleteThreadData,
   deleteThreadRelanceStep,
@@ -67,9 +68,22 @@ function query(req: Request): Record<string, string> {
   return req.query as unknown as Record<string, string>;
 }
 
+/**
+ * Number() rejette silencieusement une virgule decimale ("1,5") en retournant
+ * NaN, ce qui retombe sur 0 via `|| 0` — un utilisateur en locale FR qui tape
+ * une virgule voit alors son etape/SLA enregistree a 0 sans aucun message
+ * d'erreur, ce qui a ete signale comme "ca ne marche pas". On normalise donc
+ * la virgule en point avant de parser.
+ */
+function parseLocaleNumber(raw: string | undefined): number {
+  const normalized = (raw ?? "").trim().replace(",", ".");
+  const value = Number(normalized);
+  return Number.isFinite(value) ? value : 0;
+}
+
 function parseStep(body: Record<string, string>): { channel: RelanceChannel; delayMinutes: number } {
   const channel: RelanceChannel = body.channel === "external" ? "external" : "internal";
-  const delayMinutes = Math.max(0, Number(body.delayMinutes) || 0);
+  const delayMinutes = Math.max(0, parseLocaleNumber(body.delayMinutes));
   return { channel, delayMinutes };
 }
 
@@ -240,11 +254,18 @@ app.post("/auth/disconnect", requireCsrf, (_req: Request, res: Response) => {
 
 // ---------- Suivi des dossiers ----------
 
-app.get("/dossiers", (_req: Request, res: Response) => {
+type DossierFilter = "a_traiter" | "en_retard" | "resolus" | "tous";
+
+function parseDossierFilter(value: string | undefined): DossierFilter {
+  return value === "en_retard" || value === "resolus" || value === "tous" ? value : "a_traiter";
+}
+
+app.get("/dossiers", (req: Request, res: Response) => {
   const threads = listRecentThreads(150);
   const usageSummary = getAiUsageSummarySince(currentMonthStartIso());
+  const filter = parseDossierFilter(query(req).filtre);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderDossiersPage(threads, res.locals.csrfToken as string | undefined, usageSummary));
+  res.send(renderDossiersPage(threads, res.locals.csrfToken as string | undefined, usageSummary, filter));
 });
 
 app.get("/dossiers/:threadId", (req: Request, res: Response) => {
@@ -441,13 +462,26 @@ function runOrRedirectReglagesError(res: Response, context: string, action: () =
   res.redirect("/reglages?saved=1");
 }
 
+app.post("/reglages/categories", requireCsrf, (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  runOrRedirectReglagesError(res, "category_create", () => {
+    const label = (body.label ?? "").trim();
+    if (!label) throw new Error("Le nom de la catégorie ne peut pas être vide.");
+    createCategory({
+      label,
+      slaHours: Math.max(0, parseLocaleNumber(body.slaHours) || 24),
+      acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
+    });
+  });
+});
+
 app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) => {
   const body = req.body as Record<string, string>;
   const alertMode = parseAlertMode(body.alertMode);
   runOrRedirectReglagesError(res, "category_update", () => {
     updateCategory(req.params.id, {
       label: (body.label ?? "").trim() || req.params.id,
-      slaHours: Math.max(0, Number(body.slaHours) || 0),
+      slaHours: Math.max(0, parseLocaleNumber(body.slaHours)),
       acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
       internalAlertsEnabled: alertMode.enabled,
       internalAlertsMinUrgency: alertMode.minUrgency,
@@ -555,6 +589,26 @@ app.post("/envois/suivre", requireCsrf, (req: Request, res: Response) => {
   }
 });
 
+// ---------- Ton de marque (gabarit lu par l'IA avant chaque redaction) ----------
+
+app.get("/ton-de-marque", (req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    renderBrandVoicePage(loadBrandVoice(), res.locals.csrfToken as string | undefined, query(req).saved, query(req).error)
+  );
+});
+
+app.post("/ton-de-marque", requireCsrf, (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  try {
+    saveBrandVoice(body.content ?? "");
+    res.redirect("/ton-de-marque?saved=1");
+  } catch (err) {
+    recordPipelineError("web_request", null, `[Ton de marque] ${(err as Error).message}`);
+    res.redirect("/ton-de-marque?error=1");
+  }
+});
+
 // ---------- Confidentialite / retention ----------
 
 app.get("/confidentialite", (_req: Request, res: Response) => {
@@ -564,7 +618,15 @@ app.get("/confidentialite", (_req: Request, res: Response) => {
 
 // ---------- Gabarit commun ----------
 
-type ActivePage = "connexion" | "dossiers" | "reglages" | "journal" | "envois" | "consommation" | "confidentialite";
+type ActivePage =
+  | "connexion"
+  | "dossiers"
+  | "reglages"
+  | "journal"
+  | "envois"
+  | "consommation"
+  | "ton-de-marque"
+  | "confidentialite";
 
 function pageShell(active: ActivePage, title: string, sub: string, body: string, backLink?: string): string {
   const brand = config.branding;
@@ -594,6 +656,7 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
     <a href="/journal" class="${active === "journal" ? "active" : ""}">Journal</a>
     <a href="/envois" class="${active === "envois" ? "active" : ""}">Envois</a>
     <a href="/consommation" class="${active === "consommation" ? "active" : ""}">Consommation IA</a>
+    <a href="/ton-de-marque" class="${active === "ton-de-marque" ? "active" : ""}">Ton de marque</a>
     <form method="POST" action="/logout"><button class="btn-link" type="submit">Déconnexion</button></form>
   </nav>
   ${backLink ? `<a class="back-link" href="${backLink}">&larr; Retour</a>` : ""}
@@ -756,6 +819,19 @@ function sharedStyles(primaryColor: string): string {
   details.advanced-steps > summary { cursor: pointer; padding: 10px 16px; font-size: 12px; color: var(--ink-soft); user-select: none; }
   details.advanced-steps > summary:hover { color: var(--ink); }
   details.advanced-steps[open] > summary { border-bottom: 1px solid var(--rule); }
+  .new-category-form { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 16px; border: 1px dashed var(--rule-strong); border-radius: 4px; margin-top: 4px; }
+  .new-category-form input[type=text] { flex: 1 1 220px; padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong); background: var(--paper-raised); color: var(--ink); }
+  .new-category-form input[type=number] { width: 80px; padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong); background: var(--paper-raised); color: var(--ink); }
+  .new-category-form .checkbox-cell { font-size: 12.5px; color: var(--ink-soft); }
+  .brand-voice-editor { width: 100%; padding: 14px; border-radius: 4px; border: 1px solid var(--rule-strong); background: var(--paper-raised); color: var(--ink); font-family: var(--font-mono); font-size: 13px; line-height: 1.6; resize: vertical; }
+  .live-toggle { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-soft); margin-bottom: 18px; }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-faint); }
+  .live-dot.live-dot-on { background: var(--stamp-done); box-shadow: 0 0 0 0 var(--stamp-done); animation: live-pulse 1.6s infinite; }
+  @keyframes live-pulse { 0% { box-shadow: 0 0 0 0 rgba(63,107,74,.5); } 70% { box-shadow: 0 0 0 6px rgba(63,107,74,0); } 100% { box-shadow: 0 0 0 0 rgba(63,107,74,0); } }
+  .filter-tabs { display: flex; gap: 6px; margin-bottom: 18px; flex-wrap: wrap; }
+  .filter-tabs a { padding: 6px 13px; border-radius: 999px; border: 1px solid var(--rule-strong); font-size: 12.5px; color: var(--ink-soft); text-decoration: none; }
+  .filter-tabs a:hover { border-color: var(--ink-soft); color: var(--ink); }
+  .filter-tabs a.active { background: var(--brand-primary); color: var(--brand-primary-ink); border-color: var(--brand-primary); }
   .category-head-form input[type=text], .category-head-form input[type=number] {
     width: 100%; padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong);
     background: var(--paper); color: inherit; font-size: 13.5px; font-family: inherit;
@@ -822,8 +898,14 @@ function trimNumber(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(1);
 }
 
+/**
+ * "internal"/"external" restent les valeurs techniques stockees en base (ne
+ * pas renommer sans migration), mais l'equipe trouvait "Rappel interne" /
+ * "Relance externe" opaques — le libelle affiche dit maintenant directement
+ * QUI reçoit le message: l'equipe, ou le client.
+ */
 function channelLabel(channel: RelanceChannel): string {
-  return channel === "external" ? "Relance externe" : "Rappel interne";
+  return channel === "external" ? "Relancer le client" : "Notifier l'équipe";
 }
 
 // ---------- Page de connexion applicative (login) ----------
@@ -981,20 +1063,40 @@ function renderProviderCard(opts: {
 
 // ---------- Registre des dossiers ----------
 
+const DOSSIER_FILTER_LABELS: Record<DossierFilter, string> = {
+  a_traiter: "À traiter",
+  en_retard: "En retard",
+  resolus: "Résolus",
+  tous: "Tous",
+};
+
+function matchesDossierFilter(row: ThreadRow, filter: DossierFilter): boolean {
+  const isResolved = ["responded", "closed", "skipped"].includes(row.status);
+  switch (filter) {
+    case "tous":
+      return true;
+    case "resolus":
+      return isResolved;
+    case "en_retard":
+      return statusStamp(row).label.includes("en retard");
+    case "a_traiter":
+    default:
+      return !isResolved;
+  }
+}
+
 function renderDossiersPage(
   threads: ThreadRow[],
   csrfToken: string | undefined,
-  usageSummary: AiUsageSummary
+  usageSummary: AiUsageSummary,
+  filter: DossierFilter
 ): string {
   const categoryLabels = new Map(listCategories().map((c) => [c.id, c.label]));
-  const rows = threads.map((row) => renderThreadRow(row, csrfToken, categoryLabels)).join("");
-  const list = threads.length
-    ? `<div class="ledger">
-        <div class="ledger-head"><span>Dossier</span></div>
-        ${rows}
-      </div>`
-    : `<div class="ledger"><div class="empty">Aucun dossier pour le moment — ils apparaissent ici dès qu'un email entrant est traité.</div></div>`;
 
+  // Les compteurs et le filtre "En retard" portent toujours sur l'ensemble des
+  // dossiers charges (pas seulement ceux affiches), pour que le tableau de
+  // bord reste une vue fiable de la situation reelle meme quand on regarde
+  // un sous-ensemble filtre.
   const overdueCount = threads.filter((t) => statusStamp(t).label.includes("en retard")).length;
   const awaitingClientCount = threads.filter((t) => t.status === "awaiting_client_reply").length;
   const openCount = threads.filter((t) => !["responded", "closed", "skipped"].includes(t.status)).length;
@@ -1007,13 +1109,35 @@ function renderDossiersPage(
     <div class="metric"><div class="metric-label">Coût IA ce mois-ci</div><div class="metric-value">${formatUsd(costThisMonth)}</div><div class="metric-sub"><a href="/consommation">Détail →</a></div></div>
   </div>`;
 
+  const filterTabs = `<div class="filter-tabs">
+    ${(Object.keys(DOSSIER_FILTER_LABELS) as DossierFilter[])
+      .map(
+        (f) =>
+          `<a href="/dossiers?filtre=${f}" class="${f === filter ? "active" : ""}">${escapeHtml(DOSSIER_FILTER_LABELS[f])}</a>`
+      )
+      .join("")}
+  </div>`;
+
+  const visibleThreads = threads.filter((t) => matchesDossierFilter(t, filter));
+  const rows = visibleThreads.map((row) => renderThreadRow(row, csrfToken, categoryLabels)).join("");
+  const list = visibleThreads.length
+    ? `<div class="ledger">
+        <div class="ledger-head"><span>Dossier</span></div>
+        ${rows}
+      </div>`
+    : `<div class="ledger"><div class="empty">${
+        filter === "tous"
+          ? "Aucun dossier pour le moment — ils apparaissent ici dès qu'un email entrant est traité."
+          : "Rien à afficher dans ce filtre."
+      }</div></div>`;
+
   const retentionBanner = `<div class="banner banner-info">Les données des dossiers (sujet, expéditeur, dates, nombre de relances) sont conservées indéfiniment tant qu'elles ne sont pas supprimées manuellement. Voir la <a href="/confidentialite">page confidentialité &amp; rétention</a>.</div>`;
 
   return pageShell(
     "dossiers",
     "Registre des dossiers",
     "Détection automatique de réponse à partir du fil email connecté. Ouvrez un dossier pour consulter ou personnaliser sa séquence de relance.",
-    summary + retentionBanner + list
+    summary + filterTabs + retentionBanner + list
   );
 }
 
@@ -1028,14 +1152,26 @@ const STATUS_LABELS: Record<string, { label: string; stampClass: string }> = {
   closed: { label: "Clôturé", stampClass: "stamp-done" },
 };
 
-const URGENCY_LABELS: Record<string, { label: string; stampClass: string }> = {
-  high: { label: "Urgence haute", stampClass: "stamp-late" },
-  normal: { label: "Urgence normale", stampClass: "stamp-wait" },
-  low: { label: "Urgence basse", stampClass: "stamp-skip" },
+const URGENCY_LABELS: Record<string, { label: string; stampClass: string; hint: string }> = {
+  high: {
+    label: "Urgence haute",
+    stampClass: "stamp-late",
+    hint: "Le client semble pressé, mécontent ou attend une décision rapide — à traiter en priorité.",
+  },
+  normal: {
+    label: "Urgence normale",
+    stampClass: "stamp-wait",
+    hint: "Demande standard, sans signal d'urgence particulier — traiter dans le délai SLA habituel.",
+  },
+  low: {
+    label: "Urgence basse",
+    stampClass: "stamp-skip",
+    hint: "Demande informative ou sans échéance — peut attendre sans risque.",
+  },
 };
 
-function urgencyStamp(urgency: string): { label: string; stampClass: string } {
-  return URGENCY_LABELS[urgency] ?? { label: urgency, stampClass: "stamp-skip" };
+function urgencyStamp(urgency: string): { label: string; stampClass: string; hint: string } {
+  return URGENCY_LABELS[urgency] ?? { label: urgency, stampClass: "stamp-skip", hint: "" };
 }
 
 function statusStamp(row: ThreadRow): { label: string; stampClass: string } {
@@ -1069,7 +1205,7 @@ function renderThreadRow(
     <div class="ledger-facts">
       <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
-      <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(row.urgency).stampClass}">${escapeHtml(urgencyStamp(row.urgency).label)}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(row.urgency).stampClass}" title="${escapeHtml(urgencyStamp(row.urgency).hint)}">${escapeHtml(urgencyStamp(row.urgency).label)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Échéance</span><span class="fact-value">${escapeHtml(dueLabel)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Relances</span><span class="fact-value">${row.relance_count}</span></div>
     </div>
@@ -1124,12 +1260,7 @@ function renderDossierDetailPage(
   // "l'echeance est passee mais rien ne s'est passe".
   const nextActionAt =
     anchorAt && nextStep ? new Date(new Date(anchorAt).getTime() + nextStep.delayMinutes * 60_000) : null;
-  const triggerLabel =
-    nextStep?.channel === "external"
-      ? isPostReply
-        ? "Relancer le client maintenant"
-        : "Envoyer la relance maintenant"
-      : "Déclencher le rappel interne maintenant";
+  const triggerLabel = nextStep?.channel === "external" ? "Relancer le client maintenant" : "Notifier l'équipe maintenant";
 
   const header = `
     <div class="detail-header">
@@ -1138,7 +1269,7 @@ function renderDossierDetailPage(
       <div class="detail-facts">
         <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
         <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(thread.urgency).stampClass}">${escapeHtml(urgencyStamp(thread.urgency).label)}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(thread.urgency).stampClass}" title="${escapeHtml(urgencyStamp(thread.urgency).hint)}">${escapeHtml(urgencyStamp(thread.urgency).label)}</span></div>
         <div class="ledger-fact"><span class="fact-label">Reçu le</span><span class="fact-value">${escapeHtml(new Date(thread.received_at).toLocaleString("fr-FR"))}</span></div>
         <div class="ledger-fact"><span class="fact-label">Accusé le</span><span class="fact-value">${thread.ack_sent_at ? escapeHtml(new Date(thread.ack_sent_at).toLocaleString("fr-FR")) : "—"}</span></div>
         <div class="ledger-fact"><span class="fact-label">Échéance (SLA initial)</span><span class="fact-value">${thread.due_at ? escapeHtml(new Date(thread.due_at).toLocaleString("fr-FR")) : "—"}</span></div>
@@ -1224,7 +1355,7 @@ function renderDossierDetailPage(
         ${csrfField(csrfToken)}
         ${phaseField(phase)}
         ${stepTypeSelect()}
-        <input type="number" name="delayMinutes" min="0" step="1" placeholder="Délai (min)" required />
+        <input type="number" name="delayMinutes" min="0" step="1" value="60" placeholder="Délai (min)" required />
         <button class="btn btn-secondary btn-sm" type="submit">Ajouter une étape</button>
       </form>`
     : "";
@@ -1276,8 +1407,8 @@ function renderDossierDetailPage(
 
 function stepTypeSelect(): string {
   return `<select name="channel">
-    <option value="internal">Rappel interne</option>
-    <option value="external">Relance externe</option>
+    <option value="internal">Notifier l'équipe</option>
+    <option value="external">Relancer le client</option>
   </select>`;
 }
 
@@ -1379,7 +1510,7 @@ function renderReglagesPage(
           </div>
           <div>
             <span class="field-label">SLA (h)</span>
-            <input type="number" name="slaHours" value="${cat.slaHours}" min="0" step="0.5" />
+            <input type="number" name="slaHours" value="${cat.slaHours}" min="0" step="0.5" title="Délai que l'accusé de réception promet au client (ex: 24 = « réponse sous 24h »). C'est aussi le point de départ des rappels et relances automatiques ci-dessous." />
           </div>
           <div class="checkbox-cell">
             <input type="checkbox" id="ack-${escapeHtml(cat.id)}" name="acknowledgeAutomatically" ${cat.acknowledgeAutomatically ? "checked" : ""} />
@@ -1413,6 +1544,13 @@ function renderReglagesPage(
       <h2>Catégories &amp; séquences de relance</h2>
       <p class="section-hint">Libellé, SLA et accusé automatique par catégorie. "Alerter l'équipe si sans réponse" filtre les rappels internes: réglez sur "Jamais" ou "Urgence haute uniquement" pour les catégories à faible enjeu, afin de ne pas noyer la boîte de l'équipe pour des demandes banales. Les délais précis restent réglables dans "Réglages avancés" ci-dessous, par catégorie ou pour un dossier précis depuis sa page de détail.</p>
       ${categoryBlocks}
+      <form class="new-category-form" method="POST" action="/reglages/categories">
+        ${csrfField(csrfToken)}
+        <input type="text" name="label" placeholder="Nom de la nouvelle catégorie" required />
+        <input type="number" name="slaHours" value="24" min="0" step="0.5" title="Délai promis au client dans l'accusé de réception (heures)" />
+        <label class="checkbox-cell"><input type="checkbox" name="acknowledgeAutomatically" checked /> Accusé auto.</label>
+        <button class="btn btn-secondary btn-sm" type="submit">+ Nouvelle catégorie</button>
+      </form>
     </div>`;
 
   return pageShell(
@@ -1442,10 +1580,39 @@ function renderJournalPage(reminders: ReminderRow[], errors: PipelineErrorRow[])
       </div>`
     : `<div class="ledger"><div class="empty">Aucune erreur — le pipeline tourne sans incident depuis le dernier vidage de ce journal.</div></div>`;
 
+  const liveToggle = `<div class="live-toggle">
+    <label><input type="checkbox" id="live-refresh-toggle" /> Actualisation automatique (15s)</label>
+    <span id="live-refresh-dot" class="live-dot"></span>
+  </div>
+  <script>
+    (function () {
+      var cb = document.getElementById("live-refresh-toggle");
+      var dot = document.getElementById("live-refresh-dot");
+      var on = localStorage.getItem("journalLiveRefresh") === "1";
+      cb.checked = on;
+      dot.classList.toggle("live-dot-on", on);
+      var timer = null;
+      function start() {
+        dot.classList.add("live-dot-on");
+        timer = setInterval(function () { location.reload(); }, 15000);
+      }
+      function stop() {
+        dot.classList.remove("live-dot-on");
+        if (timer) clearInterval(timer);
+      }
+      if (on) start();
+      cb.addEventListener("change", function () {
+        localStorage.setItem("journalLiveRefresh", cb.checked ? "1" : "0");
+        if (cb.checked) start(); else stop();
+      });
+    })();
+  </script>`;
+
   const body = `
+    ${liveToggle}
     <div class="settings-section">
       <h2>Relances &amp; rappels</h2>
-      <p class="section-hint">Trace de chaque rappel interne journalisé et de chaque relance externe envoyée automatiquement par le pipeline.</p>
+      <p class="section-hint">Trace de chaque notification équipe et de chaque relance client envoyée automatiquement par le pipeline.</p>
       ${list}
     </div>
     <div class="settings-section">
@@ -1702,6 +1869,42 @@ function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined):
       }
     </div>
   </div>`;
+}
+
+// ---------- Ton de marque ----------
+
+function renderBrandVoicePage(
+  content: string,
+  csrfToken: string | undefined,
+  saved: string | undefined,
+  error: string | undefined
+): string {
+  const banner = error
+    ? `<div class="banner banner-error">Échec de l'enregistrement — voir le <a href="/journal">Journal</a>.</div>`
+    : saved
+      ? `<div class="banner banner-ok">Ton de marque enregistré — pris en compte dès le prochain email généré, sans redéploiement.</div>`
+      : "";
+
+  const body = `
+    ${banner}
+    <div class="settings-section">
+      <h2>Ce que l'IA lit avant chaque rédaction</h2>
+      <p class="section-hint">Ce texte est envoyé à Claude avant chaque accusé de réception, brouillon de réponse ou relance — c'est ici que vous réglez le tutoiement/vouvoiement, la signature, les formules à éviter, et 2-3 exemples réels du style de l'entreprise. Modifiable à tout moment, sans redéploiement.</p>
+      <form method="POST" action="/ton-de-marque">
+        ${csrfField(csrfToken)}
+        <textarea name="content" rows="24" class="brand-voice-editor">${escapeHtml(content)}</textarea>
+        <div style="margin-top: 12px;">
+          <button class="btn btn-primary btn-sm" type="submit">Enregistrer</button>
+        </div>
+      </form>
+    </div>`;
+
+  return pageShell(
+    "ton-de-marque",
+    "Ton de marque",
+    "Le gabarit de style que l'IA suit pour rédiger accusés, brouillons et relances.",
+    body
+  );
 }
 
 // ---------- Confidentialite / retention ----------

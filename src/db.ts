@@ -517,6 +517,60 @@ export function updateCategory(
   );
 }
 
+const COMBINING_DIACRITICS = new RegExp("[\\u0300-\\u036f]", "g");
+
+function slugify(label: string): string {
+  const base = label
+    .normalize("NFD")
+    .replace(COMBINING_DIACRITICS, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return base || "categorie";
+}
+
+function uniqueCategoryId(base: string): string {
+  const existing = new Set(
+    (db.prepare("SELECT id FROM categories").all() as unknown as { id: string }[]).map((r) => r.id)
+  );
+  if (!existing.has(base)) return base;
+  let n = 2;
+  while (existing.has(`${base}_${n}`)) n++;
+  return `${base}_${n}`;
+}
+
+/**
+ * Cree une categorie a la volee depuis /reglages, sans redeploiement ni
+ * edition de config/categories.json. L'id est derive automatiquement du
+ * libelle (slug), pour eviter de demander a l'admin de choisir un
+ * identifiant technique. Une sequence de relance minimale par defaut est
+ * ecrite immediatement (1 rappel interne a J+1, 1 relance externe a J+3
+ * apres reponse) pour que la categorie soit utilisable des sa creation.
+ */
+export function createCategory(params: {
+  label: string;
+  slaHours: number;
+  acknowledgeAutomatically: boolean;
+}): CategoryConfig {
+  const id = uniqueCategoryId(slugify(params.label));
+  const maxOrderRow = db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS maxOrder FROM categories").get() as {
+    maxOrder: number;
+  };
+  db.prepare(
+    `INSERT INTO categories (
+      id, label, sla_hours, acknowledge_automatically, sort_order,
+      internal_alerts_enabled, internal_alerts_min_urgency
+    ) VALUES (?, ?, ?, ?, ?, 1, 'normal')`
+  ).run(id, params.label, params.slaHours, params.acknowledgeAutomatically ? 1 : 0, maxOrderRow.maxOrder + 1);
+
+  writeSteps("pre_reply", "category", id, [{ channel: "internal", delayMinutes: 1440 }]);
+  writeSteps("post_reply", "category", id, [{ channel: "external", delayMinutes: 3 * 1440 }]);
+
+  return toCategoryConfig(
+    db.prepare("SELECT * FROM categories WHERE id = ?").get(id) as unknown as CategoryRow
+  );
+}
+
 // ---------- Sequences de relance (par categorie ou surcharge par dossier) ----------
 
 /**

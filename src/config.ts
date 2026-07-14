@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 function required(name: string): string {
@@ -74,4 +74,9 @@ export function requireAnthropicApiKey(): string {
 
 export function loadBrandVoice(): string {
   return readFileSync(path.resolve(config.brandVoicePath), "utf-8");
+}
+
+/** Ecrit le ton de marque depuis la page /ton-de-marque — evite d'avoir a editer le fichier a la main ou redeployer pour ajuster le style des emails generes. */
+export function saveBrandVoice(content: string): void {
+  writeFileSync(path.resolve(config.brandVoicePath), content, "utf-8");
 }

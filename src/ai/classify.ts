@@ -3,7 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { recordUsage, withRetry } from "./structured.js";
 import { listCategories } from "../db.js";
-import { formatThreadContext } from "./prompts.js";
+import { formatSingleMessage } from "./prompts.js";
 import type { ClassificationResult, EmailMessage, EmailThread } from "../types.js";
 
 const classificationSchema = z.object({
@@ -63,7 +63,7 @@ async function classifyEmailOnce(
     ].join("\n"),
     tools: [tool],
     tool_choice: { type: "tool", name: "classify_email" },
-    messages: [{ role: "user", content: formatThreadContext(thread, incoming) }],
+    messages: [{ role: "user", content: formatSingleMessage(incoming) }],
   });
   recordUsage("classification", thread.id, response.usage);
 
