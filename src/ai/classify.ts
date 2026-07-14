@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
-import { withRetry } from "./structured.js";
+import { recordUsage, withRetry } from "./structured.js";
 import { listCategories } from "../db.js";
 import { formatThreadContext } from "./prompts.js";
 import type { ClassificationResult, EmailMessage, EmailThread } from "../types.js";
@@ -65,6 +65,7 @@ async function classifyEmailOnce(
     tool_choice: { type: "tool", name: "classify_email" },
     messages: [{ role: "user", content: formatThreadContext(thread, incoming) }],
   });
+  recordUsage("classification", thread.id, response.usage);
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"

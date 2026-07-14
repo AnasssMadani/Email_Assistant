@@ -23,6 +23,7 @@ interface GraphMessage {
   body?: { content?: string };
   bodyPreview?: string;
   internetMessageId?: string;
+  hasAttachments?: boolean;
 }
 
 async function graphFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -50,7 +51,7 @@ function escapeODataString(value: string): string {
 }
 
 const MESSAGE_SELECT =
-  "id,conversationId,subject,from,toRecipients,receivedDateTime,body,internetMessageId";
+  "id,conversationId,subject,from,toRecipients,receivedDateTime,body,internetMessageId,hasAttachments";
 
 /**
  * Connecteur Microsoft Graph (Outlook / Microsoft 365).
@@ -92,6 +93,7 @@ export class GraphConnector implements EmailConnector {
       bodyText: msg.body?.content ?? msg.bodyPreview ?? "",
       receivedAt: new Date(msg.receivedDateTime),
       isFromUs: email.toLowerCase() === ownEmail.toLowerCase(),
+      hasAttachments: msg.hasAttachments ?? false,
     };
   }
 

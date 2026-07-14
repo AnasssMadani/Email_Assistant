@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
-import { withRetry } from "./structured.js";
+import { recordUsage, withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
 import { formatThreadContext, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread, ReplyDraft } from "../types.js";
@@ -90,6 +90,7 @@ async function draftThreeRepliesOnce(
     tool_choice: { type: "tool", name: "propose_replies" },
     messages: [{ role: "user", content: formatThreadContext(thread, incoming) }],
   });
+  recordUsage("brouillons_reponse", thread.id, response.usage);
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"

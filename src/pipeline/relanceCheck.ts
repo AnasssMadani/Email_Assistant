@@ -3,7 +3,7 @@ import { getCategory } from "../settings.js";
 import { draftRelance } from "../ai/draftRelance.js";
 import { cleanupUnusedDrafts } from "./draftCleanup.js";
 import { tagSource } from "./errorTag.js";
-import { buildReplySubject } from "../utils.js";
+import { buildReplySubject, urgencyMeetsThreshold } from "../utils.js";
 import {
   getEffectiveRelanceSteps,
   incrementPostReplyRelance,
@@ -82,16 +82,19 @@ export async function checkPreReplyThread(
 ): Promise<void> {
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(row.thread_id));
 
-  const repliedAfterAck =
-    row.ack_sent_at !== null &&
-    thread.messages.some(
-      (m) => m.isFromUs && m.receivedAt.getTime() > new Date(row.ack_sent_at as string).getTime()
-    );
+  const replyAfterAck =
+    row.ack_sent_at !== null
+      ? thread.messages.find(
+          (m) => m.isFromUs && m.receivedAt.getTime() > new Date(row.ack_sent_at as string).getTime()
+        )
+      : undefined;
 
-  if (repliedAfterAck) {
+  if (replyAfterAck) {
     // Un humain vient de repondre de fond: ce n'est plus "notre equipe est
     // en retard", c'est desormais "on attend le client" — nouvelle phase.
-    setThreadHumanReplied(row.thread_id);
+    // On retient si cette reponse contenait une piece jointe (ex: grille
+    // tarifaire) pour que la relance post-reponse puisse y faire reference.
+    setThreadHumanReplied(row.thread_id, undefined, replyAfterAck.hasAttachments);
     await cleanupUnusedDrafts(connector, row.thread_id);
     return;
   }
@@ -125,10 +128,22 @@ export async function checkPreReplyThread(
   }
 
   const note = `Dossier "${row.subject}" en attente depuis plus de ${step.delayMinutes} min apres l'echeance — aucune reponse envoyee.`;
-  await sendInternalNotification(connector, row, note);
+  const category = getCategory(row.category_id);
+  const shouldAlertTeam =
+    category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
+
+  if (shouldAlertTeam) {
+    await sendInternalNotification(connector, row, note);
+    recordReminder(row.thread_id, "internal", note);
+    console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
+  } else {
+    // Alerte volontairement filtree (categorie/urgence sous le seuil configure
+    // dans /reglages) — on avance quand meme la sequence pour ne pas re-evaluer
+    // indefiniment la meme etape, mais sans notifier l'equipe pour ne pas
+    // noyer sa boite sous des rappels pour des demandes jugees banales.
+    recordReminder(row.thread_id, "internal", `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`);
+  }
   incrementRelance(row.thread_id, row.status);
-  recordReminder(row.thread_id, "internal", note);
-  console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
 }
 
 /** Exportee pour permettre un declenchement manuel immediat depuis l'UI admin (voir web/server.ts). */
@@ -162,7 +177,13 @@ export async function checkPostReplyThread(
     }
 
     const category = getCategory(row.category_id);
-    const relance = await draftRelance(thread, lastOutbound, category, "post_reply");
+    const relance = await draftRelance(
+      thread,
+      lastOutbound,
+      category,
+      "post_reply",
+      row.outbound_had_attachment === 1
+    );
     await tagSource("Messagerie — envoi de la relance", () =>
       connector.sendReply({
         threadId: row.thread_id,
@@ -179,10 +200,18 @@ export async function checkPostReplyThread(
   }
 
   const note = `Dossier "${row.subject}": client silencieux depuis plus de ${step.delayMinutes} min apres notre reponse.`;
-  await sendInternalNotification(connector, row, note);
+  const category = getCategory(row.category_id);
+  const shouldAlertTeam =
+    category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
+
+  if (shouldAlertTeam) {
+    await sendInternalNotification(connector, row, note);
+    recordReminder(row.thread_id, "internal", note);
+    console.log(`[rappel interne post-reponse] "${row.subject}" — client silencieux.`);
+  } else {
+    recordReminder(row.thread_id, "internal", `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`);
+  }
   incrementPostReplyRelance(row.thread_id, row.status);
-  recordReminder(row.thread_id, "internal", note);
-  console.log(`[rappel interne post-reponse] "${row.subject}" — client silencieux.`);
 }
 
 /**

@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
-import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus } from "./types.js";
+import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
 
 mkdirSync(path.dirname(path.resolve(config.dbPath)), { recursive: true });
 const db = new DatabaseSync(path.resolve(config.dbPath));
@@ -24,6 +24,11 @@ db.exec(`
     relance_count INTEGER NOT NULL DEFAULT 0,
     human_replied_at TEXT,
     post_reply_relance_count INTEGER NOT NULL DEFAULT 0,
+    -- Vrai si la reponse de fond envoyee au client (ex: devis) contenait une
+    -- piece jointe (PDF, etc.) — permet a la relance post-reponse d'y faire
+    -- reference sans l'inventer. Renseigne automatiquement quand le
+    -- pipeline detecte la reponse (Gmail/Graph exposent l'info nativement).
+    outbound_had_attachment INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -56,7 +61,13 @@ db.exec(`
     label TEXT NOT NULL,
     sla_hours REAL NOT NULL,
     acknowledge_automatically INTEGER NOT NULL,
-    sort_order INTEGER NOT NULL
+    sort_order INTEGER NOT NULL,
+    -- Filtre anti-spam des rappels internes: une categorie peut nudger
+    -- l'equipe systematiquement, seulement au-dela d'une urgence donnee, ou
+    -- jamais (0 + 'high') — evite une notification pour chaque demande
+    -- banale restee sans reponse.
+    internal_alerts_enabled INTEGER NOT NULL DEFAULT 1,
+    internal_alerts_min_urgency TEXT NOT NULL DEFAULT 'normal'
   );
 
   CREATE TABLE IF NOT EXISTS relance_steps (
@@ -92,10 +103,26 @@ db.exec(`
     message TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
+
+  -- Un enregistrement par appel Claude (classification, accuse, relance,
+  -- brouillons) — sert au compteur de consommation/cout affiche dans
+  -- l'admin (page /consommation). call_type identifie l'appel, model le
+  -- modele utilise (permet de re-tarifer correctement si le modele change).
+  CREATE TABLE IF NOT EXISTS ai_usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_type TEXT NOT NULL,
+    thread_id TEXT,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `);
 
 ensureDelayMinutesColumn();
 ensureThreadPostReplyColumns();
+ensureThreadAttachmentColumn();
+ensureCategoryAlertColumns();
 seedIfNeeded();
 
 /**
@@ -124,6 +151,25 @@ function ensureThreadPostReplyColumns(): void {
   }
 }
 
+/** Migration additive: ajoute outbound_had_attachment sur threads si absente. */
+function ensureThreadAttachmentColumn(): void {
+  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
+  if (!columns.some((c) => c.name === "outbound_had_attachment")) {
+    db.exec("ALTER TABLE threads ADD COLUMN outbound_had_attachment INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
+/** Migration additive: ajoute les colonnes de filtre des rappels internes sur categories si absentes. */
+function ensureCategoryAlertColumns(): void {
+  const columns = db.prepare("PRAGMA table_info(categories)").all() as unknown as { name: string }[];
+  if (!columns.some((c) => c.name === "internal_alerts_enabled")) {
+    db.exec("ALTER TABLE categories ADD COLUMN internal_alerts_enabled INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!columns.some((c) => c.name === "internal_alerts_min_urgency")) {
+    db.exec("ALTER TABLE categories ADD COLUMN internal_alerts_min_urgency TEXT NOT NULL DEFAULT 'normal'");
+  }
+}
+
 /** Forme du fichier JSON d'amorçage historique (config/categories.json) — figee, distincte du modele runtime actuel. */
 interface CategoriesSeedFile {
   categories: Array<{
@@ -138,6 +184,26 @@ interface CategoriesSeedFile {
     externalRelanceAfterHours: number;
     maxRelances: number;
   };
+}
+
+/**
+ * Reglages par defaut du filtre anti-spam des rappels internes, a l'amorçage
+ * initial uniquement (modifiable ensuite depuis /reglages sans redeploiement).
+ * Choix par defaut: les categories a fort enjeu (reclamation, devis, suivi)
+ * alertent l'equipe; les categories a bas enjeu ou volume eleve (information,
+ * candidature, non classifie) restent silencieuses par defaut pour ne pas
+ * noyer la boite de l'equipe sous des rappels pour des demandes banales.
+ */
+function defaultAlertSettingsFor(categoryId: string): { enabled: boolean; minUrgency: UrgencyThreshold } {
+  switch (categoryId) {
+    case "reclamation":
+      return { enabled: true, minUrgency: "low" };
+    case "devis":
+    case "suivi_dossier":
+      return { enabled: true, minUrgency: "normal" };
+    default:
+      return { enabled: false, minUrgency: "high" };
+  }
 }
 
 function seedIfNeeded(): void {
@@ -156,11 +222,22 @@ function seedIfNeeded(): void {
 
   if (categoryCount.n === 0) {
     const insert = db.prepare(
-      `INSERT INTO categories (id, label, sla_hours, acknowledge_automatically, sort_order)
-       VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO categories (
+        id, label, sla_hours, acknowledge_automatically, sort_order,
+        internal_alerts_enabled, internal_alerts_min_urgency
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
     seed.categories.forEach((cat, index) => {
-      insert.run(cat.id, cat.label, cat.slaHours, cat.acknowledgeAutomatically ? 1 : 0, index);
+      const alerts = defaultAlertSettingsFor(cat.id);
+      insert.run(
+        cat.id,
+        cat.label,
+        cat.slaHours,
+        cat.acknowledgeAutomatically ? 1 : 0,
+        index,
+        alerts.enabled ? 1 : 0,
+        alerts.minUrgency
+      );
     });
   }
 
@@ -211,6 +288,7 @@ export interface ThreadRow {
   relance_count: number;
   human_replied_at: string | null;
   post_reply_relance_count: number;
+  outbound_had_attachment: number;
   created_at: string;
   updated_at: string;
 }
@@ -326,16 +404,17 @@ export function incrementRelance(threadId: string, status: ThreadStatus): void {
  * l'ancrage de la sequence post-reponse soit l'heure reelle d'envoi, pas
  * l'heure de decouverte par le pipeline.
  */
-export function setThreadHumanReplied(threadId: string, repliedAt?: string): void {
+export function setThreadHumanReplied(threadId: string, repliedAt?: string, hadAttachment = false): void {
   const now = new Date().toISOString();
   const humanRepliedAt = repliedAt ?? now;
   db.prepare(
     `UPDATE threads SET
       status = 'awaiting_client_reply',
       human_replied_at = ?,
+      outbound_had_attachment = ?,
       updated_at = ?
      WHERE thread_id = ?`
-  ).run(humanRepliedAt, now, threadId);
+  ).run(humanRepliedAt, hadAttachment ? 1 : 0, now, threadId);
 }
 
 export function incrementPostReplyRelance(threadId: string, status: ThreadStatus): void {
@@ -388,6 +467,8 @@ interface CategoryRow {
   sla_hours: number;
   acknowledge_automatically: number;
   sort_order: number;
+  internal_alerts_enabled: number;
+  internal_alerts_min_urgency: string;
 }
 
 function toCategoryConfig(row: CategoryRow): CategoryConfig {
@@ -396,6 +477,8 @@ function toCategoryConfig(row: CategoryRow): CategoryConfig {
     label: row.label,
     slaHours: row.sla_hours,
     acknowledgeAutomatically: row.acknowledge_automatically === 1,
+    internalAlertsEnabled: row.internal_alerts_enabled === 1,
+    internalAlertsMinUrgency: (row.internal_alerts_min_urgency as UrgencyThreshold) || "normal",
   };
 }
 
@@ -408,15 +491,30 @@ export function listCategories(): CategoryConfig[] {
 
 export function updateCategory(
   id: string,
-  patch: { label: string; slaHours: number; acknowledgeAutomatically: boolean }
+  patch: {
+    label: string;
+    slaHours: number;
+    acknowledgeAutomatically: boolean;
+    internalAlertsEnabled: boolean;
+    internalAlertsMinUrgency: UrgencyThreshold;
+  }
 ): void {
   db.prepare(
     `UPDATE categories SET
       label = ?,
       sla_hours = ?,
-      acknowledge_automatically = ?
+      acknowledge_automatically = ?,
+      internal_alerts_enabled = ?,
+      internal_alerts_min_urgency = ?
      WHERE id = ?`
-  ).run(patch.label, patch.slaHours, patch.acknowledgeAutomatically ? 1 : 0, id);
+  ).run(
+    patch.label,
+    patch.slaHours,
+    patch.acknowledgeAutomatically ? 1 : 0,
+    patch.internalAlertsEnabled ? 1 : 0,
+    patch.internalAlertsMinUrgency,
+    id
+  );
 }
 
 // ---------- Sequences de relance (par categorie ou surcharge par dossier) ----------
@@ -616,6 +714,78 @@ export function listDraftsForThread(threadId: string): DraftRow[] {
 
 export function deleteDraftRows(threadId: string): void {
   db.prepare("DELETE FROM drafts WHERE thread_id = ?").run(threadId);
+}
+
+// ---------- Consommation IA (tokens Claude, pour le compteur /consommation) ----------
+
+export interface AiUsageEventRow {
+  id: number;
+  call_type: string;
+  thread_id: string | null;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  created_at: string;
+}
+
+export function recordAiUsage(params: {
+  callType: string;
+  threadId: string | null;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+}): void {
+  db.prepare(
+    `INSERT INTO ai_usage_events (call_type, thread_id, model, input_tokens, output_tokens, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(
+    params.callType,
+    params.threadId,
+    params.model,
+    params.inputTokens,
+    params.outputTokens,
+    new Date().toISOString()
+  );
+}
+
+export function listRecentAiUsage(limit = 50): AiUsageEventRow[] {
+  return db
+    .prepare("SELECT * FROM ai_usage_events ORDER BY created_at DESC LIMIT ?")
+    .all(limit) as unknown as AiUsageEventRow[];
+}
+
+export interface AiUsageTotals {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface AiUsageSummary {
+  since: string;
+  total: AiUsageTotals;
+  byCallType: Array<{ callType: string } & AiUsageTotals>;
+}
+
+/** Agrege la consommation depuis `sinceIso` (ex: debut du mois courant) — total et repartition par type d'appel. */
+export function getAiUsageSummarySince(sinceIso: string): AiUsageSummary {
+  const total = db
+    .prepare(
+      `SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens
+       FROM ai_usage_events WHERE created_at >= ?`
+    )
+    .get(sinceIso) as unknown as AiUsageTotals;
+
+  const byCallType = db
+    .prepare(
+      `SELECT call_type AS callType, COUNT(*) AS calls,
+              COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens
+       FROM ai_usage_events WHERE created_at >= ?
+       GROUP BY call_type
+       ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC`
+    )
+    .all(sinceIso) as unknown as Array<{ callType: string } & AiUsageTotals>;
+
+  return { since: sinceIso, total, byCallType };
 }
 
 export default db;

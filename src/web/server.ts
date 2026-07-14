@@ -18,6 +18,7 @@ import {
   deleteCategoryRelanceStep,
   deleteThreadData,
   deleteThreadRelanceStep,
+  getAiUsageSummarySince,
   getCategoryRelanceSteps,
   getEffectiveRelanceSteps,
   getThreadRelanceOverride,
@@ -26,6 +27,7 @@ import {
   listCategories,
   listDraftsForThread,
   listPipelineErrors,
+  listRecentAiUsage,
   listReminders,
   listRecentThreads,
   markMessageProcessed,
@@ -34,6 +36,8 @@ import {
   setThreadStatus,
   updateCategory,
   upsertThreadReceived,
+  type AiUsageEventRow,
+  type AiUsageSummary,
   type PipelineErrorRow,
   type RelancePhase,
   type ReminderRow,
@@ -67,6 +71,30 @@ function parseStep(body: Record<string, string>): { channel: RelanceChannel; del
   const channel: RelanceChannel = body.channel === "external" ? "external" : "internal";
   const delayMinutes = Math.max(0, Number(body.delayMinutes) || 0);
   return { channel, delayMinutes };
+}
+
+/**
+ * Un seul menu deroulant, plutot que d'exposer directement "enabled" +
+ * "min_urgency" comme deux controles separes — objectif: pouvoir dire en un
+ * clic "n'alerte l'equipe que sur les dossiers vraiment urgents" sans avoir a
+ * comprendre le modele de donnees sous-jacent.
+ */
+const ALERT_MODES = {
+  never: { enabled: false, minUrgency: "high" as const },
+  high: { enabled: true, minUrgency: "high" as const },
+  normal: { enabled: true, minUrgency: "normal" as const },
+  always: { enabled: true, minUrgency: "low" as const },
+};
+
+function alertModeOf(cat: CategoryConfig): keyof typeof ALERT_MODES {
+  if (!cat.internalAlertsEnabled) return "never";
+  if (cat.internalAlertsMinUrgency === "high") return "high";
+  if (cat.internalAlertsMinUrgency === "low") return "always";
+  return "normal";
+}
+
+function parseAlertMode(value: string | undefined): { enabled: boolean; minUrgency: "low" | "normal" | "high" } {
+  return ALERT_MODES[(value as keyof typeof ALERT_MODES) ?? "normal"] ?? ALERT_MODES.normal;
 }
 
 /** Empeche une nouvelle etape d'avoir un delai plus court que la precedente (sequence croissante). */
@@ -213,8 +241,10 @@ app.post("/auth/disconnect", requireCsrf, (_req: Request, res: Response) => {
 // ---------- Suivi des dossiers ----------
 
 app.get("/dossiers", (_req: Request, res: Response) => {
+  const threads = listRecentThreads(150);
+  const usageSummary = getAiUsageSummarySince(currentMonthStartIso());
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderDossiersPage(listRecentThreads(150), res.locals.csrfToken as string | undefined));
+  res.send(renderDossiersPage(threads, res.locals.csrfToken as string | undefined, usageSummary));
 });
 
 app.get("/dossiers/:threadId", (req: Request, res: Response) => {
@@ -413,11 +443,14 @@ function runOrRedirectReglagesError(res: Response, context: string, action: () =
 
 app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) => {
   const body = req.body as Record<string, string>;
+  const alertMode = parseAlertMode(body.alertMode);
   runOrRedirectReglagesError(res, "category_update", () => {
     updateCategory(req.params.id, {
       label: (body.label ?? "").trim() || req.params.id,
       slaHours: Math.max(0, Number(body.slaHours) || 0),
       acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
+      internalAlertsEnabled: alertMode.enabled,
+      internalAlertsMinUrgency: alertMode.minUrgency,
     });
   });
 });
@@ -445,6 +478,21 @@ app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, (r
 app.get("/journal", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderJournalPage(listReminders(150), listPipelineErrors(100)));
+});
+
+// ---------- Consommation IA (tokens Claude & cout estime) ----------
+
+/** Debut du mois calendaire courant en UTC — borne explicite et sans ambiguite, plutot que le fuseau du serveur d'hebergement (souvent different de celui de l'equipe). */
+function currentMonthStartIso(): string {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+}
+
+app.get("/consommation", (_req: Request, res: Response) => {
+  const summary = getAiUsageSummarySince(currentMonthStartIso());
+  const recent = listRecentAiUsage(50);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderConsommationPage(summary, recent));
 });
 
 // ---------- Envois sans dossier (suivi manuel) ----------
@@ -496,7 +544,7 @@ app.post("/envois/suivre", requireCsrf, (req: Request, res: Response) => {
         status: "awaiting_client_reply",
         dueAt: null,
       });
-      setThreadHumanReplied(body.threadId, body.sentAt || undefined);
+      setThreadHumanReplied(body.threadId, body.sentAt || undefined, body.hasAttachments === "1");
       if (body.messageId) markMessageProcessed(body.messageId, body.threadId);
     }
     res.redirect(`/dossiers/${encodeURIComponent(body.threadId)}?saved=1`);
@@ -516,7 +564,7 @@ app.get("/confidentialite", (_req: Request, res: Response) => {
 
 // ---------- Gabarit commun ----------
 
-type ActivePage = "connexion" | "dossiers" | "reglages" | "journal" | "envois" | "confidentialite";
+type ActivePage = "connexion" | "dossiers" | "reglages" | "journal" | "envois" | "consommation" | "confidentialite";
 
 function pageShell(active: ActivePage, title: string, sub: string, body: string, backLink?: string): string {
   const brand = config.branding;
@@ -545,6 +593,7 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
     <a href="/reglages" class="${active === "reglages" ? "active" : ""}">Réglages</a>
     <a href="/journal" class="${active === "journal" ? "active" : ""}">Journal</a>
     <a href="/envois" class="${active === "envois" ? "active" : ""}">Envois</a>
+    <a href="/consommation" class="${active === "consommation" ? "active" : ""}">Consommation IA</a>
     <form method="POST" action="/logout"><button class="btn-link" type="submit">Déconnexion</button></form>
   </nav>
   ${backLink ? `<a class="back-link" href="${backLink}">&larr; Retour</a>` : ""}
@@ -639,6 +688,12 @@ function sharedStyles(primaryColor: string): string {
   }
   .status .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); margin-bottom: 4px; }
   .status .value { font-size: 15px; font-weight: 600; }
+  .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 26px; }
+  .metric { border: 1px solid var(--rule); border-radius: 4px; padding: 14px 16px; background: var(--paper-raised); }
+  .metric .metric-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); margin-bottom: 6px; }
+  .metric .metric-value { font-family: var(--font-display); font-size: 21px; font-weight: 700; }
+  .metric .metric-sub { font-size: 11.5px; color: var(--ink-soft); margin-top: 3px; }
+  .metric.metric-warn .metric-value { color: var(--stamp-late); }
   .cards { display: grid; gap: 14px; }
   .card {
     border: 1px solid var(--rule); border-radius: 4px; padding: 20px;
@@ -692,9 +747,15 @@ function sharedStyles(primaryColor: string): string {
   .settings-section .section-hint { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 14px; }
   .category-block { border: 1px solid var(--rule); border-radius: 4px; background: var(--paper-raised); margin-bottom: 14px; overflow: hidden; }
   .category-head-form {
-    display: grid; grid-template-columns: 2fr .9fr 1.2fr auto; gap: 12px; align-items: center;
+    display: grid; grid-template-columns: 1.8fr .8fr 1fr 1.5fr auto; gap: 12px; align-items: center;
     padding: 14px 16px; border-bottom: 1px solid var(--rule);
   }
+  .category-head-form select { width: 100%; padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong); background: var(--paper-raised); color: var(--ink); font-family: inherit; font-size: 12.5px; }
+  .field-label { display: block; font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-faint); margin-bottom: 3px; }
+  details.advanced-steps { margin-top: 2px; }
+  details.advanced-steps > summary { cursor: pointer; padding: 10px 16px; font-size: 12px; color: var(--ink-soft); user-select: none; }
+  details.advanced-steps > summary:hover { color: var(--ink); }
+  details.advanced-steps[open] > summary { border-bottom: 1px solid var(--rule); }
   .category-head-form input[type=text], .category-head-form input[type=number] {
     width: 100%; padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong);
     background: var(--paper); color: inherit; font-size: 13.5px; font-family: inherit;
@@ -920,7 +981,11 @@ function renderProviderCard(opts: {
 
 // ---------- Registre des dossiers ----------
 
-function renderDossiersPage(threads: ThreadRow[], csrfToken: string | undefined): string {
+function renderDossiersPage(
+  threads: ThreadRow[],
+  csrfToken: string | undefined,
+  usageSummary: AiUsageSummary
+): string {
   const categoryLabels = new Map(listCategories().map((c) => [c.id, c.label]));
   const rows = threads.map((row) => renderThreadRow(row, csrfToken, categoryLabels)).join("");
   const list = threads.length
@@ -930,13 +995,25 @@ function renderDossiersPage(threads: ThreadRow[], csrfToken: string | undefined)
       </div>`
     : `<div class="ledger"><div class="empty">Aucun dossier pour le moment — ils apparaissent ici dès qu'un email entrant est traité.</div></div>`;
 
+  const overdueCount = threads.filter((t) => statusStamp(t).label.includes("en retard")).length;
+  const awaitingClientCount = threads.filter((t) => t.status === "awaiting_client_reply").length;
+  const openCount = threads.filter((t) => !["responded", "closed", "skipped"].includes(t.status)).length;
+  const costThisMonth = estimateCostUsd(usageSummary.total.inputTokens, usageSummary.total.outputTokens);
+
+  const summary = `<div class="metric-grid">
+    <div class="metric"><div class="metric-label">Dossiers en cours</div><div class="metric-value">${openCount}</div></div>
+    <div class="metric ${overdueCount > 0 ? "metric-warn" : ""}"><div class="metric-label">En retard</div><div class="metric-value">${overdueCount}</div></div>
+    <div class="metric"><div class="metric-label">En attente du client</div><div class="metric-value">${awaitingClientCount}</div></div>
+    <div class="metric"><div class="metric-label">Coût IA ce mois-ci</div><div class="metric-value">${formatUsd(costThisMonth)}</div><div class="metric-sub"><a href="/consommation">Détail →</a></div></div>
+  </div>`;
+
   const retentionBanner = `<div class="banner banner-info">Les données des dossiers (sujet, expéditeur, dates, nombre de relances) sont conservées indéfiniment tant qu'elles ne sont pas supprimées manuellement. Voir la <a href="/confidentialite">page confidentialité &amp; rétention</a>.</div>`;
 
   return pageShell(
     "dossiers",
     "Registre des dossiers",
     "Détection automatique de réponse à partir du fil email connecté. Ouvrez un dossier pour consulter ou personnaliser sa séquence de relance.",
-    retentionBanner + list
+    summary + retentionBanner + list
   );
 }
 
@@ -950,6 +1027,16 @@ const STATUS_LABELS: Record<string, { label: string; stampClass: string }> = {
   awaiting_client_reply: { label: "En attente du client", stampClass: "stamp-internal" },
   closed: { label: "Clôturé", stampClass: "stamp-done" },
 };
+
+const URGENCY_LABELS: Record<string, { label: string; stampClass: string }> = {
+  high: { label: "Urgence haute", stampClass: "stamp-late" },
+  normal: { label: "Urgence normale", stampClass: "stamp-wait" },
+  low: { label: "Urgence basse", stampClass: "stamp-skip" },
+};
+
+function urgencyStamp(urgency: string): { label: string; stampClass: string } {
+  return URGENCY_LABELS[urgency] ?? { label: urgency, stampClass: "stamp-skip" };
+}
 
 function statusStamp(row: ThreadRow): { label: string; stampClass: string } {
   const info = STATUS_LABELS[row.status] ?? { label: row.status, stampClass: "stamp-skip" };
@@ -982,6 +1069,7 @@ function renderThreadRow(
     <div class="ledger-facts">
       <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(row.urgency).stampClass}">${escapeHtml(urgencyStamp(row.urgency).label)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Échéance</span><span class="fact-value">${escapeHtml(dueLabel)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Relances</span><span class="fact-value">${row.relance_count}</span></div>
     </div>
@@ -1050,6 +1138,7 @@ function renderDossierDetailPage(
       <div class="detail-facts">
         <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
         <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(thread.urgency).stampClass}">${escapeHtml(urgencyStamp(thread.urgency).label)}</span></div>
         <div class="ledger-fact"><span class="fact-label">Reçu le</span><span class="fact-value">${escapeHtml(new Date(thread.received_at).toLocaleString("fr-FR"))}</span></div>
         <div class="ledger-fact"><span class="fact-label">Accusé le</span><span class="fact-value">${thread.ack_sent_at ? escapeHtml(new Date(thread.ack_sent_at).toLocaleString("fr-FR")) : "—"}</span></div>
         <div class="ledger-fact"><span class="fact-label">Échéance (SLA initial)</span><span class="fact-value">${thread.due_at ? escapeHtml(new Date(thread.due_at).toLocaleString("fr-FR")) : "—"}</span></div>
@@ -1270,24 +1359,50 @@ function renderReglagesPage(
       ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>`
       : "";
 
+  const alertModeLabels: Record<keyof typeof ALERT_MODES, string> = {
+    never: "Jamais",
+    high: "Urgence haute uniquement",
+    normal: "Urgence normale et plus",
+    always: "Toujours",
+  };
+
   const categoryBlocks = categories
     .map((cat) => {
+      const currentMode = alertModeOf(cat);
       return `<div class="category-block">
         <form class="category-head-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}">
           ${csrfField(csrfToken)}
           <div>
+            <span class="field-label">Catégorie</span>
             <input type="text" name="label" value="${escapeHtml(cat.label)}" />
             <span class="cat-id">${escapeHtml(cat.id)}</span>
           </div>
-          <div><input type="number" name="slaHours" value="${cat.slaHours}" min="0" step="0.5" /></div>
+          <div>
+            <span class="field-label">SLA (h)</span>
+            <input type="number" name="slaHours" value="${cat.slaHours}" min="0" step="0.5" />
+          </div>
           <div class="checkbox-cell">
             <input type="checkbox" id="ack-${escapeHtml(cat.id)}" name="acknowledgeAutomatically" ${cat.acknowledgeAutomatically ? "checked" : ""} />
             <label for="ack-${escapeHtml(cat.id)}">Accusé auto.</label>
           </div>
+          <div>
+            <span class="field-label">Alerter l'équipe si sans réponse</span>
+            <select name="alertMode">
+              ${(Object.keys(alertModeLabels) as Array<keyof typeof ALERT_MODES>)
+                .map(
+                  (mode) =>
+                    `<option value="${mode}" ${mode === currentMode ? "selected" : ""}>${escapeHtml(alertModeLabels[mode])}</option>`
+                )
+                .join("")}
+            </select>
+          </div>
           <div><button class="btn btn-primary btn-sm" type="submit">Enregistrer</button></div>
         </form>
-        ${renderCategoryStepsPanel(cat.id, "pre_reply", "Avant notre réponse (nudge équipe)", csrfToken)}
-        ${renderCategoryStepsPanel(cat.id, "post_reply", "Après notre réponse (relance client)", csrfToken)}
+        <details class="advanced-steps">
+          <summary>Réglages avancés de la séquence de relance (délais précis, étapes multiples)</summary>
+          ${renderCategoryStepsPanel(cat.id, "pre_reply", "Avant notre réponse (nudge équipe)", csrfToken)}
+          ${renderCategoryStepsPanel(cat.id, "post_reply", "Après notre réponse (relance client)", csrfToken)}
+        </details>
       </div>`;
     })
     .join("");
@@ -1296,7 +1411,7 @@ function renderReglagesPage(
     ${banner}
     <div class="settings-section">
       <h2>Catégories &amp; séquences de relance</h2>
-      <p class="section-hint">Libellé, SLA et accusé automatique par catégorie, plus la séquence de relance qui s'applique par défaut à tout dossier de cette catégorie (sauf s'il a sa propre séquence — voir sa page de détail).</p>
+      <p class="section-hint">Libellé, SLA et accusé automatique par catégorie. "Alerter l'équipe si sans réponse" filtre les rappels internes: réglez sur "Jamais" ou "Urgence haute uniquement" pour les catégories à faible enjeu, afin de ne pas noyer la boîte de l'équipe pour des demandes banales. Les délais précis restent réglables dans "Réglages avancés" ci-dessous, par catégorie ou pour un dossier précis depuis sa page de détail.</p>
       ${categoryBlocks}
     </div>`;
 
@@ -1343,6 +1458,122 @@ function renderJournalPage(reminders: ReminderRow[], errors: PipelineErrorRow[])
     "journal",
     "Journal",
     "Ce qui a été fait automatiquement par le pipeline, et ce qui a échoué — pour intervenir sans avoir à rouvrir la boîte mail ou les logs du serveur.",
+    body
+  );
+}
+
+// ---------- Consommation IA ----------
+
+const AI_CALL_TYPE_LABELS: Record<string, string> = {
+  classification: "Classification de l'email",
+  accuse_reception: "Rédaction de l'accusé de réception",
+  brouillons_reponse: "Rédaction des 3 brouillons de réponse",
+  relance_pre_reponse: "Rédaction d'une relance (avant notre réponse)",
+  relance_post_reponse: "Rédaction d'une relance (après notre réponse)",
+};
+
+function aiCallTypeLabel(callType: string): string {
+  return AI_CALL_TYPE_LABELS[callType] ?? callType;
+}
+
+function estimateCostUsd(inputTokens: number, outputTokens: number): number {
+  return (
+    (inputTokens / 1_000_000) * config.pricing.inputPerMillionTokensUsd +
+    (outputTokens / 1_000_000) * config.pricing.outputPerMillionTokensUsd
+  );
+}
+
+function formatUsd(amount: number): string {
+  return `$${amount.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: amount < 1 ? 4 : 2 })}`;
+}
+
+function formatTokens(n: number): string {
+  return n.toLocaleString("fr-FR");
+}
+
+function renderConsommationPage(summary: AiUsageSummary, recent: AiUsageEventRow[]): string {
+  const totalTokens = summary.total.inputTokens + summary.total.outputTokens;
+  const totalCost = estimateCostUsd(summary.total.inputTokens, summary.total.outputTokens);
+
+  const metrics = `<div class="metric-grid">
+    <div class="metric">
+      <div class="metric-label">Appels IA ce mois-ci</div>
+      <div class="metric-value">${summary.total.calls}</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Tokens consommés</div>
+      <div class="metric-value">${formatTokens(totalTokens)}</div>
+      <div class="metric-sub">${formatTokens(summary.total.inputTokens)} entrée · ${formatTokens(summary.total.outputTokens)} sortie</div>
+    </div>
+    <div class="metric metric-warn">
+      <div class="metric-label">Coût estimé ce mois-ci</div>
+      <div class="metric-value">${formatUsd(totalCost)}</div>
+      <div class="metric-sub">Estimation — voir tarifs ci-dessous</div>
+    </div>
+  </div>`;
+
+  const breakdownRows = summary.byCallType
+    .map((row) => {
+      const cost = estimateCostUsd(row.inputTokens, row.outputTokens);
+      return `<div class="ledger-row">
+        <div class="ledger-main"><span class="subject-static">${escapeHtml(aiCallTypeLabel(row.callType))}</span></div>
+        <div class="ledger-facts">
+          <div class="ledger-fact"><span class="fact-label">Appels</span><span class="fact-value">${row.calls}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Tokens entrée</span><span class="fact-value">${formatTokens(row.inputTokens)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Tokens sortie</span><span class="fact-value">${formatTokens(row.outputTokens)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Coût estimé</span><span class="fact-value">${formatUsd(cost)}</span></div>
+        </div>
+      </div>`;
+    })
+    .join("");
+  const breakdown = summary.byCallType.length
+    ? `<div class="ledger"><div class="ledger-head"><span>Type d'appel</span></div>${breakdownRows}</div>`
+    : `<div class="ledger"><div class="empty">Aucun appel IA enregistré ce mois-ci.</div></div>`;
+
+  const recentRows = recent
+    .map((ev) => {
+      const cost = estimateCostUsd(ev.input_tokens, ev.output_tokens);
+      return `<div class="ledger-row">
+        <div class="ledger-main">
+          <span class="subject-static">${escapeHtml(aiCallTypeLabel(ev.call_type))}</span>
+          <div class="ledger-meta">${ev.thread_id ? `<a class="subject-link" href="/dossiers/${encodeURIComponent(ev.thread_id)}">Voir le dossier</a>` : "(sans dossier)"} — ${escapeHtml(new Date(ev.created_at).toLocaleString("fr-FR"))}</div>
+        </div>
+        <div class="ledger-facts">
+          <div class="ledger-fact"><span class="fact-label">Entrée</span><span class="fact-value">${formatTokens(ev.input_tokens)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Sortie</span><span class="fact-value">${formatTokens(ev.output_tokens)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Coût</span><span class="fact-value">${formatUsd(cost)}</span></div>
+        </div>
+      </div>`;
+    })
+    .join("");
+  const recentList = recent.length
+    ? `<div class="ledger"><div class="ledger-head"><span>Appel</span></div>${recentRows}</div>`
+    : `<div class="ledger"><div class="empty">Aucun appel IA pour le moment.</div></div>`;
+
+  const body = `
+    ${metrics}
+    <div class="settings-section">
+      <h2>Répartition par type d'appel (ce mois-ci)</h2>
+      <p class="section-hint">Chaque email traité déclenche plusieurs appels Claude distincts (classification, accusé, 3 brouillons, puis une relance si nécessaire) — cette répartition montre lesquels pèsent le plus.</p>
+      ${breakdown}
+    </div>
+    <div class="settings-section">
+      <h2>Derniers appels</h2>
+      <p class="section-hint">Les 50 appels IA les plus récents, avec leur coût estimé individuel.</p>
+      ${recentList}
+    </div>
+    <div class="banner banner-info">
+      Estimation basée sur ${formatUsd(config.pricing.inputPerMillionTokensUsd)}/M tokens en entrée et
+      ${formatUsd(config.pricing.outputPerMillionTokensUsd)}/M tokens en sortie (réglables via les variables
+      d'environnement CLAUDE_INPUT_PRICE_PER_MTOK / CLAUDE_OUTPUT_PRICE_PER_MTOK) — à vérifier contre la
+      tarification Anthropic en vigueur pour le modèle utilisé, le montant réel facturé peut différer.
+      Le mois court en UTC (minuit UTC au 1ᵉʳ du mois), pas dans le fuseau du serveur.
+    </div>`;
+
+  return pageShell(
+    "consommation",
+    "Consommation IA",
+    "Tokens consommés et coût estimé des appels Claude — mis à jour en temps réel, sans redéploiement.",
     body
   );
 }
@@ -1459,6 +1690,7 @@ function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined):
               <input type="hidden" name="recipientEmail" value="${escapeHtml(recipient.email)}" />
               <input type="hidden" name="recipientName" value="${escapeHtml(recipient.name ?? "")}" />
               <input type="hidden" name="sentAt" value="${escapeHtml(message.receivedAt.toISOString())}" />
+              <input type="hidden" name="hasAttachments" value="${message.hasAttachments ? "1" : "0"}" />
               <select name="categoryId">
                 ${listCategories()
                   .map((c) => `<option value="${escapeHtml(c.id)}" ${c.id === "autre" ? "selected" : ""}>${escapeHtml(c.label)}</option>`)

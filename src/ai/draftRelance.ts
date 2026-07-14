@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
-import { withRetry } from "./structured.js";
+import { recordUsage, withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
 import { formatThreadContext, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
@@ -28,10 +28,11 @@ export async function draftRelance(
   thread: EmailThread,
   anchorMessage: EmailMessage,
   category: CategoryConfig,
-  phase: RelancePhase = "pre_reply"
+  phase: RelancePhase = "pre_reply",
+  hadAttachment = false
 ): Promise<RelanceDraft> {
   return withRetry(
-    () => draftRelanceOnce(thread, anchorMessage, category, phase),
+    () => draftRelanceOnce(thread, anchorMessage, category, phase, hadAttachment),
     phase === "post_reply" ? "relance post-réponse" : "relance"
   );
 }
@@ -40,7 +41,8 @@ async function draftRelanceOnce(
   thread: EmailThread,
   anchorMessage: EmailMessage,
   category: CategoryConfig,
-  phase: RelancePhase
+  phase: RelancePhase,
+  hadAttachment: boolean
 ): Promise<RelanceDraft> {
   const client = getClient();
   const brandVoice = loadBrandVoice();
@@ -80,6 +82,14 @@ async function draftRelanceOnce(
           "- Demande si le client a des questions ou une decision a partager, sans mettre",
           "  la pression ni fixer d'ultimatum.",
           `- Cette demande relevait de la categorie "${category.label}".`,
+          ...(hadAttachment
+            ? [
+                "- Notre reponse precedente contenait une piece jointe (ex: grille tarifaire en PDF):",
+                "  mentionne explicitement qu'un document etait joint a ce message et invite le",
+                "  client a le consulter s'il ne l'a pas encore vu — sans decrire ni inventer son",
+                "  contenu, que tu ne connais pas.",
+              ]
+            : []),
         ].join("\n")
       : (() => {
           // pre_reply: on met en avant notre dernier message envoye (accuse ou
@@ -122,6 +132,7 @@ async function draftRelanceOnce(
     tool_choice: { type: "tool", name: "write_relance" },
     messages: [{ role: "user", content: formatThreadContext(thread, anchorMessage) }],
   });
+  recordUsage(phase === "post_reply" ? "relance_post_reponse" : "relance_pre_reponse", thread.id, response.usage);
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"

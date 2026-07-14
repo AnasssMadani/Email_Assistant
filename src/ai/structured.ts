@@ -1,3 +1,23 @@
+import type Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_MODEL } from "./client.js";
+import { recordAiUsage } from "../db.js";
+
+/**
+ * Journalise les tokens consommes par un appel Claude, quel que soit le
+ * resultat (meme une reponse tronquee/mal formee a consomme des tokens) —
+ * alimente le compteur de consommation/cout de la page /consommation.
+ * `callType` identifie l'appel (ex: "classification", "accuse_reception").
+ */
+export function recordUsage(callType: string, threadId: string | null, usage: Anthropic.Usage): void {
+  recordAiUsage({
+    callType,
+    threadId,
+    model: CLAUDE_MODEL,
+    inputTokens: usage.input_tokens,
+    outputTokens: usage.output_tokens,
+  });
+}
+
 /**
  * Les sorties structurees de Claude (tool_use.input) ne sont pas garanties
  * conformes au schema declare — une reponse tronquee (max_tokens atteint) ou

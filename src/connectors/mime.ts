@@ -41,6 +41,16 @@ export function extractPlainText(part: gmail_v1.Schema$MessagePart | undefined):
   return "";
 }
 
+/** Vrai si le payload contient au moins une partie avec un nom de fichier (piece jointe Gmail), a l'exclusion des parts inline sans nom. */
+export function hasAttachmentParts(part: gmail_v1.Schema$MessagePart | undefined): boolean {
+  if (!part) return false;
+  if (part.filename && part.filename.length > 0) return true;
+  if (part.parts && part.parts.length > 0) {
+    return part.parts.some((child) => hasAttachmentParts(child));
+  }
+  return false;
+}
+
 export function parseAddress(raw: string | undefined): { name?: string; email: string } {
   if (!raw) return { email: "" };
   const match = raw.match(/^\s*(?:"?([^"<]*)"?\s*)?<?([^<>\s]+@[^<>\s]+)>?\s*$/);

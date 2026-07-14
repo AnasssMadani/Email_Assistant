@@ -58,6 +58,14 @@ export const config = {
     primaryColor: process.env.BRAND_PRIMARY_COLOR ?? "#16202A",
     logoUrl: process.env.BRAND_LOGO_URL ?? "",
   },
+  // Tarifs Claude en $ par million de tokens, utilises uniquement pour l'estimation
+  // de cout affichee dans /consommation — ce sont des valeurs indicatives par
+  // defaut, a verifier/ajuster sur la page de tarification Anthropic actuelle
+  // pour le modele reellement facture (voir CLAUDE_MODEL dans src/ai/client.ts).
+  pricing: {
+    inputPerMillionTokensUsd: Number(process.env.CLAUDE_INPUT_PRICE_PER_MTOK ?? 3),
+    outputPerMillionTokensUsd: Number(process.env.CLAUDE_OUTPUT_PRICE_PER_MTOK ?? 15),
+  },
 };
 
 export function requireAnthropicApiKey(): string {

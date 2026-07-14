@@ -64,6 +64,6 @@ async function registerIfNewThread(message: EmailMessage): Promise<void> {
     status: "awaiting_client_reply",
     dueAt: null,
   });
-  setThreadHumanReplied(message.threadId, sentAt);
+  setThreadHumanReplied(message.threadId, sentAt, message.hasAttachments);
   console.log(`[envoi suivi] ${recipient.email} — "${message.subject}"`);
 }

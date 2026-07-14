@@ -14,6 +14,8 @@ export interface EmailMessage {
   bodyText: string;
   receivedAt: Date;
   isFromUs: boolean;
+  /** Vrai si le message contient au moins une piece jointe (PDF, etc.) — permet a une relance automatique d'y faire reference sans l'inventer. */
+  hasAttachments: boolean;
 }
 
 export interface EmailThread {
@@ -49,11 +51,22 @@ export interface EmailConnector {
   sendNotification(params: NotificationParams): Promise<{ id: string }>;
 }
 
+/**
+ * Seuil d'urgence minimal (tel que classifie par Claude) a partir duquel un
+ * rappel interne genere une vraie notification email plutot qu'une simple
+ * ligne au Journal. "low" = toujours alerter (aucun filtre), "high" = alerter
+ * uniquement sur les dossiers juges urgents — evite de notifier l'equipe pour
+ * chaque demande banale restee sans reponse.
+ */
+export type UrgencyThreshold = "low" | "normal" | "high";
+
 export interface CategoryConfig {
   id: string;
   label: string;
   slaHours: number;
   acknowledgeAutomatically: boolean;
+  internalAlertsEnabled: boolean;
+  internalAlertsMinUrgency: UrgencyThreshold;
 }
 
 export type RelanceChannel = "internal" | "external";

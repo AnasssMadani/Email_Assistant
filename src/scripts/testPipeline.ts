@@ -34,6 +34,7 @@ const sample: EmailMessage = {
   ].join("\n"),
   receivedAt: new Date(),
   isFromUs: false,
+  hasAttachments: false,
 };
 
 const thread: EmailThread = { id: sample.threadId, messages: [sample] };

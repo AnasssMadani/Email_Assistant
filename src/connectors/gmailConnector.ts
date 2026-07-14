@@ -1,6 +1,6 @@
 import { google, type gmail_v1 } from "googleapis";
 import { getAuthorizedClient } from "./gmailAuth.js";
-import { extractPlainText, getHeader, parseAddress, buildRawMimeMessage } from "./mime.js";
+import { extractPlainText, getHeader, hasAttachmentParts, parseAddress, buildRawMimeMessage } from "./mime.js";
 import type {
   EmailConnector,
   EmailMessage,
@@ -61,6 +61,7 @@ export class GmailConnector implements EmailConnector {
         ? new Date(dateHeader)
         : new Date(Number(msg.internalDate ?? Date.now())),
       isFromUs: from.email.toLowerCase() === ownEmail.toLowerCase(),
+      hasAttachments: hasAttachmentParts(msg.payload),
     };
   }
 

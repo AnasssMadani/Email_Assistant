@@ -17,7 +17,7 @@ retours du pilote.
 ## Signature
 
 ```
-L'equipe [Nom du client]
+L'equipe Global Link
 [coordonnees / site web]
 ```
 
