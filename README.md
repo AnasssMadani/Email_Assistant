@@ -94,31 +94,55 @@ actions "Marquer répondu" / "Supprimer les données".
 
 ## Séquences de relance
 
-Chaque **catégorie** a sa propre séquence de relance: une liste ordonnée
-d'étapes, chacune définie par un délai **en minutes** après l'échéance du
-dossier (l'interface l'affiche en minutes, heures ou jours selon la
-grandeur — `+30min`, `+4h`, `J+2`) et un canal — **rappel interne**
-(journalisé, visible sur la page Journal, à brancher sur l'outil d'équipe)
-ou **relance externe** (email envoyé automatiquement au demandeur, rédigé
-par Claude). Exemple typique: étape 1 à J+1 en rappel interne, étape 2 à
-J+5 en relance externe — mais rien n'empêche un délai de quelques minutes
-pour tester le pipeline sans attendre. Se règle depuis **Réglages**
-(`/reglages`), par catégorie — pas de redéploiement nécessaire.
+Le cycle de vie d'un dossier a **deux phases indépendantes**, chacune avec
+sa propre séquence de relance:
 
-Un **dossier précis** peut avoir sa propre séquence, indépendante de celle
-de sa catégorie: depuis sa page de détail, "Personnaliser pour ce dossier"
-pré-remplit une séquence modifiable à partir de la séquence effective du
-moment; tant qu'elle existe, elle remplace entièrement la règle de la
-catégorie pour ce dossier. "Revenir à la règle de la catégorie" la supprime.
+1. **Avant notre réponse** — personne chez nous n'a encore répondu de fond
+   au client. Ancrée sur l'échéance SLA (`due_at`). S'arrête dès qu'un
+   humain envoie une réponse de fond (un devis, par exemple) — le dossier
+   passe alors en statut **"En attente du client"**.
+2. **Après notre réponse** — on attend désormais la réponse du client à ce
+   qu'on lui a envoyé. Ancrée sur l'heure de cette réponse
+   (`human_replied_at`), pas sur l'échéance d'origine. S'arrête dès que le
+   client répond; sinon, relance le CLIENT (pas notre équipe), en
+   référençant ce qu'on lui a déjà envoyé.
 
-Techniquement, une seule table (`relance_steps` dans `src/db.ts`) porte les
-deux cas — étapes rattachées à une catégorie (`owner_type='category'`) ou
-à un dossier (`owner_type='thread'`) — et
-`getEffectiveRelanceSteps(threadId, categoryId)` résout laquelle
-s'applique: la séquence du dossier si elle existe, sinon celle de sa
-catégorie. `relance_count` sur le dossier sert d'index dans cette séquence
-(combien d'étapes ont déjà été exécutées, rappel interne ou relance
-externe confondus).
+Chaque phase, pour chaque **catégorie**, a sa propre liste ordonnée
+d'étapes — un délai **en minutes** (affiché en minutes, heures ou jours
+selon la grandeur: `+30min`, `+4h`, `J+2`) et un canal: **rappel interne**
+(journalisé sur la page Journal *et* envoyé par email — à `NOTIFICATION_EMAIL`
+si défini, sinon à la messagerie connectée elle-même) ou **relance externe**
+(email envoyé automatiquement, rédigé par Claude — avec un ton différent
+selon la phase: "toujours en cours de traitement" avant notre réponse,
+"suivi de notre devis" après). Se règle depuis **Réglages** (`/reglages`),
+par catégorie et par phase — pas de redéploiement nécessaire.
+
+Un **dossier précis** peut avoir sa propre séquence (par phase),
+indépendante de celle de sa catégorie: depuis sa page de détail,
+"Personnaliser pour ce dossier" pré-remplit une séquence modifiable à
+partir de la séquence effective du moment; tant qu'elle existe, elle
+remplace entièrement la règle de la catégorie pour ce dossier et cette
+phase. "Revenir à la règle de la catégorie" la supprime.
+
+Techniquement, deux tables (`relance_steps` et `post_reply_relance_steps`
+dans `src/db.ts`) portent chacune les deux cas — étapes rattachées à une
+catégorie (`owner_type='category'`) ou à un dossier (`owner_type='thread'`)
+— et `getEffectiveRelanceSteps(threadId, categoryId, phase)` résout
+laquelle s'applique. `relance_count` / `post_reply_relance_count` sur le
+dossier servent d'index dans leur séquence respective.
+
+### Devis envoyé sans demande préalable du client
+
+Un dossier n'est normalement créé que par un email **entrant** — si vous
+envoyez un devis à froid (démarchage, prospect qui n'a jamais écrit),
+aucun dossier n'existe pour ce fil et aucune relance ne peut se
+déclencher. Pour couvrir ce cas, le pipeline scrute aussi le dossier
+"Envoyés" (`src/pipeline/discoverOutbound.ts`): tout email sortant dont le
+fil n'est pas déjà suivi devient automatiquement un dossier en phase
+"après notre réponse", catégorie "autre" par défaut (à ajuster ensuite).
+Seuls les envois **postérieurs au démarrage du process** sont pris en
+compte, pour ne pas générer d'un coup un dossier par email de l'historique
+au premier déploiement.
 
 ## Installation
 

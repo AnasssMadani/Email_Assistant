@@ -95,14 +95,22 @@ export class GraphConnector implements EmailConnector {
     };
   }
 
-  async listRecentInboxMessages(maxResults = 25): Promise<EmailMessage[]> {
+  private async listByFolder(folder: "inbox" | "sentitems", maxResults: number): Promise<EmailMessage[]> {
     const ownEmail = await this.getOwnEmailAddress();
     const data = await graphFetch<{ value: GraphMessage[] }>(
-      `/me/mailFolders/inbox/messages?$top=${maxResults}&$orderby=receivedDateTime desc&$select=${MESSAGE_SELECT}`
+      `/me/mailFolders/${folder}/messages?$top=${maxResults}&$orderby=receivedDateTime desc&$select=${MESSAGE_SELECT}`
     );
     return data.value
       .map((m) => this.toEmailMessage(m, ownEmail))
       .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
+  }
+
+  async listRecentInboxMessages(maxResults = 25): Promise<EmailMessage[]> {
+    return this.listByFolder("inbox", maxResults);
+  }
+
+  async listRecentSentMessages(maxResults = 25): Promise<EmailMessage[]> {
+    return this.listByFolder("sentitems", maxResults);
   }
 
   async getThread(threadId: string): Promise<EmailThread> {

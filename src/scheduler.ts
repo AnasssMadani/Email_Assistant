@@ -1,6 +1,7 @@
 import cron from "node-cron";
 import { config } from "./config.js";
 import { createEmailConnector } from "./connectors/index.js";
+import { discoverOutboundOnlyThreads } from "./pipeline/discoverOutbound.js";
 import { processIncomingMessage } from "./pipeline/processIncoming.js";
 import { runRelanceCheck } from "./pipeline/relanceCheck.js";
 import { recordPipelineError } from "./db.js";
@@ -13,6 +14,7 @@ import type { EmailConnector } from "./types.js";
 // meme email deux fois avant qu'il soit marque comme traite.
 let pollInProgress = false;
 let relanceCheckInProgress = false;
+let discoverOutboundInProgress = false;
 
 async function pollInbox(connector: EmailConnector): Promise<void> {
   if (pollInProgress) {
@@ -53,6 +55,19 @@ async function checkRelances(connector: EmailConnector): Promise<void> {
   }
 }
 
+async function discoverOutbound(connector: EmailConnector): Promise<void> {
+  if (discoverOutboundInProgress) return;
+  discoverOutboundInProgress = true;
+  try {
+    await discoverOutboundOnlyThreads(connector);
+  } catch (err) {
+    console.error("[decouverte envois] erreur:", err);
+    recordPipelineError("discover_outbound", null, (err as Error).message);
+  } finally {
+    discoverOutboundInProgress = false;
+  }
+}
+
 export function startScheduler(): void {
   const connector = createEmailConnector();
 
@@ -61,7 +76,9 @@ export function startScheduler(): void {
   console.log(`Verification relances: ${config.relanceCheckCron}`);
 
   void pollInbox(connector);
+  void discoverOutbound(connector);
 
   cron.schedule(config.pollIntervalCron, () => void pollInbox(connector));
+  cron.schedule(config.pollIntervalCron, () => void discoverOutbound(connector));
   cron.schedule(config.relanceCheckCron, () => void checkRelances(connector));
 }

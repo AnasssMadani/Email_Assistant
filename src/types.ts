@@ -39,6 +39,8 @@ export interface EmailConnector {
   readonly name: "gmail" | "graph";
   getOwnEmailAddress(): Promise<string>;
   listRecentInboxMessages(maxResults?: number): Promise<EmailMessage[]>;
+  /** Messages envoyes par nous, y compris ceux qui n'ont jamais recu de message entrant (devis envoye a froid, etc.). */
+  listRecentSentMessages(maxResults?: number): Promise<EmailMessage[]>;
   getThread(threadId: string): Promise<EmailThread>;
   sendReply(params: SendReplyParams): Promise<{ id: string }>;
   createDraftReply(params: SendReplyParams): Promise<{ id: string }>;

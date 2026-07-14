@@ -319,16 +319,23 @@ export function incrementRelance(threadId: string, status: ThreadStatus): void {
   ).run(now, status, now, threadId);
 }
 
-/** Bascule un dossier en "attente de reponse client": un humain vient d'envoyer une reponse de fond (ex: le devis). */
-export function setThreadHumanReplied(threadId: string): void {
+/**
+ * Bascule un dossier en "attente de reponse client": un humain vient
+ * d'envoyer une reponse de fond (ex: le devis). `repliedAt` optionnel pour
+ * les dossiers decouverts a posteriori (voir discoverOutbound.ts), afin que
+ * l'ancrage de la sequence post-reponse soit l'heure reelle d'envoi, pas
+ * l'heure de decouverte par le pipeline.
+ */
+export function setThreadHumanReplied(threadId: string, repliedAt?: string): void {
   const now = new Date().toISOString();
+  const humanRepliedAt = repliedAt ?? now;
   db.prepare(
     `UPDATE threads SET
       status = 'awaiting_client_reply',
       human_replied_at = ?,
       updated_at = ?
      WHERE thread_id = ?`
-  ).run(now, now, threadId);
+  ).run(humanRepliedAt, now, threadId);
 }
 
 export function incrementPostReplyRelance(threadId: string, status: ThreadStatus): void {

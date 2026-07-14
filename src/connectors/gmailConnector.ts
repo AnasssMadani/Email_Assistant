@@ -64,12 +64,12 @@ export class GmailConnector implements EmailConnector {
     };
   }
 
-  async listRecentInboxMessages(maxResults = 25): Promise<EmailMessage[]> {
+  private async listByLabel(label: "INBOX" | "SENT", maxResults: number): Promise<EmailMessage[]> {
     const gmail = await this.getGmail();
     const ownEmail = await this.getOwnEmailAddress();
     const list = await gmail.users.messages.list({
       userId: "me",
-      labelIds: ["INBOX"],
+      labelIds: [label],
       maxResults,
     });
 
@@ -81,6 +81,14 @@ export class GmailConnector implements EmailConnector {
       messages.push(this.toEmailMessage(full.data, ownEmail));
     }
     return messages.sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
+  }
+
+  async listRecentInboxMessages(maxResults = 25): Promise<EmailMessage[]> {
+    return this.listByLabel("INBOX", maxResults);
+  }
+
+  async listRecentSentMessages(maxResults = 25): Promise<EmailMessage[]> {
+    return this.listByLabel("SENT", maxResults);
   }
 
   async getThread(threadId: string): Promise<EmailThread> {
