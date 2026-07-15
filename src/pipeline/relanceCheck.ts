@@ -38,18 +38,26 @@ import type { EmailConnector, RelanceStep } from "../types.js";
 export async function runRelanceCheck(connector: EmailConnector): Promise<void> {
   const now = Date.now();
 
+  // checkPreReplyThread/checkPostReplyThread detectent une reponse humaine
+  // AVANT de regarder s'il y a une etape a declencher — mais si on ne les
+  // appelle QUE quand une etape est due, un dossier dont la sequence est
+  // entierement epuisee (toutes les etapes deja envoyees) n'est plus jamais
+  // reexamine, et une reponse arrivee APRES la derniere etape ne sera jamais
+  // detectee: le dossier reste bloque indefiniment, et la phase suivante
+  // (relance apres reponse, ou "repondu") ne se declenche jamais. On appelle
+  // donc systematiquement la fonction pour chaque dossier eligible, en ne
+  // passant une etape que si elle existe ET qu'elle est due — la detection
+  // de reponse, elle, tourne a chaque cycle quoi qu'il arrive.
   for (const row of listThreadsAwaitingReply()) {
     if (!row.due_at) continue;
 
     const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "pre_reply");
     const nextStep = steps[row.relance_count];
-    if (!nextStep) continue;
-
-    const fireAt = new Date(row.due_at).getTime() + nextStep.delayMinutes * 60_000;
-    if (now < fireAt) continue;
+    const fireAt = nextStep ? new Date(row.due_at).getTime() + nextStep.delayMinutes * 60_000 : null;
+    const dueStep = nextStep && fireAt !== null && now >= fireAt ? nextStep : undefined;
 
     try {
-      await checkPreReplyThread(connector, row, nextStep);
+      await checkPreReplyThread(connector, row, dueStep);
     } catch (err) {
       console.error(`[verification relances] erreur sur le dossier ${row.thread_id}:`, err);
       recordPipelineError("relance_check", row.thread_id, (err as Error).message);
@@ -61,13 +69,11 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
 
     const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "post_reply");
     const nextStep = steps[row.post_reply_relance_count];
-    if (!nextStep) continue;
-
-    const fireAt = new Date(row.human_replied_at).getTime() + nextStep.delayMinutes * 60_000;
-    if (now < fireAt) continue;
+    const fireAt = nextStep ? new Date(row.human_replied_at).getTime() + nextStep.delayMinutes * 60_000 : null;
+    const dueStep = nextStep && fireAt !== null && now >= fireAt ? nextStep : undefined;
 
     try {
-      await checkPostReplyThread(connector, row, nextStep);
+      await checkPostReplyThread(connector, row, dueStep);
     } catch (err) {
       console.error(`[verification relances post-reponse] erreur sur le dossier ${row.thread_id}:`, err);
       recordPipelineError("relance_check", row.thread_id, (err as Error).message);
@@ -79,7 +85,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
 export async function checkPreReplyThread(
   connector: EmailConnector,
   row: ThreadRow,
-  step: RelanceStep
+  step: RelanceStep | undefined
 ): Promise<void> {
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(row.thread_id));
 
@@ -99,6 +105,12 @@ export async function checkPreReplyThread(
     await cleanupUnusedDrafts(connector, row.thread_id);
     return;
   }
+
+  // Pas de reponse humaine, et aucune etape due pour l'instant (sequence
+  // epuisee, ou prochain palier pas encore atteint) — rien de plus a faire
+  // ce cycle-ci, mais la detection de reponse ci-dessus aura quand meme
+  // tourne.
+  if (!step) return;
 
   if (step.channel === "external") {
     const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
@@ -158,7 +170,7 @@ export async function checkPreReplyThread(
 export async function checkPostReplyThread(
   connector: EmailConnector,
   row: ThreadRow,
-  step: RelanceStep
+  step: RelanceStep | undefined
 ): Promise<void> {
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(row.thread_id));
 
@@ -172,6 +184,12 @@ export async function checkPostReplyThread(
     setThreadStatus(row.thread_id, "responded");
     return;
   }
+
+  // Sequence post-reponse epuisee, ou prochain palier pas encore atteint —
+  // rien a envoyer ce cycle-ci, mais la detection de reponse client
+  // ci-dessus continue de tourner indefiniment tant que le dossier n'est
+  // pas cloture, au lieu de s'arreter des la derniere etape configuree.
+  if (!step) return;
 
   if (step.channel === "external") {
     const lastOutbound = [...thread.messages].reverse().find((m) => m.isFromUs);
