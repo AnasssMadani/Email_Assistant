@@ -109,6 +109,13 @@ export async function checkPreReplyThread(
       );
       return;
     }
+    // lastInbound sert d'ancrage de CONTENU (la demande initiale du client),
+    // mais l'en-tete RFC In-Reply-To doit pointer vers le tout dernier
+    // message du fil, quel qu'en soit l'auteur — sinon (ex: notre accuse
+    // envoye apres lastInbound) la relance "repond" a un message plus ancien
+    // que le dernier echange reel, et Gmail la detache dans un nouveau fil
+    // au lieu de l'enchainer a la suite de notre accuse.
+    const lastMessageInThread = thread.messages[thread.messages.length - 1];
 
     const category = getCategory(row.category_id);
     const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
@@ -118,7 +125,7 @@ export async function checkPreReplyThread(
         to: row.sender_email,
         subject: buildReplySubject(row.subject),
         bodyText: relance.body,
-        inReplyToMessageId: lastInbound.rfcMessageId,
+        inReplyToMessageId: lastMessageInThread.rfcMessageId,
       })
     );
     incrementRelance(row.thread_id, "relance_sent");

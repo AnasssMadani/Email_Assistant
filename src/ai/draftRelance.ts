@@ -119,6 +119,12 @@ async function draftRelanceOnce(
             "- Rappelle brievement l'objet de la demande initiale.",
             "- Indique que le dossier est toujours en cours de traitement.",
             "- Ne promets pas de nouveau delai precis s'il n'est pas confirme.",
+            "- Le retard est de notre cote, jamais du sien: ne dis jamais que nous",
+            "  attendons une reponse, une precision ou une information de sa part,",
+            "  sauf si notre dernier message (fourni ci-dessous) le demande",
+            "  explicitement mot pour mot. Par defaut, personne ne lui a rien",
+            "  demande — n'invente aucune question, precision ou echange qui ne",
+            "  figure pas litteralement dans ce message.",
             `- Cette demande relevait de la categorie "${category.label}".`,
             ...continuityBlock,
           ].join("\n");
