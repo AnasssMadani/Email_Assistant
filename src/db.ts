@@ -620,6 +620,27 @@ function writeSteps(
 ): void {
   const table = tableFor(phase);
   db.prepare(`DELETE FROM ${table} WHERE owner_type = ? AND owner_id = ?`).run(ownerType, ownerId);
+
+  // `relance_steps` (pre_reply) predates delay_minutes: sur une base creee
+  // avant la bascule heures->minutes, sa colonne delay_hours est restee
+  // NOT NULL (CREATE TABLE IF NOT EXISTS ne modifie jamais une table
+  // existante). Ne jamais fournir delay_hours ici faisait donc echouer tout
+  // ajout/suppression d'etape avec "NOT NULL constraint failed:
+  // relance_steps.delay_hours" sur ces bases-la. On la renseigne toujours
+  // (calculee depuis delayMinutes), ce qui reste compatible avec les bases
+  // recentes ou la colonne est nullable. post_reply_relance_steps n'a jamais
+  // eu cette colonne, donc pas concernee.
+  if (table === "relance_steps") {
+    const insert = db.prepare(
+      `INSERT INTO relance_steps (owner_type, owner_id, step_order, channel, delay_hours, delay_minutes)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    steps.forEach((step, index) => {
+      insert.run(ownerType, ownerId, index + 1, step.channel, step.delayMinutes / 60, step.delayMinutes);
+    });
+    return;
+  }
+
   const insert = db.prepare(
     `INSERT INTO ${table} (owner_type, owner_id, step_order, channel, delay_minutes) VALUES (?, ?, ?, ?, ?)`
   );
