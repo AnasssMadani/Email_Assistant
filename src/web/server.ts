@@ -848,6 +848,7 @@ function sharedStyles(primaryColor: string): string {
   .step-item .step-order { font-family: var(--font-mono); color: var(--ink-faint); font-size: 12px; width: 18px; }
   .step-item .step-delay { font-family: var(--font-mono); font-weight: 600; min-width: 52px; }
   .step-item .step-raw { color: var(--ink-faint); font-size: 11px; }
+  .step-item .step-absolute { color: var(--ink-soft); font-size: 12px; font-family: var(--font-mono); }
   .step-item form { margin-left: auto; }
   .step-add-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .step-add-form select, .step-add-form input[type=number] {
@@ -1348,6 +1349,7 @@ function renderDossierDetailPage(
     csrfToken,
     executedCount: isPostReply ? thread.post_reply_relance_count : thread.relance_count,
     phase,
+    anchorAt,
   });
 
   const addForm = isCustom
@@ -1419,6 +1421,16 @@ function renderStepList(opts: {
   csrfToken: string | undefined;
   executedCount: number;
   phase: RelancePhase;
+  /**
+   * Date de depart reelle du decompte (echeance SLA pour pre_reply, date de
+   * notre reponse pour post_reply). Fournie uniquement depuis la page d'un
+   * dossier precis (une categorie n'a pas d'ancrage concret). Sans cette
+   * date affichee en clair, "+2min" se lit comme "dans 2 minutes" alors que
+   * c'est en realite 2 minutes apres l'echeance — qui peut elle-meme etre a
+   * 24h. Affichee ici pour qu'aucune etape ne semble "ne jamais se
+   * declencher" sans explication.
+   */
+  anchorAt?: string | null;
 }): string {
   if (opts.steps.length === 0) {
     return `<div class="step-empty">Aucune étape configurée — ce dossier ne sera jamais relancé automatiquement.</div>`;
@@ -1427,6 +1439,9 @@ function renderStepList(opts: {
     .map((step) => {
       const done = step.order <= opts.executedCount;
       const stampClass = step.channel === "external" ? "stamp-external" : "stamp-internal";
+      const absoluteAt = opts.anchorAt
+        ? new Date(new Date(opts.anchorAt).getTime() + step.delayMinutes * 60_000).toLocaleString("fr-FR")
+        : null;
       const deleteForm = opts.editable
         ? `<form method="POST" action="${opts.deleteAction(step.order)}" onsubmit="return confirm('Supprimer cette étape ?');">
             ${csrfField(opts.csrfToken)}
@@ -1438,6 +1453,7 @@ function renderStepList(opts: {
         <span class="step-order">${step.order}.</span>
         <span class="step-delay">${escapeHtml(formatDelay(step.delayMinutes))}</span>
         <span class="step-raw">(${step.delayMinutes} min)</span>
+        ${absoluteAt ? `<span class="step-absolute">→ ${escapeHtml(absoluteAt)}</span>` : ""}
         <span class="stamp ${stampClass}">${escapeHtml(channelLabel(step.channel))}</span>
         ${done ? `<span class="stamp stamp-done">Effectuée</span>` : ""}
         ${deleteForm}
