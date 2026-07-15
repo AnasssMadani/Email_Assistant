@@ -31,7 +31,12 @@ export const config = {
     tokenPath: process.env.AZURE_TOKEN_PATH ?? "./data/graph-token.json",
   },
   pollIntervalCron: process.env.POLL_INTERVAL_CRON ?? "*/2 * * * *",
-  relanceCheckCron: process.env.RELANCE_CHECK_CRON ?? "*/30 * * * *",
+  // Cadence de verification des relances/rappels dus. A 30 min (l'ancien
+  // defaut), une relance ciblee a 15 min pouvait arriver avec jusqu'a 45 min
+  // de retard reel. Alignee sur pollIntervalCron pour des delais courts
+  // (quelques minutes, meme jour) fiables — reste ajustable via l'env si
+  // besoin d'un intervalle different.
+  relanceCheckCron: process.env.RELANCE_CHECK_CRON ?? "*/2 * * * *",
   dbPath: process.env.DB_PATH ?? "./data/app.db",
   categoriesConfigPath: process.env.CATEGORIES_CONFIG_PATH ?? "./config/categories.json",
   brandVoicePath: process.env.BRAND_VOICE_PATH ?? "./config/brand-voice.md",
