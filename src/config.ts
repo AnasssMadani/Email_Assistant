@@ -71,6 +71,10 @@ export const config = {
     inputPerMillionTokensUsd: Number(process.env.CLAUDE_INPUT_PRICE_PER_MTOK ?? 3),
     outputPerMillionTokensUsd: Number(process.env.CLAUDE_OUTPUT_PRICE_PER_MTOK ?? 15),
   },
+  // Fuseau d'affichage des dates dans l'admin. Sans ceci, toLocaleString()
+  // rend dans le fuseau du serveur d'hebergement (souvent UTC), pas celui de
+  // l'equipe — un decalage silencieux d'1h+ selon ou l'app est deployee.
+  timezone: process.env.APP_TIMEZONE ?? "Africa/Casablanca",
 };
 
 export function requireAnthropicApiKey(): string {

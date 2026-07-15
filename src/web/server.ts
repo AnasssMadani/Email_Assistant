@@ -896,6 +896,18 @@ function formatDelay(minutes: number): string {
   return `J+${trimNumber(minutes / 1440)}`;
 }
 
+/**
+ * Toutes les dates affichees dans l'admin doivent passer par ici. Sans le
+ * timeZone explicite, toLocaleString() rend dans le fuseau du PROCESSUS
+ * serveur (souvent UTC sur un hebergement PaaS), pas celui de l'equipe —
+ * decalage silencieux d'1h+ observe en production (config.timezone, par
+ * defaut Africa/Casablanca).
+ */
+function formatDateTime(value: string | Date): string {
+  const date = typeof value === "string" ? new Date(value) : value;
+  return date.toLocaleString("fr-FR", { timeZone: config.timezone });
+}
+
 function trimNumber(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(1);
 }
@@ -1025,7 +1037,7 @@ function renderStatus(state: ReturnType<typeof getConnectionState>, csrfToken: s
     return `<div class="status"><div><div class="label">Statut</div><div class="value">Aucune messagerie connectée</div></div></div>`;
   }
   const providerLabel = state.provider === "gmail" ? "Gmail" : "Outlook / Microsoft 365";
-  const since = new Date(state.connectedAt).toLocaleString("fr-FR");
+  const since = formatDateTime(state.connectedAt);
   return `<div class="status">
     <div>
       <div class="label">Statut</div>
@@ -1194,7 +1206,7 @@ function renderThreadRow(
   categoryLabels: Map<string, string>
 ): string {
   const stamp = statusStamp(row);
-  const dueLabel = row.due_at ? new Date(row.due_at).toLocaleString("fr-FR") : "—";
+  const dueLabel = row.due_at ? formatDateTime(row.due_at) : "—";
   const canClose = !["responded", "closed", "skipped"].includes(row.status);
   const categoryLabel = categoryLabels.get(row.category_id) ?? row.category_id;
   const detailHref = `/dossiers/${encodeURIComponent(row.thread_id)}`;
@@ -1272,13 +1284,13 @@ function renderDossierDetailPage(
         <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
         <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
         <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(thread.urgency).stampClass}" title="${escapeHtml(urgencyStamp(thread.urgency).hint)}">${escapeHtml(urgencyStamp(thread.urgency).label)}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Reçu le</span><span class="fact-value">${escapeHtml(new Date(thread.received_at).toLocaleString("fr-FR"))}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Accusé le</span><span class="fact-value">${thread.ack_sent_at ? escapeHtml(new Date(thread.ack_sent_at).toLocaleString("fr-FR")) : "—"}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Échéance (SLA initial)</span><span class="fact-value">${thread.due_at ? escapeHtml(new Date(thread.due_at).toLocaleString("fr-FR")) : "—"}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Répondu par nous le</span><span class="fact-value">${thread.human_replied_at ? escapeHtml(new Date(thread.human_replied_at).toLocaleString("fr-FR")) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Reçu le</span><span class="fact-value">${escapeHtml(formatDateTime(thread.received_at))}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Accusé le</span><span class="fact-value">${thread.ack_sent_at ? escapeHtml(formatDateTime(thread.ack_sent_at)) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Échéance (SLA initial)</span><span class="fact-value">${thread.due_at ? escapeHtml(formatDateTime(thread.due_at)) : "—"}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Répondu par nous le</span><span class="fact-value">${thread.human_replied_at ? escapeHtml(formatDateTime(thread.human_replied_at)) : "—"}</span></div>
         <div class="ledger-fact"><span class="fact-label">Prochaine action prévue</span><span class="fact-value">${
           nextActionAt
-            ? `${escapeHtml(nextActionAt.toLocaleString("fr-FR"))} — ${escapeHtml(channelLabel(nextStep!.channel))}`
+            ? `${escapeHtml(formatDateTime(nextActionAt))} — ${escapeHtml(channelLabel(nextStep!.channel))}`
             : "—"
         }</span></div>
         <div class="ledger-fact"><span class="fact-label">Relances (avant réponse)</span><span class="fact-value">${thread.relance_count}</span></div>
@@ -1441,7 +1453,7 @@ function renderStepList(opts: {
       const done = step.order <= opts.executedCount;
       const stampClass = step.channel === "external" ? "stamp-external" : "stamp-internal";
       const absoluteAt = opts.anchorAt
-        ? new Date(new Date(opts.anchorAt).getTime() + step.delayMinutes * 60_000).toLocaleString("fr-FR")
+        ? formatDateTime(new Date(new Date(opts.anchorAt).getTime() + step.delayMinutes * 60_000))
         : null;
       const deleteForm = opts.editable
         ? `<form method="POST" action="${opts.deleteAction(step.order)}" onsubmit="return confirm('Supprimer cette étape ?');">
@@ -1721,7 +1733,7 @@ function renderConsommationPage(summary: AiUsageSummary, recent: AiUsageEventRow
       return `<div class="ledger-row">
         <div class="ledger-main">
           <span class="subject-static">${escapeHtml(aiCallTypeLabel(ev.call_type))}</span>
-          <div class="ledger-meta">${ev.thread_id ? `<a class="subject-link" href="/dossiers/${encodeURIComponent(ev.thread_id)}">Voir le dossier</a>` : "(sans dossier)"} — ${escapeHtml(new Date(ev.created_at).toLocaleString("fr-FR"))}</div>
+          <div class="ledger-meta">${ev.thread_id ? `<a class="subject-link" href="/dossiers/${encodeURIComponent(ev.thread_id)}">Voir le dossier</a>` : "(sans dossier)"} — ${escapeHtml(formatDateTime(ev.created_at))}</div>
         </div>
         <div class="ledger-facts">
           <div class="ledger-fact"><span class="fact-label">Entrée</span><span class="fact-value">${formatTokens(ev.input_tokens)}</span></div>
@@ -1804,7 +1816,7 @@ function renderErrorRow(row: PipelineErrorRow): string {
           ? `<div class="ledger-fact"><span class="fact-label">Source</span><span class="stamp stamp-internal">${escapeHtml(source)}</span></div>`
           : ""
       }
-      <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(new Date(row.created_at).toLocaleString("fr-FR"))}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(formatDateTime(row.created_at))}</span></div>
     </div>
   </div>`;
 }
@@ -1820,7 +1832,7 @@ function renderReminderRow(row: ReminderRow): string {
     <div class="ledger-facts">
       <div class="ledger-fact"><span class="fact-label">Type</span><span class="stamp ${stampClass}">${escapeHtml(kindLabel)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Note</span><span class="fact-value">${escapeHtml(row.note ?? "—")}</span></div>
-      <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(new Date(row.created_at).toLocaleString("fr-FR"))}</span></div>
+      <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(formatDateTime(row.created_at))}</span></div>
     </div>
   </div>`;
 }
@@ -1862,7 +1874,7 @@ function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined):
   return `<div class="ledger-row">
     <div class="ledger-main">
       <span class="subject-static">${escapeHtml(message.subject)}</span>
-      <div class="ledger-meta">${escapeHtml(recipientLabel)} — envoyé le ${escapeHtml(message.receivedAt.toLocaleString("fr-FR"))}</div>
+      <div class="ledger-meta">${escapeHtml(recipientLabel)} — envoyé le ${escapeHtml(formatDateTime(message.receivedAt))}</div>
     </div>
     <div class="ledger-actions">
       ${
