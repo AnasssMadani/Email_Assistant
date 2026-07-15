@@ -46,7 +46,7 @@ async function main(): Promise<void> {
 
   const category = getCategory(classification.categoryId);
   console.log(
-    `\nCategorie resolue: ${category.label} (SLA ${category.slaHours}h, accuse auto: ${category.acknowledgeAutomatically})`
+    `\nCategorie resolue: ${category.label} (SLA ${category.slaMinutes}min, accuse auto: ${category.acknowledgeAutomatically})`
   );
 
   if (!category.acknowledgeAutomatically || !classification.requiresAcknowledgement) {

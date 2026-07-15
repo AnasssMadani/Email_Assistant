@@ -31,7 +31,7 @@ test("a dossier with no override falls back to its category's sequence", () => {
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
-    slaHours: 24,
+    slaMinutes: 1440,
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });
@@ -49,7 +49,7 @@ test("adding a thread-scoped step overrides the category sequence entirely", () 
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
-    slaHours: 24,
+    slaMinutes: 1440,
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });
@@ -73,7 +73,7 @@ test("clearing a thread override reverts it to the category default", () => {
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
-    slaHours: 24,
+    slaMinutes: 1440,
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });
@@ -109,7 +109,7 @@ test("deleteThreadData removes a dossier's custom relance override", () => {
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
-    slaHours: 24,
+    slaMinutes: 1440,
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });
@@ -142,7 +142,7 @@ test("a thread-scoped post_reply override does not affect the pre_reply sequence
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
-    slaHours: 24,
+    slaMinutes: 1440,
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });
@@ -165,7 +165,7 @@ test("setThreadHumanReplied transitions a dossier into awaiting_client_reply", (
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
-    slaHours: 24,
+    slaMinutes: 1440,
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });

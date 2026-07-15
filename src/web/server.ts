@@ -414,7 +414,7 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
       const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
       if (!lastInbound) throw new Error("Aucun message entrant trouve dans ce fil.");
       const category = getCategory(body.categoryId);
-      const dueAt = new Date(Date.now() + category.slaHours * 3600_000).toISOString();
+      const dueAt = new Date(Date.now() + category.slaMinutes * 60_000).toISOString();
       upsertThreadReceived({
         threadId,
         subject: threadRow.subject,
@@ -422,7 +422,7 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
         senderName: lastInbound.from.name ?? null,
         categoryId: category.id,
         urgency: threadRow.urgency,
-        slaHours: category.slaHours,
+        slaMinutes: category.slaMinutes,
         status: "received",
         dueAt,
       });
@@ -469,7 +469,7 @@ app.post("/reglages/categories", requireCsrf, (req: Request, res: Response) => {
     if (!label) throw new Error("Le nom de la catégorie ne peut pas être vide.");
     createCategory({
       label,
-      slaHours: Math.max(0, parseLocaleNumber(body.slaHours) || 24),
+      slaMinutes: Math.max(0, parseLocaleNumber(body.slaMinutes) || 1440),
       acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
     });
   });
@@ -481,7 +481,7 @@ app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) 
   runOrRedirectReglagesError(res, "category_update", () => {
     updateCategory(req.params.id, {
       label: (body.label ?? "").trim() || req.params.id,
-      slaHours: Math.max(0, parseLocaleNumber(body.slaHours)),
+      slaMinutes: Math.max(0, parseLocaleNumber(body.slaMinutes)),
       acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
       internalAlertsEnabled: alertMode.enabled,
       internalAlertsMinUrgency: alertMode.minUrgency,
@@ -574,7 +574,7 @@ app.post("/envois/suivre", requireCsrf, (req: Request, res: Response) => {
         senderName: body.recipientName || null,
         categoryId: category.id,
         urgency: "normal",
-        slaHours: category.slaHours,
+        slaMinutes: category.slaMinutes,
         status: "awaiting_client_reply",
         dueAt: null,
       });
@@ -815,6 +815,7 @@ function sharedStyles(primaryColor: string): string {
   }
   .category-head-form select { width: 100%; padding: 7px 9px; border-radius: 3px; border: 1px solid var(--rule-strong); background: var(--paper-raised); color: var(--ink); font-family: inherit; font-size: 12.5px; }
   .field-label { display: block; font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-faint); margin-bottom: 3px; }
+  .field-hint { display: block; font-size: 10.5px; color: var(--ink-faint); margin-top: 3px; font-family: var(--font-mono); }
   details.advanced-steps { margin-top: 2px; }
   details.advanced-steps > summary { cursor: pointer; padding: 10px 16px; font-size: 12px; color: var(--ink-soft); user-select: none; }
   details.advanced-steps > summary:hover { color: var(--ink); }
@@ -1525,8 +1526,9 @@ function renderReglagesPage(
             <span class="cat-id">${escapeHtml(cat.id)}</span>
           </div>
           <div>
-            <span class="field-label">SLA (h)</span>
-            <input type="number" name="slaHours" value="${cat.slaHours}" min="0" step="0.5" title="Délai que l'accusé de réception promet au client (ex: 24 = « réponse sous 24h »). C'est aussi le point de départ des rappels et relances automatiques ci-dessous." />
+            <span class="field-label">SLA (min)</span>
+            <input type="number" name="slaMinutes" value="${cat.slaMinutes}" min="0" step="1" title="Délai que l'accusé de réception promet au client, en minutes (ex: 1440 = « réponse sous 24h »). C'est aussi le point de départ des rappels et relances automatiques ci-dessous." />
+            <span class="field-hint">${escapeHtml(formatDelay(cat.slaMinutes))}</span>
           </div>
           <div class="checkbox-cell">
             <input type="checkbox" id="ack-${escapeHtml(cat.id)}" name="acknowledgeAutomatically" ${cat.acknowledgeAutomatically ? "checked" : ""} />
@@ -1563,7 +1565,7 @@ function renderReglagesPage(
       <form class="new-category-form" method="POST" action="/reglages/categories">
         ${csrfField(csrfToken)}
         <input type="text" name="label" placeholder="Nom de la nouvelle catégorie" required />
-        <input type="number" name="slaHours" value="24" min="0" step="0.5" title="Délai promis au client dans l'accusé de réception (heures)" />
+        <input type="number" name="slaMinutes" value="1440" min="0" step="1" title="Délai promis au client dans l'accusé de réception, en minutes (1440 = 24h)" />
         <label class="checkbox-cell"><input type="checkbox" name="acknowledgeAutomatically" checked /> Accusé auto.</label>
         <button class="btn btn-secondary btn-sm" type="submit">+ Nouvelle catégorie</button>
       </form>

@@ -68,7 +68,7 @@ test("a thread that already has a dossier is left untouched", async () => {
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
-    slaHours: 24,
+    slaMinutes: 1440,
     status: "ack_sent",
     dueAt: new Date().toISOString(),
   });

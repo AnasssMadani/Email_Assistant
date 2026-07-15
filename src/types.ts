@@ -63,7 +63,8 @@ export type UrgencyThreshold = "low" | "normal" | "high";
 export interface CategoryConfig {
   id: string;
   label: string;
-  slaHours: number;
+  /** Delai promis au client dans l'accuse de reception, en minutes (permet un reglage plus fin qu'en heures, coherent avec les etapes de relance deja en minutes). */
+  slaMinutes: number;
   acknowledgeAutomatically: boolean;
   internalAlertsEnabled: boolean;
   internalAlertsMinUrgency: UrgencyThreshold;

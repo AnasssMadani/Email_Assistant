@@ -3,7 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { recordUsage, withRetry } from "./structured.js";
 import { loadBrandVoice } from "../config.js";
-import { formatSingleMessage, LANGUAGE_INSTRUCTION } from "./prompts.js";
+import { formatSingleMessage, formatSlaForPrompt, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
 
 export interface AckDraft {
@@ -58,7 +58,7 @@ async function draftAcknowledgementOnce(
       "Regles strictes:",
       "- Cite explicitement l'objet reel de la demande (pas de formule generique du type",
       "  'nous avons bien recu votre message').",
-      `- Annonce un delai de reponse de ${category.slaHours} heure(s) maximum, sans donner`,
+      `- Annonce un delai de reponse de ${formatSlaForPrompt(category.slaMinutes)} maximum, sans donner`,
       "  d'heure ou de date precise.",
       "- Ne promets rien d'autre que la prise en compte de la demande: aucun engagement",
       "  sur un prix, une disponibilite ou une decision.",

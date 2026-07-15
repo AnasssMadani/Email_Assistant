@@ -16,6 +16,10 @@ db.exec(`
     category_id TEXT NOT NULL,
     urgency TEXT NOT NULL,
     sla_hours REAL NOT NULL,
+    -- SLA exprime en minutes (remplace sla_hours cote UI/logique — celle-ci
+    -- reste ecrite pour compatibilite avec les bases anterieures a la
+    -- bascule, ou la colonne est NOT NULL).
+    sla_minutes REAL,
     status TEXT NOT NULL,
     received_at TEXT NOT NULL,
     ack_sent_at TEXT,
@@ -60,6 +64,9 @@ db.exec(`
     id TEXT PRIMARY KEY,
     label TEXT NOT NULL,
     sla_hours REAL NOT NULL,
+    -- Idem threads.sla_minutes: source de verite cote UI/logique, sla_hours
+    -- reste ecrite pour compatibilite avec les bases anterieures.
+    sla_minutes REAL,
     acknowledge_automatically INTEGER NOT NULL,
     sort_order INTEGER NOT NULL,
     -- Filtre anti-spam des rappels internes: une categorie peut nudger
@@ -123,6 +130,7 @@ ensureDelayMinutesColumn();
 ensureThreadPostReplyColumns();
 ensureThreadAttachmentColumn();
 ensureCategoryAlertColumns();
+ensureSlaMinutesColumns();
 seedIfNeeded();
 
 /**
@@ -157,6 +165,29 @@ function ensureThreadAttachmentColumn(): void {
   if (!columns.some((c) => c.name === "outbound_had_attachment")) {
     db.exec("ALTER TABLE threads ADD COLUMN outbound_had_attachment INTEGER NOT NULL DEFAULT 0");
   }
+}
+
+/**
+ * Migration additive: le SLA est desormais regle et affiche en minutes (plus
+ * granulaire, coherent avec les etapes de relance deja en minutes) plutot
+ * qu'en heures. Ajoute sla_minutes sur categories et threads si absente, et
+ * retro-remplit a partir de sla_hours * 60 pour ne pas perdre les reglages
+ * existants. sla_hours reste ecrite en parallele a chaque insertion/mise a
+ * jour (voir toCategoryConfig/updateCategory/upsertThreadReceived) car cette
+ * colonne est NOT NULL sur les bases anterieures a cette migration.
+ */
+function ensureSlaMinutesColumns(): void {
+  const categoryColumns = db.prepare("PRAGMA table_info(categories)").all() as unknown as { name: string }[];
+  if (!categoryColumns.some((c) => c.name === "sla_minutes")) {
+    db.exec("ALTER TABLE categories ADD COLUMN sla_minutes REAL");
+  }
+  db.exec("UPDATE categories SET sla_minutes = sla_hours * 60 WHERE sla_minutes IS NULL");
+
+  const threadColumns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
+  if (!threadColumns.some((c) => c.name === "sla_minutes")) {
+    db.exec("ALTER TABLE threads ADD COLUMN sla_minutes REAL");
+  }
+  db.exec("UPDATE threads SET sla_minutes = sla_hours * 60 WHERE sla_minutes IS NULL");
 }
 
 /** Migration additive: ajoute les colonnes de filtre des rappels internes sur categories si absentes. */
@@ -223,9 +254,9 @@ function seedIfNeeded(): void {
   if (categoryCount.n === 0) {
     const insert = db.prepare(
       `INSERT INTO categories (
-        id, label, sla_hours, acknowledge_automatically, sort_order,
+        id, label, sla_hours, sla_minutes, acknowledge_automatically, sort_order,
         internal_alerts_enabled, internal_alerts_min_urgency
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     seed.categories.forEach((cat, index) => {
       const alerts = defaultAlertSettingsFor(cat.id);
@@ -233,6 +264,7 @@ function seedIfNeeded(): void {
         cat.id,
         cat.label,
         cat.slaHours,
+        cat.slaHours * 60,
         cat.acknowledgeAutomatically ? 1 : 0,
         index,
         alerts.enabled ? 1 : 0,
@@ -280,6 +312,7 @@ export interface ThreadRow {
   category_id: string;
   urgency: string;
   sla_hours: number;
+  sla_minutes: number | null;
   status: ThreadStatus;
   received_at: string;
   ack_sent_at: string | null;
@@ -313,7 +346,7 @@ export function upsertThreadReceived(params: {
   senderName: string | null;
   categoryId: string;
   urgency: string;
-  slaHours: number;
+  slaMinutes: number;
   status: ThreadStatus;
   dueAt: string | null;
 }): void {
@@ -321,13 +354,14 @@ export function upsertThreadReceived(params: {
   db.prepare(
     `INSERT INTO threads (
       thread_id, subject, sender_email, sender_name, category_id, urgency,
-      sla_hours, status, received_at, due_at, relance_count, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      sla_hours, sla_minutes, status, received_at, due_at, relance_count, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
     ON CONFLICT(thread_id) DO UPDATE SET
       subject = excluded.subject,
       category_id = excluded.category_id,
       urgency = excluded.urgency,
       sla_hours = excluded.sla_hours,
+      sla_minutes = excluded.sla_minutes,
       status = excluded.status,
       due_at = excluded.due_at,
       updated_at = excluded.updated_at`
@@ -338,7 +372,8 @@ export function upsertThreadReceived(params: {
     params.senderName,
     params.categoryId,
     params.urgency,
-    params.slaHours,
+    params.slaMinutes / 60,
+    params.slaMinutes,
     params.status,
     now,
     params.dueAt,
@@ -465,6 +500,7 @@ interface CategoryRow {
   id: string;
   label: string;
   sla_hours: number;
+  sla_minutes: number | null;
   acknowledge_automatically: number;
   sort_order: number;
   internal_alerts_enabled: number;
@@ -475,7 +511,7 @@ function toCategoryConfig(row: CategoryRow): CategoryConfig {
   return {
     id: row.id,
     label: row.label,
-    slaHours: row.sla_hours,
+    slaMinutes: row.sla_minutes ?? row.sla_hours * 60,
     acknowledgeAutomatically: row.acknowledge_automatically === 1,
     internalAlertsEnabled: row.internal_alerts_enabled === 1,
     internalAlertsMinUrgency: (row.internal_alerts_min_urgency as UrgencyThreshold) || "normal",
@@ -493,7 +529,7 @@ export function updateCategory(
   id: string,
   patch: {
     label: string;
-    slaHours: number;
+    slaMinutes: number;
     acknowledgeAutomatically: boolean;
     internalAlertsEnabled: boolean;
     internalAlertsMinUrgency: UrgencyThreshold;
@@ -503,13 +539,15 @@ export function updateCategory(
     `UPDATE categories SET
       label = ?,
       sla_hours = ?,
+      sla_minutes = ?,
       acknowledge_automatically = ?,
       internal_alerts_enabled = ?,
       internal_alerts_min_urgency = ?
      WHERE id = ?`
   ).run(
     patch.label,
-    patch.slaHours,
+    patch.slaMinutes / 60,
+    patch.slaMinutes,
     patch.acknowledgeAutomatically ? 1 : 0,
     patch.internalAlertsEnabled ? 1 : 0,
     patch.internalAlertsMinUrgency,
@@ -549,7 +587,7 @@ function uniqueCategoryId(base: string): string {
  */
 export function createCategory(params: {
   label: string;
-  slaHours: number;
+  slaMinutes: number;
   acknowledgeAutomatically: boolean;
 }): CategoryConfig {
   const id = uniqueCategoryId(slugify(params.label));
@@ -558,10 +596,17 @@ export function createCategory(params: {
   };
   db.prepare(
     `INSERT INTO categories (
-      id, label, sla_hours, acknowledge_automatically, sort_order,
+      id, label, sla_hours, sla_minutes, acknowledge_automatically, sort_order,
       internal_alerts_enabled, internal_alerts_min_urgency
-    ) VALUES (?, ?, ?, ?, ?, 1, 'normal')`
-  ).run(id, params.label, params.slaHours, params.acknowledgeAutomatically ? 1 : 0, maxOrderRow.maxOrder + 1);
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, 'normal')`
+  ).run(
+    id,
+    params.label,
+    params.slaMinutes / 60,
+    params.slaMinutes,
+    params.acknowledgeAutomatically ? 1 : 0,
+    maxOrderRow.maxOrder + 1
+  );
 
   writeSteps("pre_reply", "category", id, [{ channel: "internal", delayMinutes: 1440 }]);
   writeSteps("post_reply", "category", id, [{ channel: "external", delayMinutes: 3 * 1440 }]);

@@ -44,6 +44,20 @@ export function formatSingleMessage(message: EmailMessage): string {
   return ["Message a traiter:", formatMessage(message)].join("\n");
 }
 
+/**
+ * Le SLA est regle en minutes (granularite fine, coherente avec les etapes
+ * de relance), mais l'annoncer tel quel dans un email ("1440 minutes") lirait
+ * mal a un client — on le reformule dans l'unite la plus naturelle avant de
+ * l'inclure dans une instruction Claude.
+ */
+export function formatSlaForPrompt(minutes: number): string {
+  if (minutes <= 0) return "quelques instants";
+  if (minutes < 60) return `${minutes} minute${minutes > 1 ? "s" : ""}`;
+  const hours = minutes / 60;
+  const rounded = Number.isInteger(hours) ? String(hours) : hours.toFixed(1);
+  return `${rounded} heure${hours > 1 ? "s" : ""}`;
+}
+
 function formatMessage(m: EmailMessage): string {
   return [
     `De: ${m.from.name ? `${m.from.name} <${m.from.email}>` : m.from.email}`,

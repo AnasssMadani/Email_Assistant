@@ -28,7 +28,7 @@ export async function processIncomingMessage(
   const shouldAcknowledge = category.acknowledgeAutomatically && classification.requiresAcknowledgement;
   const now = Date.now();
   const dueAt = shouldAcknowledge
-    ? new Date(now + category.slaHours * 3600_000).toISOString()
+    ? new Date(now + category.slaMinutes * 60_000).toISOString()
     : null;
 
   upsertThreadReceived({
@@ -38,7 +38,7 @@ export async function processIncomingMessage(
     senderName: message.from.name ?? null,
     categoryId: category.id,
     urgency: classification.urgency,
-    slaHours: category.slaHours,
+    slaMinutes: category.slaMinutes,
     status: shouldAcknowledge ? "received" : "skipped",
     dueAt,
   });

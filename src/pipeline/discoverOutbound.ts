@@ -60,7 +60,7 @@ async function registerIfNewThread(message: EmailMessage): Promise<void> {
     senderName: recipient.name ?? null,
     categoryId: category.id,
     urgency: "normal",
-    slaHours: category.slaHours,
+    slaMinutes: category.slaMinutes,
     status: "awaiting_client_reply",
     dueAt: null,
   });
