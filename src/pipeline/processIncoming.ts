@@ -11,6 +11,7 @@ import {
   setThreadAckSent,
   setThreadStatus,
   recordDraft,
+  recordReminder,
 } from "../db.js";
 import type { CategoryConfig, EmailConnector, EmailMessage, EmailThread } from "../types.js";
 
@@ -84,6 +85,11 @@ export async function sendAcknowledgementAndDrafts(
     })
   );
   setThreadAckSent(incoming.threadId);
+  // Journalise le destinataire reel de l'accuse — sans ca, un envoi vers une
+  // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est
+  // visible nulle part avant qu'un rebond n'arrive dans la boite, et devient
+  // alors impossible a relier au dossier d'origine.
+  recordReminder(incoming.threadId, "external", `Accusé de réception envoyé à ${incoming.from.email}.`);
   console.log(`[accuse envoye] ${incoming.from.email} — "${incoming.subject}"`);
 
   const replies = await draftThreeReplies(thread, incoming, category);

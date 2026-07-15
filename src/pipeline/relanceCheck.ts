@@ -129,7 +129,7 @@ export async function checkPreReplyThread(
       })
     );
     incrementRelance(row.thread_id, "relance_sent");
-    recordReminder(row.thread_id, "external", "Relance envoyee automatiquement au demandeur.");
+    recordReminder(row.thread_id, "external", `Relance envoyee automatiquement a ${row.sender_email}.`);
     console.log(`[relance externe] ${row.sender_email} — "${row.subject}"`);
     return;
   }
@@ -201,7 +201,11 @@ export async function checkPostReplyThread(
       })
     );
     incrementPostReplyRelance(row.thread_id, "relance_sent");
-    recordReminder(row.thread_id, "external", "Relance post-reponse envoyee au client (suivi de notre reponse).");
+    recordReminder(
+      row.thread_id,
+      "external",
+      `Relance post-reponse envoyee a ${row.sender_email} (suivi de notre reponse).`
+    );
     console.log(`[relance post-reponse] ${row.sender_email} — "${row.subject}"`);
     return;
   }
@@ -228,20 +232,37 @@ export async function checkPostReplyThread(
  * elle-meme (un pense-bete dans sa propre boite). Best-effort: un echec
  * d'envoi ne doit pas empecher le rappel d'etre journalise normalement.
  */
+/**
+ * L'equipe qui recoit ces rappels n'a pas forcement acces a l'application
+ * admin — pointer vers "Registre des dossiers" n'aide personne. Un lien de
+ * recherche direct dans la messagerie (qu'ils utilisent deja au quotidien)
+ * est bien plus utile pour retrouver l'echange precis, surtout quand
+ * plusieurs dossiers de la meme categorie se ressemblent.
+ */
+function mailboxSearchHint(connector: EmailConnector, row: ThreadRow): string {
+  const query = `from:(${row.sender_email}) OR subject:(${row.subject})`;
+  if (connector.name === "gmail") {
+    return `Retrouver l'échange: https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}`;
+  }
+  return `Retrouvez l'échange dans la messagerie en recherchant l'expéditeur (${row.sender_email}) ou l'objet ("${row.subject}").`;
+}
+
 async function sendInternalNotification(connector: EmailConnector, row: ThreadRow, note: string): Promise<void> {
   try {
     const ownEmail = await connector.getOwnEmailAddress();
     const to = config.notificationEmail || ownEmail;
+    const categoryLabel = getCategory(row.category_id).label;
     await connector.sendNotification({
       to,
       subject: `[Rappel] ${row.subject}`,
       bodyText: [
         note,
         "",
+        `Objet: ${row.subject}`,
         `Client: ${row.sender_name ? `${row.sender_name} ` : ""}<${row.sender_email}>`,
-        `Categorie: ${row.category_id}`,
+        `Categorie: ${categoryLabel}`,
         "",
-        "Ouvrez le dossier dans l'application (onglet Registre des dossiers) pour le traiter.",
+        mailboxSearchHint(connector, row),
       ].join("\n"),
     });
   } catch (err) {
