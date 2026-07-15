@@ -10,6 +10,7 @@ import {
   incrementRelance,
   listThreadsAwaitingClientReply,
   listThreadsAwaitingReply,
+  markMessageProcessed,
   recordPipelineError,
   recordReminder,
   setThreadHumanReplied,
@@ -226,13 +227,6 @@ export async function checkPostReplyThread(
 }
 
 /**
- * Envoie une vraie notification email pour un rappel interne — auparavant
- * seulement journalise en base (invisible sans ouvrir l'application). Part
- * vers NOTIFICATION_EMAIL si defini, sinon vers la messagerie connectee
- * elle-meme (un pense-bete dans sa propre boite). Best-effort: un echec
- * d'envoi ne doit pas empecher le rappel d'etre journalise normalement.
- */
-/**
  * L'equipe qui recoit ces rappels n'a pas forcement acces a l'application
  * admin — pointer vers "Registre des dossiers" n'aide personne. Un lien de
  * recherche direct dans la messagerie (qu'ils utilisent deja au quotidien)
@@ -247,12 +241,19 @@ function mailboxSearchHint(connector: EmailConnector, row: ThreadRow): string {
   return `Retrouvez l'échange dans la messagerie en recherchant l'expéditeur (${row.sender_email}) ou l'objet ("${row.subject}").`;
 }
 
+/**
+ * Envoie une vraie notification email pour un rappel interne — auparavant
+ * seulement journalise en base (invisible sans ouvrir l'application). Part
+ * vers NOTIFICATION_EMAIL si defini, sinon vers la messagerie connectee
+ * elle-meme (un pense-bete dans sa propre boite). Best-effort: un echec
+ * d'envoi ne doit pas empecher le rappel d'etre journalise normalement.
+ */
 async function sendInternalNotification(connector: EmailConnector, row: ThreadRow, note: string): Promise<void> {
   try {
     const ownEmail = await connector.getOwnEmailAddress();
     const to = config.notificationEmail || ownEmail;
     const categoryLabel = getCategory(row.category_id).label;
-    await connector.sendNotification({
+    const sent = await connector.sendNotification({
       to,
       subject: `[Rappel] ${row.subject}`,
       bodyText: [
@@ -265,6 +266,15 @@ async function sendInternalNotification(connector: EmailConnector, row: ThreadRo
         mailboxSearchHint(connector, row),
       ].join("\n"),
     });
+    // Un rappel interne est envoye sans threadId (voir sendNotification), donc
+    // Gmail/Graph lui creent son propre fil — qui apparait ensuite dans
+    // "Envoyes" comme n'importe quel autre email. Sans ce marquage,
+    // discoverOutbound.ts le voit au cycle suivant, ne le trouve dans aucun
+    // dossier existant, et l'enregistre a tort comme un nouveau dossier
+    // "envoye a froid" (avec le destinataire du rappel comme faux client).
+    // sent.id sert de threadId de remplacement: ce rappel n'appartient a
+    // aucun dossier reel, seul le marquage "deja traite" compte ici.
+    markMessageProcessed(sent.id, sent.id);
   } catch (err) {
     recordPipelineError(
       "relance_check",

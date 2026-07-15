@@ -53,10 +53,21 @@ export function hasAttachmentParts(part: gmail_v1.Schema$MessagePart | undefined
 
 export function parseAddress(raw: string | undefined): { name?: string; email: string } {
   if (!raw) return { email: "" };
-  const match = raw.match(/^\s*(?:"?([^"<]*)"?\s*)?<?([^<>\s]+@[^<>\s]+)>?\s*$/);
-  if (!match) return { email: raw.trim() };
-  const [, name, email] = match;
-  return { name: name?.trim() || undefined, email: email.trim() };
+  const trimmed = raw.trim();
+  // Format "Nom <email>" (ou '"Nom" <email>'): seul ce cas a un vrai nom a extraire.
+  const withName = trimmed.match(/^"?([^"<]*)"?\s*<([^<>\s]+@[^<>\s]+)>\s*$/);
+  if (withName) {
+    const [, name, email] = withName;
+    return { name: name.trim() || undefined, email: email.trim() };
+  }
+  // Adresse nue "email@domaine", sans chevrons: le nom optionnel du motif
+  // precedent est glouton et, faute de "<...>" pour le borner, grignotait
+  // la partie locale de l'adresse elle-meme (ex: "ahmedmokile@gmail.com" ->
+  // nom="ahmedmokil", email="e@gmail.com"). Ici, toute la chaine EST
+  // l'adresse — aucun nom a en extraire.
+  const bare = trimmed.match(/^[^<>\s]+@[^<>\s]+$/);
+  if (bare) return { email: trimmed };
+  return { email: trimmed };
 }
 
 export function buildRawMimeMessage(params: {
