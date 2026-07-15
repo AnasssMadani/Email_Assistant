@@ -75,6 +75,15 @@ export const config = {
   // rend dans le fuseau du serveur d'hebergement (souvent UTC), pas celui de
   // l'equipe — un decalage silencieux d'1h+ selon ou l'app est deployee.
   timezone: process.env.APP_TIMEZONE ?? "Africa/Casablanca",
+  // Garde-fou anti-rafale: nombre maximal de relances EXTERNES (celles vues
+  // par un client) que le planificateur peut envoyer en un seul cycle de
+  // verification. Un rattrapage apres arret du planificateur, ou simplement
+  // beaucoup de dossiers configures avec des delais courts arrivant a
+  // echeance au meme moment, ne doit jamais se traduire par une rafale
+  // d'emails identiques envoyes d'un coup a plusieurs clients — le surplus
+  // attend simplement le cycle suivant. Les rappels internes (jamais vus
+  // par un client) ne sont pas concernes par cette limite.
+  maxExternalRelancesPerCycle: Number(process.env.MAX_EXTERNAL_RELANCES_PER_CYCLE ?? 5),
 };
 
 export function requireAnthropicApiKey(): string {

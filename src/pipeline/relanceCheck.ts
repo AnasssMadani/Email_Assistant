@@ -20,6 +20,21 @@ import {
 import type { EmailConnector, RelanceStep } from "../types.js";
 
 /**
+ * Compteur partage sur un seul cycle de runRelanceCheck: plafonne le nombre
+ * de relances EXTERNES envoyees, quel que soit le nombre de dossiers due en
+ * meme temps. Voir config.maxExternalRelancesPerCycle.
+ */
+interface ExternalSendBudget {
+  remaining: number;
+}
+
+function tryConsumeExternalBudget(budget: ExternalSendBudget): boolean {
+  if (budget.remaining <= 0) return false;
+  budget.remaining--;
+  return true;
+}
+
+/**
  * Deux boucles independantes, une par phase du cycle de vie d'un dossier:
  *
  * 1. "pre_reply" — personne chez nous n'a encore repondu de fond au client.
@@ -37,6 +52,10 @@ import type { EmailConnector, RelanceStep } from "../types.js";
  */
 export async function runRelanceCheck(connector: EmailConnector): Promise<void> {
   const now = Date.now();
+  // Un seul budget partage entre les deux boucles (pre_reply et post_reply):
+  // le plafond porte sur le TOTAL de relances externes du cycle, pas sur
+  // chaque phase separement.
+  const externalBudget: ExternalSendBudget = { remaining: config.maxExternalRelancesPerCycle };
 
   // checkPreReplyThread/checkPostReplyThread detectent une reponse humaine
   // AVANT de regarder s'il y a une etape a declencher — mais si on ne les
@@ -57,7 +76,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
     const dueStep = nextStep && fireAt !== null && now >= fireAt ? nextStep : undefined;
 
     try {
-      await checkPreReplyThread(connector, row, dueStep);
+      await checkPreReplyThread(connector, row, dueStep, externalBudget);
     } catch (err) {
       console.error(`[verification relances] erreur sur le dossier ${row.thread_id}:`, err);
       recordPipelineError("relance_check", row.thread_id, (err as Error).message);
@@ -73,7 +92,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
     const dueStep = nextStep && fireAt !== null && now >= fireAt ? nextStep : undefined;
 
     try {
-      await checkPostReplyThread(connector, row, dueStep);
+      await checkPostReplyThread(connector, row, dueStep, externalBudget);
     } catch (err) {
       console.error(`[verification relances post-reponse] erreur sur le dossier ${row.thread_id}:`, err);
       recordPipelineError("relance_check", row.thread_id, (err as Error).message);
@@ -85,7 +104,8 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
 export async function checkPreReplyThread(
   connector: EmailConnector,
   row: ThreadRow,
-  step: RelanceStep | undefined
+  step: RelanceStep | undefined,
+  externalBudget: ExternalSendBudget = { remaining: 1 }
 ): Promise<void> {
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(row.thread_id));
 
@@ -121,6 +141,12 @@ export async function checkPreReplyThread(
         "Relance externe annulee: aucun message entrant trouve dans le fil recupere depuis la messagerie."
       );
       return;
+    }
+    if (!tryConsumeExternalBudget(externalBudget)) {
+      console.log(
+        `[relance externe] "${row.subject}" — differee (limite de ${config.maxExternalRelancesPerCycle} relances externes/cycle atteinte), retentera au prochain cycle.`
+      );
+      return; // relance_count intact: reessaie identiquement au prochain cycle
     }
     // lastInbound sert d'ancrage de CONTENU (la demande initiale du client),
     // mais l'en-tete RFC In-Reply-To doit pointer vers le tout dernier
@@ -170,7 +196,8 @@ export async function checkPreReplyThread(
 export async function checkPostReplyThread(
   connector: EmailConnector,
   row: ThreadRow,
-  step: RelanceStep | undefined
+  step: RelanceStep | undefined,
+  externalBudget: ExternalSendBudget = { remaining: 1 }
 ): Promise<void> {
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(row.thread_id));
 
@@ -200,6 +227,12 @@ export async function checkPostReplyThread(
         "Relance post-reponse annulee: aucun message sortant trouve dans le fil recupere depuis la messagerie."
       );
       return;
+    }
+    if (!tryConsumeExternalBudget(externalBudget)) {
+      console.log(
+        `[relance post-reponse] "${row.subject}" — differee (limite de ${config.maxExternalRelancesPerCycle} relances externes/cycle atteinte), retentera au prochain cycle.`
+      );
+      return; // post_reply_relance_count intact: reessaie identiquement au prochain cycle
     }
 
     const category = getCategory(row.category_id);
