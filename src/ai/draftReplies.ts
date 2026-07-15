@@ -16,7 +16,26 @@ const replyDraftSchema = z.object({
 // Exactement 3: un tableau tronque ou mal forme (max_tokens atteint en cours
 // de generation, par ex.) doit echouer la validation plutot que produire
 // moins de brouillons que promis, ou un brouillon au contenu incomplet.
-const repliesSchema = z.object({ drafts: z.array(replyDraftSchema).length(3) });
+//
+// Claude retourne parfois "drafts" comme une chaine JSON serialisee plutot
+// que comme un tableau natif dans tool_use.input — quirk connu de l'API sur
+// des schemas avec un tableau d'objets imbriques. Observe en production:
+// echec systematique sur les deux tentatives de withRetry (donc pas un
+// hasard ponctuel), qui privait le dossier de ses 3 brouillons alors que
+// Claude avait bien produit un contenu exploitable, juste mal encode. On
+// tente donc un JSON.parse() avant validation si la valeur recue est une
+// chaine; si ce n'est pas du JSON valide, la validation echoue normalement
+// et withRetry reste le filet de securite.
+export const repliesSchema = z.object({
+  drafts: z.preprocess((value) => {
+    if (typeof value !== "string") return value;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }, z.array(replyDraftSchema).length(3)),
+});
 
 export async function draftThreeReplies(
   thread: EmailThread,
