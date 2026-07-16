@@ -1,3 +1,4 @@
+import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
@@ -96,6 +97,13 @@ export async function sendAcknowledgementAndDrafts(
   // alors impossible a relier au dossier d'origine.
   recordReminder(incoming.threadId, "external", `Accusé de réception envoyé à ${incoming.from.email}.`);
   console.log(`[accuse envoye] ${incoming.from.email} — "${incoming.subject}"`);
+
+  if (!config.draftRepliesEnabled) {
+    // En pause: ni appel Claude ni depot de brouillon — le dossier reste au
+    // statut "ack_sent", deja eligible aux relances/rappels normalement.
+    console.log(`[brouillons en pause] aucun brouillon genere pour ${incoming.from.email}.`);
+    return;
+  }
 
   const replies = await draftThreeReplies(thread, incoming, category);
   for (const reply of replies) {

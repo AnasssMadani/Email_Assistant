@@ -37,6 +37,11 @@ export const config = {
   // (quelques minutes, meme jour) fiables — reste ajustable via l'env si
   // besoin d'un intervalle different.
   relanceCheckCron: process.env.RELANCE_CHECK_CRON ?? "*/2 * * * *",
+  // En pause par defaut (a la demande): l'accuse, les relances et les
+  // notifications continuent de fonctionner normalement, seuls les 3
+  // brouillons de reponse ne sont plus generes ni deposes. Remettre a
+  // "true" pour les reactiver, sans autre changement de code.
+  draftRepliesEnabled: process.env.ENABLE_DRAFT_REPLIES === "true",
   dbPath: process.env.DB_PATH ?? "./data/app.db",
   categoriesConfigPath: process.env.CATEGORIES_CONFIG_PATH ?? "./config/categories.json",
   brandVoicePath: process.env.BRAND_VOICE_PATH ?? "./config/brand-voice.md",
