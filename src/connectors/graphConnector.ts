@@ -24,6 +24,7 @@ interface GraphMessage {
   bodyPreview?: string;
   internetMessageId?: string;
   hasAttachments?: boolean;
+  isDraft?: boolean;
 }
 
 async function graphFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -51,7 +52,7 @@ function escapeODataString(value: string): string {
 }
 
 const MESSAGE_SELECT =
-  "id,conversationId,subject,from,toRecipients,receivedDateTime,body,internetMessageId,hasAttachments";
+  "id,conversationId,subject,from,toRecipients,receivedDateTime,body,internetMessageId,hasAttachments,isDraft";
 
 /**
  * Connecteur Microsoft Graph (Outlook / Microsoft 365).
@@ -127,7 +128,16 @@ export class GraphConnector implements EmailConnector {
     const data = await graphFetch<{ value: GraphMessage[] }>(
       `/me/messages?$filter=${filter}&$select=${MESSAGE_SELECT}`
     );
+    // /me/messages interroge tout le mailbox, brouillons compris — les 3
+    // propositions de reponse deposees comme brouillons partagent le meme
+    // conversationId et remontent donc ici. Un brouillon est cree "depuis"
+    // notre compte (isFromUs=true) mais n'a jamais ete envoye: le laisser
+    // dans messages faisait gonfler le nombre de messages isFromUs au-dela
+    // du compteur d'envois reels (automated_outbound_count), ce qui faisait
+    // detecter a tort une "reponse humaine" des que les brouillons etaient
+    // deposes. Meme correctif que GmailConnector.getThread().
     const messages = data.value
+      .filter((m) => !m.isDraft)
       .map((m) => this.toEmailMessage(m, ownEmail))
       .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
     return { id: threadId, messages };
@@ -135,14 +145,19 @@ export class GraphConnector implements EmailConnector {
 
   private async findLatestMessageId(conversationId: string): Promise<string> {
     // Meme contournement que getThread(): pas de $orderby combine au
-    // $filter, on determine le plus recent cote client.
+    // $filter, on determine le plus recent cote client. isDraft exclu pour
+    // la meme raison qu'a la lecture du fil: un brouillon (nos 3
+    // propositions de reponse) ne doit jamais servir d'ancrage "dernier
+    // message" pour une reponse — ce n'est pas un echange reel.
     const filter = encodeURIComponent(`conversationId eq '${escapeODataString(conversationId)}'`);
-    const data = await graphFetch<{ value: { id: string; receivedDateTime: string }[] }>(
-      `/me/messages?$filter=${filter}&$select=id,receivedDateTime`
+    const data = await graphFetch<{ value: { id: string; receivedDateTime: string; isDraft?: boolean }[] }>(
+      `/me/messages?$filter=${filter}&$select=id,receivedDateTime,isDraft`
     );
-    const latest = data.value.reduce<{ id: string; receivedDateTime: string } | undefined>((acc, m) =>
-      !acc || new Date(m.receivedDateTime).getTime() > new Date(acc.receivedDateTime).getTime() ? m : acc
-    , undefined);
+    const latest = data.value
+      .filter((m) => !m.isDraft)
+      .reduce<{ id: string; receivedDateTime: string } | undefined>((acc, m) =>
+        !acc || new Date(m.receivedDateTime).getTime() > new Date(acc.receivedDateTime).getTime() ? m : acc
+      , undefined);
     if (!latest) {
       throw new Error(`Aucun message trouve pour la conversation ${conversationId}.`);
     }

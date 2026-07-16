@@ -97,6 +97,14 @@ export class GmailConnector implements EmailConnector {
     const ownEmail = await this.getOwnEmailAddress();
     const thread = await gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
     const messages = (thread.data.messages ?? [])
+      // threads.get() renvoie AUSSI les brouillons associes au fil (label
+      // DRAFT) — nos 3 propositions de reponse en sont justement un exemple.
+      // Un brouillon est compose "depuis" notre compte (isFromUs=true) mais
+      // n'a jamais ete envoye: le laisser dans messages faisait gonfler le
+      // nombre de messages isFromUs au-dela du compteur d'envois reels
+      // (automated_outbound_count), ce qui faisait detecter a tort une
+      // "reponse humaine" des que les 3 brouillons etaient deposes.
+      .filter((m) => !m.labelIds?.includes("DRAFT"))
       .map((m) => this.toEmailMessage(m, ownEmail))
       .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
     return { id: threadId, messages };
