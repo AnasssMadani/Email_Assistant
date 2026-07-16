@@ -84,7 +84,12 @@ export function buildRawMimeMessage(params: {
     `Subject: ${encodeSubject(params.subject)}`,
     "MIME-Version: 1.0",
     "Content-Type: text/plain; charset=UTF-8",
-    "Content-Transfer-Encoding: 7bit",
+    // "7bit" veut dire "pas d'octet au-dela de 127" — mais le corps est du
+    // texte francais en UTF-8 (accents = octets multi-bytes), donc l'en-tete
+    // mentait sur l'encodage reel. La plupart des serveurs tolerent cet
+    // ecart, mais ce n'est pas garanti (et rend fragile toute comparaison
+    // exacte du corps entre l'envoi et sa relecture ulterieure).
+    "Content-Transfer-Encoding: 8bit",
   ];
 
   if (params.inReplyToMessageId) {

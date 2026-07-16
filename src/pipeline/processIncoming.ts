@@ -7,6 +7,7 @@ import { tagSource } from "./errorTag.js";
 import {
   isMessageProcessed,
   markBodySentByAutomation,
+  markMessageIdSentByAutomation,
   markMessageProcessed,
   upsertThreadReceived,
   setThreadAckSent,
@@ -76,7 +77,7 @@ export async function sendAcknowledgementAndDrafts(
   const replySubject = buildReplySubject(incoming.subject);
 
   const ack = await draftAcknowledgement(thread, incoming, category);
-  await tagSource("Messagerie — envoi de l'accusé", () =>
+  const sentAck = await tagSource("Messagerie — envoi de l'accusé", () =>
     connector.sendReply({
       threadId: incoming.threadId,
       to: incoming.from.email,
@@ -86,9 +87,11 @@ export async function sendAcknowledgementAndDrafts(
     })
   );
   setThreadAckSent(incoming.threadId);
-  // Empreinte du corps envoye: permet a checkPreReplyThread de reconnaitre
-  // plus tard ce message comme "notre propre accuse", pas une reponse
-  // humaine, quand il le retrouve dans le fil relu depuis la messagerie.
+  // Empreinte du message envoye (id + corps, en repli): permet a
+  // checkPreReplyThread de reconnaitre plus tard ce message comme "notre
+  // propre accuse", pas une reponse humaine, quand il le retrouve dans le
+  // fil relu depuis la messagerie.
+  markMessageIdSentByAutomation(incoming.threadId, sentAck.id);
   markBodySentByAutomation(incoming.threadId, ack.body);
   // Journalise le destinataire reel de l'accuse — sans ca, un envoi vers une
   // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est

@@ -8,6 +8,7 @@ import {
   incrementPostReplyRelance,
   incrementRelance,
   markBodySentByAutomation,
+  markMessageIdSentByAutomation,
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
@@ -142,6 +143,49 @@ test("checkPreReplyThread does not mistake its own already-sent relance for a hu
 
   const row = getThreadRow(threadId);
   // Ne doit PAS avoir bascule en post-reponse: aucune reponse humaine reelle.
+  assert.notEqual(row?.status, "awaiting_client_reply");
+  assert.equal(row?.human_replied_at, null);
+});
+
+test("checkPreReplyThread recognizes its own send by message id even when the re-fetched body text differs", async () => {
+  // The body-hash check is a fallback for connectors (Graph) that don't
+  // preserve message ids across send/refetch — but on Gmail specifically,
+  // the id IS reliable, and must be enough on its own even if the body text
+  // ends up slightly different after the MIME round-trip (line-ending
+  // normalization, encoding quirks, etc.), which is exactly the gap that
+  // let an acknowledgement slip through as "a human reply" in production.
+  const threadId = "t-self-ack-detected-by-id-only";
+  const sentAckId = "gmail-ack-message-id-123";
+
+  upsertThreadReceived({
+    threadId,
+    subject: "Devis",
+    senderEmail: "client@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1,
+    status: "ack_sent",
+    dueAt: new Date(Date.now() - 60_000).toISOString(),
+  });
+  setThreadAckSent(threadId);
+  markMessageIdSentByAutomation(threadId, sentAckId);
+
+  const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
+  const ackRefetchedWithDifferentWhitespace = fakeMessage({
+    id: sentAckId,
+    threadId,
+    isFromUs: true,
+    receivedAt: new Date(),
+    // Deliberately NOT identical to whatever was hashed at send time —
+    // proves the id match alone is sufficient, independent of the body.
+    bodyText: "Bonjour,\r\n\r\nNous avons bien reçu votre message.\r\n\r\n",
+  });
+  const connector = fakeConnector({ id: threadId, messages: [clientMessage, ackRefetchedWithDifferentWhitespace] });
+
+  await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+
+  const row = getThreadRow(threadId);
   assert.notEqual(row?.status, "awaiting_client_reply");
   assert.equal(row?.human_replied_at, null);
 });

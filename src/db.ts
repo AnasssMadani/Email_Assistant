@@ -141,6 +141,17 @@ db.exec(`
     created_at TEXT NOT NULL,
     PRIMARY KEY (thread_id, body_hash)
   );
+
+  -- Signal principal (plus fiable que le hash du corps sur Gmail, ou l'id
+  -- d'un message envoye reste stable entre l'envoi et sa relecture — Graph
+  -- reassigne un nouvel id au moment de l'envoi d'un brouillon, donc pour ce
+  -- connecteur automated_sent_bodies reste necessaire en repli).
+  CREATE TABLE IF NOT EXISTS automated_sent_message_ids (
+    thread_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (thread_id, message_id)
+  );
 `);
 
 ensureDelayMinutesColumn();
@@ -966,6 +977,28 @@ export function wasBodySentByAutomation(threadId: string, bodyText: string): boo
   const row = db
     .prepare("SELECT 1 FROM automated_sent_bodies WHERE thread_id = ? AND body_hash = ?")
     .get(threadId, hashBody(bodyText));
+  return row !== undefined;
+}
+
+/**
+ * Signal principal: l'id du message tel que retourne par sendReply() au
+ * moment de l'envoi. Fiable sur Gmail (l'id reste le meme entre l'envoi et
+ * la relecture du fil) — moins garanti sur Graph, ou l'id retourne est
+ * celui du brouillon avant envoi et peut differer de l'id final, d'ou le
+ * hash de corps garde en repli.
+ */
+export function markMessageIdSentByAutomation(threadId: string, messageId: string): void {
+  if (!messageId) return;
+  db.prepare(
+    "INSERT OR IGNORE INTO automated_sent_message_ids (thread_id, message_id, created_at) VALUES (?, ?, ?)"
+  ).run(threadId, messageId, new Date().toISOString());
+}
+
+export function wasMessageIdSentByAutomation(threadId: string, messageId: string): boolean {
+  if (!messageId) return false;
+  const row = db
+    .prepare("SELECT 1 FROM automated_sent_message_ids WHERE thread_id = ? AND message_id = ?")
+    .get(threadId, messageId);
   return row !== undefined;
 }
 
