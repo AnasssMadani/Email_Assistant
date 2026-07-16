@@ -49,6 +49,14 @@ export interface EmailConnector {
   deleteDraft(draftId: string): Promise<void>;
   /** Email autonome, hors fil client (pas de threadId) — utilise pour les notifications internes (rappels). */
   sendNotification(params: NotificationParams): Promise<{ id: string }>;
+  /**
+   * Remet un message a l'etat "non lu". Gmail et Graph marquent
+   * automatiquement tout le fil comme lu des qu'on y envoie une reponse
+   * (l'accuse automatique dans ce cas) — sans ce correctif, l'email du
+   * client disparait visuellement de la liste des nouveaux messages non lus
+   * de l'equipe alors que personne chez nous ne l'a reellement encore lu.
+   */
+  markMessageUnread(messageId: string): Promise<void>;
 }
 
 /**

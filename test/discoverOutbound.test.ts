@@ -44,6 +44,7 @@ function fakeConnector(sentMessages: EmailMessage[]): EmailConnector {
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
+    async markMessageUnread() {},
   };
 }
 

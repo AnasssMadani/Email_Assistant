@@ -91,6 +91,16 @@ export async function sendAcknowledgementAndDrafts(
   // reconnaitre plus tard que ce message (retrouve dans le fil relu depuis
   // la messagerie) est notre propre accuse, pas une reponse humaine.
   incrementAutomatedOutboundCount(incoming.threadId);
+  // Gmail/Graph marquent automatiquement tout le fil comme lu des qu'on y
+  // envoie une reponse (l'accuse ci-dessus) — sans ce correctif, le message
+  // du client disparait de la liste des non-lus alors que l'equipe ne l'a
+  // pas encore vu. Non bloquant: un echec ici ne doit pas faire echouer
+  // l'accuse deja envoye.
+  try {
+    await connector.markMessageUnread(incoming.id);
+  } catch (err) {
+    console.error(`[non-lu] echec du marquage non-lu pour ${incoming.id}:`, err);
+  }
   // Journalise le destinataire reel de l'accuse — sans ca, un envoi vers une
   // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est
   // visible nulle part avant qu'un rebond n'arrive dans la boite, et devient

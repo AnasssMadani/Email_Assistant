@@ -202,6 +202,13 @@ export class GraphConnector implements EmailConnector {
     }
   }
 
+  async markMessageUnread(messageId: string): Promise<void> {
+    await graphFetch(`/me/messages/${messageId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ isRead: false }),
+    });
+  }
+
   async sendNotification(params: NotificationParams): Promise<{ id: string }> {
     // Pas de conversationId: notification autonome, pas une reponse dans le
     // fil du client. sendMail repond 202 Accepted sans corps (id inconnu).

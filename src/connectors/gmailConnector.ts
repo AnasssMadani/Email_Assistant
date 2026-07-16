@@ -157,6 +157,15 @@ export class GmailConnector implements EmailConnector {
     }
   }
 
+  async markMessageUnread(messageId: string): Promise<void> {
+    const gmail = await this.getGmail();
+    await gmail.users.messages.modify({
+      userId: "me",
+      id: messageId,
+      requestBody: { addLabelIds: ["UNREAD"] },
+    });
+  }
+
   async sendNotification(params: NotificationParams): Promise<{ id: string }> {
     const gmail = await this.getGmail();
     const ownEmail = await this.getOwnEmailAddress();
