@@ -45,7 +45,10 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
   let sendReplyCalls = 0;
 
   for (let i = 0; i < dossierCount; i++) {
-    const threadId = `t-burst-${i}`;
+    // Doit ressembler a un vrai id de fil Gmail (hex) pour passer le garde-fou
+    // threadIdMatchesConnector() de relanceCheck.ts — le connecteur factice
+    // ci-dessous declare name: "gmail".
+    const threadId = `19f${i.toString(16).padStart(13, "0")}`;
     threadIds.push(threadId);
     const dueAt = new Date(Date.now() - 60_000).toISOString();
 
@@ -117,4 +120,62 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
 
   const untouchedCount = threadIds.filter((id) => getThreadRow(id)?.relance_count === 0).length;
   assert.equal(untouchedCount, dossierCount);
+});
+
+test("runRelanceCheck skips a dossier whose thread id doesn't match the currently active connector", async () => {
+  // Regression: switching the connected mailbox's provider (e.g. Gmail ->
+  // Outlook) leaves old dossiers in the DB with the previous provider's
+  // thread id shape. Observed live: Graph rejected a 16-char hex Gmail
+  // thread id with "ErrorInvalidIdMalformed", repeating on every single
+  // relance-check cycle forever since nothing skipped the mismatched row.
+  const threadId = "19faaaaaaaaaaaaa"; // Gmail-shaped (16 hex chars)
+
+  upsertThreadReceived({
+    threadId,
+    subject: "Ancien dossier Gmail",
+    senderEmail: "client@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1,
+    status: "ack_sent",
+    dueAt: new Date(Date.now() - 60_000).toISOString(),
+  });
+  setThreadAckSent(threadId);
+  addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
+
+  let getThreadCalls = 0;
+  const graphConnector: EmailConnector = {
+    name: "graph",
+    async getOwnEmailAddress() {
+      return "us@example.com";
+    },
+    async listRecentInboxMessages() {
+      return [];
+    },
+    async listRecentSentMessages() {
+      return [];
+    },
+    async getThread() {
+      getThreadCalls++;
+      throw new Error("Microsoft Graph ... -> 400: ErrorInvalidIdMalformed");
+    },
+    async sendReply(_params: SendReplyParams) {
+      return { id: "sent-1" };
+    },
+    async createDraftReply(_params: SendReplyParams) {
+      return { id: "draft-1" };
+    },
+    async deleteDraft() {},
+    async sendNotification(_params: NotificationParams) {
+      return { id: "notif-1" };
+    },
+  };
+
+  await runRelanceCheck(graphConnector);
+
+  assert.equal(getThreadCalls, 0);
+  const errorsForThread = listPipelineErrors(100).filter((e) => e.thread_id === threadId);
+  assert.equal(errorsForThread.length, 0);
+  assert.equal(getThreadRow(threadId)?.relance_count, 0);
 });

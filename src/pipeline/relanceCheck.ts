@@ -36,6 +36,28 @@ function tryConsumeExternalBudget(budget: ExternalSendBudget): boolean {
 }
 
 /**
+ * Detection heuristique du fournisseur d'origine d'un thread_id, pour
+ * eviter d'appeler l'API Graph avec un id de fil Gmail (ou l'inverse) — les
+ * deux formats n'ont rien a voir, et l'appel echoue systematiquement avec
+ * une erreur peu parlante ("Id is malformed" cote Graph). Se produit quand
+ * la boite connectee change de fournisseur apres coup: les dossiers suivis
+ * sous l'ancien fournisseur restent en base, jamais nettoyes
+ * automatiquement, et sans ce garde-fou seraient re-tentes (et
+ * re-echoueraient) a chaque cycle indefiniment. Id Gmail: chaine hex
+ * courte (ex: "19f674320b53b27a"). Id Graph (conversationId): bien plus
+ * long, encode en base64url, jamais purement hexadecimal sur cette
+ * longueur.
+ */
+function looksLikeGmailThreadId(id: string): boolean {
+  return /^[0-9a-f]{10,20}$/i.test(id);
+}
+
+function threadIdMatchesConnector(threadId: string, connectorName: "gmail" | "graph"): boolean {
+  const gmailShaped = looksLikeGmailThreadId(threadId);
+  return connectorName === "gmail" ? gmailShaped : !gmailShaped;
+}
+
+/**
  * Deux boucles independantes, une par phase du cycle de vie d'un dossier:
  *
  * 1. "pre_reply" — personne chez nous n'a encore repondu de fond au client.
@@ -70,6 +92,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
   // de reponse, elle, tourne a chaque cycle quoi qu'il arrive.
   for (const row of listThreadsAwaitingReply()) {
     if (!row.due_at) continue;
+    if (!threadIdMatchesConnector(row.thread_id, connector.name)) continue;
 
     const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "pre_reply");
     const nextStep = steps[row.relance_count];
@@ -86,6 +109,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
 
   for (const row of listThreadsAwaitingClientReply()) {
     if (!row.human_replied_at) continue;
+    if (!threadIdMatchesConnector(row.thread_id, connector.name)) continue;
 
     const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "post_reply");
     const nextStep = steps[row.post_reply_relance_count];
