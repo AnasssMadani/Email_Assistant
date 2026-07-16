@@ -207,7 +207,15 @@ export async function checkPreReplyThread(
     return;
   }
 
-  const note = `Dossier "${row.subject}" en attente depuis plus de ${step.delayMinutes} min apres l'echeance — aucune reponse envoyee.`;
+  // step.delayMinutes est le delai CONFIGURE de cette etape (ex: 0 min, ou
+  // 1440 min pour une etape de secours a 24h) — pas le temps reellement
+  // ecoule. Affiche a tort "0 min" ou "1440 min" quel que soit le vrai
+  // retard. Le vrai retard se calcule depuis due_at (l'echeance SLA), seule
+  // reference temporelle pertinente ici.
+  const elapsedMinutes = row.due_at
+    ? Math.max(0, Math.round((Date.now() - new Date(row.due_at).getTime()) / 60_000))
+    : step.delayMinutes;
+  const note = `Dossier "${row.subject}" en attente depuis plus de ${elapsedMinutes} min apres l'echeance — aucune reponse envoyee.`;
   const category = getCategory(row.category_id);
   const shouldAlertTeam =
     category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
@@ -297,7 +305,13 @@ export async function checkPostReplyThread(
     return;
   }
 
-  const note = `Dossier "${row.subject}": client silencieux depuis plus de ${step.delayMinutes} min apres notre reponse.`;
+  // Meme correctif que checkPreReplyThread: le vrai retard se calcule depuis
+  // human_replied_at (notre reponse), pas depuis le delai configure de
+  // l'etape.
+  const elapsedMinutesSinceReply = row.human_replied_at
+    ? Math.max(0, Math.round((Date.now() - new Date(row.human_replied_at).getTime()) / 60_000))
+    : step.delayMinutes;
+  const note = `Dossier "${row.subject}": client silencieux depuis plus de ${elapsedMinutesSinceReply} min apres notre reponse.`;
   const category = getCategory(row.category_id);
   const shouldAlertTeam =
     category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
