@@ -118,22 +118,35 @@ export class GraphConnector implements EmailConnector {
   async getThread(threadId: string): Promise<EmailThread> {
     const ownEmail = await this.getOwnEmailAddress();
     const filter = encodeURIComponent(`conversationId eq '${escapeODataString(threadId)}'`);
+    // Pas de $orderby ici: combine a $filter sur conversationId, Graph le
+    // rejette souvent avec "InefficientFilter — The restriction or sort
+    // order is too complex for this operation" (observe en production sur
+    // une boite Outlook.com personnelle — moins tolerant que Exchange
+    // Online pour ce type de requete combinee). On trie cote client a la
+    // place, sur les memes donnees.
     const data = await graphFetch<{ value: GraphMessage[] }>(
-      `/me/messages?$filter=${filter}&$orderby=receivedDateTime asc&$select=${MESSAGE_SELECT}`
+      `/me/messages?$filter=${filter}&$select=${MESSAGE_SELECT}`
     );
-    return { id: threadId, messages: data.value.map((m) => this.toEmailMessage(m, ownEmail)) };
+    const messages = data.value
+      .map((m) => this.toEmailMessage(m, ownEmail))
+      .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
+    return { id: threadId, messages };
   }
 
   private async findLatestMessageId(conversationId: string): Promise<string> {
+    // Meme contournement que getThread(): pas de $orderby combine au
+    // $filter, on determine le plus recent cote client.
     const filter = encodeURIComponent(`conversationId eq '${escapeODataString(conversationId)}'`);
-    const data = await graphFetch<{ value: { id: string }[] }>(
-      `/me/messages?$filter=${filter}&$orderby=receivedDateTime desc&$top=1&$select=id`
+    const data = await graphFetch<{ value: { id: string; receivedDateTime: string }[] }>(
+      `/me/messages?$filter=${filter}&$select=id,receivedDateTime`
     );
-    const id = data.value[0]?.id;
-    if (!id) {
+    const latest = data.value.reduce<{ id: string; receivedDateTime: string } | undefined>((acc, m) =>
+      !acc || new Date(m.receivedDateTime).getTime() > new Date(acc.receivedDateTime).getTime() ? m : acc
+    , undefined);
+    if (!latest) {
       throw new Error(`Aucun message trouve pour la conversation ${conversationId}.`);
     }
-    return id;
+    return latest.id;
   }
 
   private async buildReplyDraft(params: SendReplyParams): Promise<string> {
