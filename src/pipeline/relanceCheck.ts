@@ -6,19 +6,16 @@ import { tagSource } from "./errorTag.js";
 import { buildReplySubject, urgencyMeetsThreshold } from "../utils.js";
 import {
   getEffectiveRelanceSteps,
+  incrementAutomatedOutboundCount,
   incrementPostReplyRelance,
   incrementRelance,
   listThreadsAwaitingClientReply,
   listThreadsAwaitingReply,
-  markBodySentByAutomation,
-  markMessageIdSentByAutomation,
   markMessageProcessed,
   recordPipelineError,
   recordReminder,
   setThreadHumanReplied,
   setThreadStatus,
-  wasBodySentByAutomation,
-  wasMessageIdSentByAutomation,
   type ThreadRow,
 } from "../db.js";
 import type { EmailConnector, RelanceStep } from "../types.js";
@@ -115,22 +112,17 @@ export async function checkPreReplyThread(
 
   // isFromUs seul ne suffit pas: notre propre accuse ET nos propres
   // relances automatiques sont AUSSI des messages isFromUs dans ce meme
-  // fil. Sans exclure ce qu'on sait avoir envoye nous-memes, la relance
-  // pre-reponse (ou meme l'accuse) se detectait elle-meme comme "la reponse
-  // humaine" au cycle suivant — le dossier basculait en post-reponse et
-  // declenchait une deuxieme relance client pour une reponse qui n'a jamais
-  // existe. L'id du message (fiable sur Gmail) est le signal principal; le
-  // hash de corps normalise reste un repli pour Graph, ou l'id d'un
-  // brouillon envoye ne correspond pas toujours a l'id final du message.
+  // fil. Matcher un id ou un hash de corps precis s'est revele fragile en
+  // production (Gmail/Graph peuvent alterer legerement le texte au
+  // round-trip) — on compare a la place le NOMBRE de messages isFromUs
+  // reellement presents au nombre qu'on sait avoir envoye nous-memes
+  // (automated_outbound_count): au-dela, l'exces est forcement humain, quel
+  // que soit son contenu exact. Le dernier message isFromUs du fil (trie
+  // chronologiquement) est alors ce message humain.
+  const ourMessages = thread.messages.filter((m) => m.isFromUs);
   const replyAfterAck =
-    row.ack_sent_at !== null
-      ? thread.messages.find(
-          (m) =>
-            m.isFromUs &&
-            m.receivedAt.getTime() > new Date(row.ack_sent_at as string).getTime() &&
-            !wasMessageIdSentByAutomation(row.thread_id, m.id) &&
-            !wasBodySentByAutomation(row.thread_id, m.bodyText)
-        )
+    row.ack_sent_at !== null && ourMessages.length > row.automated_outbound_count
+      ? ourMessages[ourMessages.length - 1]
       : undefined;
 
   if (replyAfterAck) {
@@ -175,7 +167,7 @@ export async function checkPreReplyThread(
 
     const category = getCategory(row.category_id);
     const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
-    const sentRelance = await tagSource("Messagerie — envoi de la relance", () =>
+    await tagSource("Messagerie — envoi de la relance", () =>
       connector.sendReply({
         threadId: row.thread_id,
         to: row.sender_email,
@@ -185,8 +177,7 @@ export async function checkPreReplyThread(
       })
     );
     incrementRelance(row.thread_id, "relance_sent");
-    markMessageIdSentByAutomation(row.thread_id, sentRelance.id);
-    markBodySentByAutomation(row.thread_id, relance.body);
+    incrementAutomatedOutboundCount(row.thread_id);
     recordReminder(row.thread_id, "external", `Relance envoyee automatiquement a ${row.sender_email}.`);
     console.log(`[relance externe] ${row.sender_email} — "${row.subject}"`);
     return;
@@ -262,7 +253,7 @@ export async function checkPostReplyThread(
       "post_reply",
       row.outbound_had_attachment === 1
     );
-    const sentRelance = await tagSource("Messagerie — envoi de la relance", () =>
+    await tagSource("Messagerie — envoi de la relance", () =>
       connector.sendReply({
         threadId: row.thread_id,
         to: row.sender_email,
@@ -272,8 +263,7 @@ export async function checkPostReplyThread(
       })
     );
     incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
-    markMessageIdSentByAutomation(row.thread_id, sentRelance.id);
-    markBodySentByAutomation(row.thread_id, relance.body);
+    incrementAutomatedOutboundCount(row.thread_id);
     recordReminder(
       row.thread_id,
       "external",

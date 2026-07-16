@@ -5,10 +5,9 @@ import { checkPreReplyThread, checkPostReplyThread } from "../src/pipeline/relan
 import {
   addThreadRelanceStep,
   getThreadRow,
+  incrementAutomatedOutboundCount,
   incrementPostReplyRelance,
   incrementRelance,
-  markBodySentByAutomation,
-  markMessageIdSentByAutomation,
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
@@ -100,16 +99,20 @@ test("checkPreReplyThread still detects a human reply after the pre-reply sequen
   assert.ok(row?.human_replied_at);
 });
 
-test("checkPreReplyThread does not mistake its own already-sent relance for a human reply", async () => {
-  // Regression: observed live — a pre-reply relance was sent, then on the
-  // very next check cycle the system found that SAME relance in the
-  // refetched thread (isFromUs, timestamped after ack_sent_at) and treated
-  // it as "a human answered the client", flipping the dossier into
-  // post-reply and firing a second, unwarranted relance about a reply that
-  // never happened.
-  const threadId = "t-self-relance-not-a-reply";
-  const ackSentAt = new Date(Date.now() - 5 * 60_000).toISOString();
-  const relanceBody = "Nous vous informons que votre dossier est toujours en cours de traitement.";
+test("checkPreReplyThread does not mistake its own already-sent ack/relance for a human reply, regardless of exact text", async () => {
+  // Regression: two prior approaches (exact body hash, then message id)
+  // both still failed live — Gmail/Graph can alter the text or id of a
+  // sent message between send and re-fetch (line endings, encoding,
+  // Graph's draft-vs-sent id mismatch), so either signal could silently
+  // miss a match and let our own ack/relance be treated as "the human
+  // replied", prematurely flipping the dossier into post-reply and firing
+  // an unwarranted second relance about a reply that never happened.
+  // Counting sidesteps this entirely: it never inspects content or id at
+  // all, so no round-trip alteration can break it. Two automated sends
+  // (ack + one relance) are simulated here, with a re-fetched thread whose
+  // isFromUs message text/ids don't match anything we "remember" sending —
+  // on the old approaches this would have false-positived.
+  const threadId = "t-self-sends-not-a-reply";
 
   upsertThreadReceived({
     threadId,
@@ -123,39 +126,42 @@ test("checkPreReplyThread does not mistake its own already-sent relance for a hu
     dueAt: new Date(Date.now() - 4 * 60_000).toISOString(),
   });
   setThreadAckSent(threadId);
-  // Simule ce que checkPreReplyThread fait lui-meme apres avoir envoye la
-  // relance: marquer son propre corps comme automatique pour ce dossier.
-  markBodySentByAutomation(threadId, relanceBody);
+  incrementAutomatedOutboundCount(threadId); // the ack
   addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
   incrementRelance(threadId, "relance_sent");
+  incrementAutomatedOutboundCount(threadId); // the pre-reply relance
 
   const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
-  const ourOwnRelanceRefetched = fakeMessage({
-    id: "m-relance",
+  const ourAckRefetched = fakeMessage({
+    id: "ack-id-as-seen-on-refetch",
+    threadId,
+    isFromUs: true,
+    receivedAt: new Date(Date.now() - 90_000),
+    bodyText: "Bonjour,\r\n\r\nNous avons bien reçu votre message.\r\n\r\n",
+  });
+  const ourRelanceRefetched = fakeMessage({
+    id: "relance-id-as-seen-on-refetch",
     threadId,
     isFromUs: true,
     receivedAt: new Date(Date.now() - 60_000),
-    bodyText: relanceBody,
+    bodyText: "Votre dossier est toujours en cours de traitement.",
   });
-  const connector = fakeConnector({ id: threadId, messages: [clientMessage, ourOwnRelanceRefetched] });
+  const connector = fakeConnector({
+    id: threadId,
+    messages: [clientMessage, ourAckRefetched, ourRelanceRefetched],
+  });
 
   await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
 
   const row = getThreadRow(threadId);
-  // Ne doit PAS avoir bascule en post-reponse: aucune reponse humaine reelle.
+  // Ne doit PAS avoir bascule en post-reponse: aucune reponse humaine reelle,
+  // seulement 2 messages isFromUs, exactement le nombre qu'on sait avoir envoye.
   assert.notEqual(row?.status, "awaiting_client_reply");
   assert.equal(row?.human_replied_at, null);
 });
 
-test("checkPreReplyThread recognizes its own send by message id even when the re-fetched body text differs", async () => {
-  // The body-hash check is a fallback for connectors (Graph) that don't
-  // preserve message ids across send/refetch — but on Gmail specifically,
-  // the id IS reliable, and must be enough on its own even if the body text
-  // ends up slightly different after the MIME round-trip (line-ending
-  // normalization, encoding quirks, etc.), which is exactly the gap that
-  // let an acknowledgement slip through as "a human reply" in production.
-  const threadId = "t-self-ack-detected-by-id-only";
-  const sentAckId = "gmail-ack-message-id-123";
+test("checkPreReplyThread detects a genuine human reply even after several automated sends", async () => {
+  const threadId = "t-real-reply-after-automated-sends";
 
   upsertThreadReceived({
     threadId,
@@ -166,28 +172,31 @@ test("checkPreReplyThread recognizes its own send by message id even when the re
     urgency: "normal",
     slaMinutes: 1,
     status: "ack_sent",
-    dueAt: new Date(Date.now() - 60_000).toISOString(),
+    dueAt: new Date(Date.now() - 4 * 60_000).toISOString(),
   });
   setThreadAckSent(threadId);
-  markMessageIdSentByAutomation(threadId, sentAckId);
+  incrementAutomatedOutboundCount(threadId); // the ack
+  addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
+  incrementRelance(threadId, "relance_sent");
+  incrementAutomatedOutboundCount(threadId); // the pre-reply relance
 
   const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
-  const ackRefetchedWithDifferentWhitespace = fakeMessage({
-    id: sentAckId,
+  const ourAck = fakeMessage({ id: "m-ack", threadId, isFromUs: true, receivedAt: new Date(Date.now() - 120_000) });
+  const ourRelance = fakeMessage({ id: "m-relance", threadId, isFromUs: true, receivedAt: new Date(Date.now() - 60_000) });
+  const humanReply = fakeMessage({
+    id: "m-human",
     threadId,
     isFromUs: true,
     receivedAt: new Date(),
-    // Deliberately NOT identical to whatever was hashed at send time —
-    // proves the id match alone is sufficient, independent of the body.
-    bodyText: "Bonjour,\r\n\r\nNous avons bien reçu votre message.\r\n\r\n",
+    bodyText: "Voici votre devis en piece jointe.",
   });
-  const connector = fakeConnector({ id: threadId, messages: [clientMessage, ackRefetchedWithDifferentWhitespace] });
+  const connector = fakeConnector({ id: threadId, messages: [clientMessage, ourAck, ourRelance, humanReply] });
 
   await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
 
   const row = getThreadRow(threadId);
-  assert.notEqual(row?.status, "awaiting_client_reply");
-  assert.equal(row?.human_replied_at, null);
+  assert.equal(row?.status, "awaiting_client_reply");
+  assert.ok(row?.human_replied_at);
 });
 
 test("checkPostReplyThread still detects the client's reply after the post-reply sequence is exhausted (step=undefined)", async () => {

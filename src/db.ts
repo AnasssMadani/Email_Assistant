@@ -1,5 +1,4 @@
 import { DatabaseSync } from "node:sqlite";
-import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
@@ -34,6 +33,15 @@ db.exec(`
     -- reference sans l'inventer. Renseigne automatiquement quand le
     -- pipeline detecte la reponse (Gmail/Graph exposent l'info nativement).
     outbound_had_attachment INTEGER NOT NULL DEFAULT 0,
+    -- Nombre de messages envoyes AUTOMATIQUEMENT par le pipeline dans ce
+    -- fil (accuse + chaque relance) — permet de detecter une vraie reponse
+    -- humaine par simple comptage: si le fil relu contient plus de messages
+    -- isFromUs que cette valeur, l'exces est forcement humain, quel que
+    -- soit son contenu ou son id. Remplace une correspondance exacte
+    -- (hash de corps, puis id de message) qui echouait encore en
+    -- production a cause d'alterations du texte au round-trip Gmail/Graph
+    -- (fins de ligne, encodage) — le comptage ne depend d'aucun des deux.
+    automated_outbound_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -126,32 +134,6 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
-  -- Empreinte de chaque email envoye automatiquement (accuse, relance) par
-  -- dossier. checkPreReplyThread doit distinguer "un humain a repondu de
-  -- fond" de "notre propre relance automatique vient d'etre envoyee" — les
-  -- deux sont des messages isFromUs dans le meme fil, impossibles a
-  -- differencier par simple presence. Sans cette table, la relance
-  -- pre-reponse elle-meme etait detectee comme LA reponse humaine au cycle
-  -- suivant, ce qui faisait basculer le dossier en post-reponse et
-  -- declenchait une deuxieme relance client pour une reponse qui n'a
-  -- jamais existe.
-  CREATE TABLE IF NOT EXISTS automated_sent_bodies (
-    thread_id TEXT NOT NULL,
-    body_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (thread_id, body_hash)
-  );
-
-  -- Signal principal (plus fiable que le hash du corps sur Gmail, ou l'id
-  -- d'un message envoye reste stable entre l'envoi et sa relecture — Graph
-  -- reassigne un nouvel id au moment de l'envoi d'un brouillon, donc pour ce
-  -- connecteur automated_sent_bodies reste necessaire en repli).
-  CREATE TABLE IF NOT EXISTS automated_sent_message_ids (
-    thread_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (thread_id, message_id)
-  );
 `);
 
 ensureDelayMinutesColumn();
@@ -159,6 +141,7 @@ ensureThreadPostReplyColumns();
 ensureThreadAttachmentColumn();
 ensureCategoryAlertColumns();
 ensureSlaMinutesColumns();
+ensureAutomatedOutboundCountColumn();
 seedIfNeeded();
 
 /**
@@ -192,6 +175,14 @@ function ensureThreadAttachmentColumn(): void {
   const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
   if (!columns.some((c) => c.name === "outbound_had_attachment")) {
     db.exec("ALTER TABLE threads ADD COLUMN outbound_had_attachment INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
+/** Migration additive: ajoute automated_outbound_count sur threads si absente. */
+function ensureAutomatedOutboundCountColumn(): void {
+  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
+  if (!columns.some((c) => c.name === "automated_outbound_count")) {
+    db.exec("ALTER TABLE threads ADD COLUMN automated_outbound_count INTEGER NOT NULL DEFAULT 0");
   }
 }
 
@@ -350,6 +341,7 @@ export interface ThreadRow {
   human_replied_at: string | null;
   post_reply_relance_count: number;
   outbound_had_attachment: number;
+  automated_outbound_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -945,61 +937,21 @@ export function getAiUsageSummarySince(sinceIso: string): AiUsageSummary {
   return { since: sinceIso, total, byCallType };
 }
 
-// ---------- Empreintes des envois automatiques (distinguer un humain d'une relance) ----------
+// ---------- Compteur des envois automatiques (distinguer un humain d'une relance) ----------
 
 /**
- * Le corps est envoye tel quel (fins de ligne \n) dans le MIME brut, mais
- * Gmail/Graph normalisent frequemment les fins de ligne (\r\n) au stockage
- * — le texte relu via l'API peut donc differer octet pour octet de celui
- * envoye, sans aucune difference de CONTENU reelle. Un hash strict sur le
- * texte brut ratait alors la correspondance et laissait passer notre propre
- * accuse/relance comme "reponse humaine". On normalise tous les espaces
- * (fins de ligne comprises) avant de hasher, pour ne comparer que le
- * contenu textuel reel.
+ * A appeler juste apres l'envoi reussi d'un accuse ou d'une relance
+ * automatique. checkPreReplyThread compare ensuite le nombre de messages
+ * isFromUs reellement presents dans le fil relu a ce compteur: au-dela,
+ * l'exces est forcement humain — sans avoir a faire correspondre le
+ * contenu ou l'id d'un message precis (voir le commentaire sur la colonne
+ * automated_outbound_count pour l'historique des deux approches qui ont
+ * echoue avant celle-ci).
  */
-function normalizeForHash(bodyText: string): string {
-  return bodyText.replace(/\s+/g, " ").trim();
-}
-
-function hashBody(bodyText: string): string {
-  return createHash("sha256").update(normalizeForHash(bodyText)).digest("hex");
-}
-
-/** A appeler juste apres l'envoi reussi d'un accuse ou d'une relance automatique. */
-export function markBodySentByAutomation(threadId: string, bodyText: string): void {
+export function incrementAutomatedOutboundCount(threadId: string): void {
   db.prepare(
-    "INSERT OR IGNORE INTO automated_sent_bodies (thread_id, body_hash, created_at) VALUES (?, ?, ?)"
-  ).run(threadId, hashBody(bodyText), new Date().toISOString());
-}
-
-/** Vrai si ce texte exact a deja ete envoye par l'automation pour ce dossier (donc pas une reponse humaine). */
-export function wasBodySentByAutomation(threadId: string, bodyText: string): boolean {
-  const row = db
-    .prepare("SELECT 1 FROM automated_sent_bodies WHERE thread_id = ? AND body_hash = ?")
-    .get(threadId, hashBody(bodyText));
-  return row !== undefined;
-}
-
-/**
- * Signal principal: l'id du message tel que retourne par sendReply() au
- * moment de l'envoi. Fiable sur Gmail (l'id reste le meme entre l'envoi et
- * la relecture du fil) — moins garanti sur Graph, ou l'id retourne est
- * celui du brouillon avant envoi et peut differer de l'id final, d'ou le
- * hash de corps garde en repli.
- */
-export function markMessageIdSentByAutomation(threadId: string, messageId: string): void {
-  if (!messageId) return;
-  db.prepare(
-    "INSERT OR IGNORE INTO automated_sent_message_ids (thread_id, message_id, created_at) VALUES (?, ?, ?)"
-  ).run(threadId, messageId, new Date().toISOString());
-}
-
-export function wasMessageIdSentByAutomation(threadId: string, messageId: string): boolean {
-  if (!messageId) return false;
-  const row = db
-    .prepare("SELECT 1 FROM automated_sent_message_ids WHERE thread_id = ? AND message_id = ?")
-    .get(threadId, messageId);
-  return row !== undefined;
+    "UPDATE threads SET automated_outbound_count = automated_outbound_count + 1 WHERE thread_id = ?"
+  ).run(threadId);
 }
 
 export default db;
