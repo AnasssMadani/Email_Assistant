@@ -13,6 +13,8 @@ import {
   hasThreadRelanceOverride,
   incrementPostReplyRelance,
   listThreadsAwaitingClientReply,
+  listThreadsAwaitingReply,
+  setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
 } from "../src/db.js";
@@ -178,8 +180,40 @@ test("setThreadHumanReplied transitions a dossier into awaiting_client_reply", (
   const awaiting = listThreadsAwaitingClientReply();
   assert.ok(awaiting.some((r) => r.thread_id === "t-human-replied"));
 
-  incrementPostReplyRelance("t-human-replied", "relance_sent");
+  incrementPostReplyRelance("t-human-replied", "post_reply_relance_sent");
   const updated = getThreadRow("t-human-replied");
   assert.equal(updated?.post_reply_relance_count, 1);
-  assert.equal(updated?.status, "relance_sent");
+  assert.equal(updated?.status, "post_reply_relance_sent");
+});
+
+test("a post-reply relance no longer makes the dossier eligible for the pre-reply loop again", () => {
+  // Regression: pre-reply and post-reply external relances used to share the
+  // literal status "relance_sent". listThreadsAwaitingReply() (pre-reply)
+  // matches on that same string, so the moment a post-reply relance set the
+  // status back to "relance_sent", the dossier became eligible for BOTH
+  // loops at once — observed live as a dossier receiving an internal notify
+  // AND a second, different client relance after it had already moved into
+  // post-reply. It must appear in the post-reply eligible set and must NOT
+  // reappear in the pre-reply one.
+  const threadId = "t-no-oscillation";
+  upsertThreadReceived({
+    threadId,
+    subject: "Devis",
+    senderEmail: "client@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1,
+    status: "ack_sent",
+    dueAt: new Date(Date.now() - 60_000).toISOString(),
+  });
+  setThreadAckSent(threadId);
+  setThreadHumanReplied(threadId);
+  incrementPostReplyRelance(threadId, "post_reply_relance_sent");
+
+  const preReplyEligible = listThreadsAwaitingReply().some((r) => r.thread_id === threadId);
+  const postReplyEligible = listThreadsAwaitingClientReply().some((r) => r.thread_id === threadId);
+
+  assert.equal(preReplyEligible, false);
+  assert.equal(postReplyEligible, true);
 });

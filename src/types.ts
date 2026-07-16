@@ -108,7 +108,10 @@ export type ThreadStatus =
   | "ack_sent"
   | "drafts_ready"
   | "responded"
+  /** Relance PRE-reponse envoyee (personne chez nous n'a encore repondu de fond). Distinct de post_reply_relance_sent: les deux phases ne doivent jamais partager la meme valeur de statut, sinon l'UI ne peut plus savoir laquelle des deux sequences afficher. */
   | "relance_sent"
-  /** Un humain a envoye une reponse de fond (ex: le devis) — on attend maintenant la reponse DU CLIENT a ce message. */
+  /** Un humain a envoye une reponse de fond (ex: le devis) — on attend maintenant la reponse DU CLIENT a ce message, aucune relance post-reponse envoyee pour l'instant. */
   | "awaiting_client_reply"
+  /** Relance POST-reponse envoyee (le client reste silencieux apres notre reponse de fond). */
+  | "post_reply_relance_sent"
   | "closed";

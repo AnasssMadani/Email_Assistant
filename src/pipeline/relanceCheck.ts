@@ -265,7 +265,7 @@ export async function checkPostReplyThread(
         inReplyToMessageId: lastOutbound.rfcMessageId,
       })
     );
-    incrementPostReplyRelance(row.thread_id, "relance_sent");
+    incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
     markBodySentByAutomation(row.thread_id, relance.body);
     recordReminder(
       row.thread_id,

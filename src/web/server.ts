@@ -304,7 +304,7 @@ app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Req
   const threadId = req.params.threadId;
   const thread = getThreadRow(threadId);
   if (thread) {
-    const isPostReply = thread.status === "awaiting_client_reply";
+    const isPostReply = isPostReplyStatus(thread.status);
     const phase = isPostReply ? "post_reply" : "pre_reply";
     const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id, phase);
     const nextStep = steps[isPostReply ? thread.post_reply_relance_count : thread.relance_count];
@@ -922,6 +922,18 @@ function channelLabel(channel: RelanceChannel): string {
   return channel === "external" ? "Relancer le client" : "Notifier l'équipe";
 }
 
+/**
+ * Vrai des qu'un humain a envoye une reponse de fond, qu'une relance
+ * post-reponse ait deja ete envoyee ou non. A utiliser partout ou le code
+ * doit savoir "ce dossier suit-il la sequence pre_reply ou post_reply ?" —
+ * un simple `status === "awaiting_client_reply"` ratait le cas ou le statut
+ * est passe a "post_reply_relance_sent" apres la premiere relance post-
+ * reponse, ce qui faisait alors afficher/traiter la mauvaise sequence.
+ */
+function isPostReplyStatus(status: string): boolean {
+  return status === "awaiting_client_reply" || status === "post_reply_relance_sent";
+}
+
 // ---------- Page de connexion applicative (login) ----------
 
 function renderLoginPage(opts: { next: string; error?: string }): string {
@@ -1112,7 +1124,7 @@ function renderDossiersPage(
   // bord reste une vue fiable de la situation reelle meme quand on regarde
   // un sous-ensemble filtre.
   const overdueCount = threads.filter((t) => statusStamp(t).label.includes("en retard")).length;
-  const awaitingClientCount = threads.filter((t) => t.status === "awaiting_client_reply").length;
+  const awaitingClientCount = threads.filter((t) => isPostReplyStatus(t.status)).length;
   const openCount = threads.filter((t) => !["responded", "closed", "skipped"].includes(t.status)).length;
   const costThisMonth = estimateCostUsd(usageSummary.total.inputTokens, usageSummary.total.outputTokens);
 
@@ -1163,6 +1175,7 @@ const STATUS_LABELS: Record<string, { label: string; stampClass: string }> = {
   responded: { label: "Répondu", stampClass: "stamp-done" },
   relance_sent: { label: "Relancé", stampClass: "stamp-late" },
   awaiting_client_reply: { label: "En attente du client", stampClass: "stamp-internal" },
+  post_reply_relance_sent: { label: "Client relancé (suivi)", stampClass: "stamp-internal" },
   closed: { label: "Clôturé", stampClass: "stamp-done" },
 };
 
@@ -1196,7 +1209,8 @@ function statusStamp(row: ThreadRow): { label: string; stampClass: string } {
   const isOverdue =
     row.due_at !== null &&
     new Date(row.due_at).getTime() < Date.now() &&
-    !["responded", "closed", "skipped", "awaiting_client_reply"].includes(row.status);
+    !["responded", "closed", "skipped"].includes(row.status) &&
+    !isPostReplyStatus(row.status);
   return isOverdue ? { label: `${info.label} (en retard)`, stampClass: "stamp-late" } : info;
 }
 
@@ -1255,7 +1269,7 @@ function renderDossierDetailPage(
       ? `<div class="banner banner-ok">Modifications enregistrées — aucun redéploiement nécessaire.</div>`
       : "";
 
-  const isPostReply = thread.status === "awaiting_client_reply";
+  const isPostReply = isPostReplyStatus(thread.status);
   const phase: RelancePhase = isPostReply ? "post_reply" : "pre_reply";
   const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id, phase);
   const draftCount = listDraftsForThread(thread.thread_id).length;
@@ -1263,7 +1277,7 @@ function renderDossierDetailPage(
   const anchorAt = isPostReply ? thread.human_replied_at : thread.due_at;
   const canTriggerNow =
     anchorAt !== null &&
-    ["ack_sent", "drafts_ready", "relance_sent", "awaiting_client_reply"].includes(thread.status) &&
+    (["ack_sent", "drafts_ready", "relance_sent"].includes(thread.status) || isPostReplyStatus(thread.status)) &&
     Boolean(nextStep);
   // L'echeance (due_at) est l'ancrage fixe du cycle pre_reply (reception +
   // SLA de la categorie) — elle ne bouge pas apres une relance, par design.

@@ -497,10 +497,19 @@ export function listThreadsAwaitingReply(): ThreadRow[] {
     .all() as unknown as ThreadRow[];
 }
 
-/** Dossiers ou un humain a repondu et on attend desormais la reponse du client a ce message. */
+/**
+ * Dossiers ou un humain a repondu et on attend desormais la reponse du
+ * client a ce message — que la sequence post-reponse ait deja envoye une
+ * relance ou non. Sans inclure 'post_reply_relance_sent', un dossier
+ * cessait d'etre reexamine des sa premiere relance post-reponse envoyee.
+ */
 export function listThreadsAwaitingClientReply(): ThreadRow[] {
   return db
-    .prepare(`SELECT * FROM threads WHERE status = 'awaiting_client_reply' AND human_replied_at IS NOT NULL`)
+    .prepare(
+      `SELECT * FROM threads
+       WHERE status IN ('awaiting_client_reply', 'post_reply_relance_sent')
+       AND human_replied_at IS NOT NULL`
+    )
     .all() as unknown as ThreadRow[];
 }
 
@@ -927,8 +936,22 @@ export function getAiUsageSummarySince(sinceIso: string): AiUsageSummary {
 
 // ---------- Empreintes des envois automatiques (distinguer un humain d'une relance) ----------
 
+/**
+ * Le corps est envoye tel quel (fins de ligne \n) dans le MIME brut, mais
+ * Gmail/Graph normalisent frequemment les fins de ligne (\r\n) au stockage
+ * — le texte relu via l'API peut donc differer octet pour octet de celui
+ * envoye, sans aucune difference de CONTENU reelle. Un hash strict sur le
+ * texte brut ratait alors la correspondance et laissait passer notre propre
+ * accuse/relance comme "reponse humaine". On normalise tous les espaces
+ * (fins de ligne comprises) avant de hasher, pour ne comparer que le
+ * contenu textuel reel.
+ */
+function normalizeForHash(bodyText: string): string {
+  return bodyText.replace(/\s+/g, " ").trim();
+}
+
 function hashBody(bodyText: string): string {
-  return createHash("sha256").update(bodyText.trim()).digest("hex");
+  return createHash("sha256").update(normalizeForHash(bodyText)).digest("hex");
 }
 
 /** A appeler juste apres l'envoi reussi d'un accuse ou d'une relance automatique. */
