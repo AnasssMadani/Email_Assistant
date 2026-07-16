@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
@@ -123,6 +124,22 @@ db.exec(`
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     created_at TEXT NOT NULL
+  );
+
+  -- Empreinte de chaque email envoye automatiquement (accuse, relance) par
+  -- dossier. checkPreReplyThread doit distinguer "un humain a repondu de
+  -- fond" de "notre propre relance automatique vient d'etre envoyee" — les
+  -- deux sont des messages isFromUs dans le meme fil, impossibles a
+  -- differencier par simple presence. Sans cette table, la relance
+  -- pre-reponse elle-meme etait detectee comme LA reponse humaine au cycle
+  -- suivant, ce qui faisait basculer le dossier en post-reponse et
+  -- declenchait une deuxieme relance client pour une reponse qui n'a
+  -- jamais existe.
+  CREATE TABLE IF NOT EXISTS automated_sent_bodies (
+    thread_id TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (thread_id, body_hash)
   );
 `);
 
@@ -906,6 +923,27 @@ export function getAiUsageSummarySince(sinceIso: string): AiUsageSummary {
     .all(sinceIso) as unknown as Array<{ callType: string } & AiUsageTotals>;
 
   return { since: sinceIso, total, byCallType };
+}
+
+// ---------- Empreintes des envois automatiques (distinguer un humain d'une relance) ----------
+
+function hashBody(bodyText: string): string {
+  return createHash("sha256").update(bodyText.trim()).digest("hex");
+}
+
+/** A appeler juste apres l'envoi reussi d'un accuse ou d'une relance automatique. */
+export function markBodySentByAutomation(threadId: string, bodyText: string): void {
+  db.prepare(
+    "INSERT OR IGNORE INTO automated_sent_bodies (thread_id, body_hash, created_at) VALUES (?, ?, ?)"
+  ).run(threadId, hashBody(bodyText), new Date().toISOString());
+}
+
+/** Vrai si ce texte exact a deja ete envoye par l'automation pour ce dossier (donc pas une reponse humaine). */
+export function wasBodySentByAutomation(threadId: string, bodyText: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM automated_sent_bodies WHERE thread_id = ? AND body_hash = ?")
+    .get(threadId, hashBody(bodyText));
+  return row !== undefined;
 }
 
 export default db;

@@ -7,6 +7,7 @@ import {
   getThreadRow,
   incrementPostReplyRelance,
   incrementRelance,
+  markBodySentByAutomation,
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
@@ -96,6 +97,53 @@ test("checkPreReplyThread still detects a human reply after the pre-reply sequen
   const row = getThreadRow(threadId);
   assert.equal(row?.status, "awaiting_client_reply");
   assert.ok(row?.human_replied_at);
+});
+
+test("checkPreReplyThread does not mistake its own already-sent relance for a human reply", async () => {
+  // Regression: observed live — a pre-reply relance was sent, then on the
+  // very next check cycle the system found that SAME relance in the
+  // refetched thread (isFromUs, timestamped after ack_sent_at) and treated
+  // it as "a human answered the client", flipping the dossier into
+  // post-reply and firing a second, unwarranted relance about a reply that
+  // never happened.
+  const threadId = "t-self-relance-not-a-reply";
+  const ackSentAt = new Date(Date.now() - 5 * 60_000).toISOString();
+  const relanceBody = "Nous vous informons que votre dossier est toujours en cours de traitement.";
+
+  upsertThreadReceived({
+    threadId,
+    subject: "Devis",
+    senderEmail: "client@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1,
+    status: "ack_sent",
+    dueAt: new Date(Date.now() - 4 * 60_000).toISOString(),
+  });
+  setThreadAckSent(threadId);
+  // Simule ce que checkPreReplyThread fait lui-meme apres avoir envoye la
+  // relance: marquer son propre corps comme automatique pour ce dossier.
+  markBodySentByAutomation(threadId, relanceBody);
+  addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
+  incrementRelance(threadId, "relance_sent");
+
+  const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
+  const ourOwnRelanceRefetched = fakeMessage({
+    id: "m-relance",
+    threadId,
+    isFromUs: true,
+    receivedAt: new Date(Date.now() - 60_000),
+    bodyText: relanceBody,
+  });
+  const connector = fakeConnector({ id: threadId, messages: [clientMessage, ourOwnRelanceRefetched] });
+
+  await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+
+  const row = getThreadRow(threadId);
+  // Ne doit PAS avoir bascule en post-reponse: aucune reponse humaine reelle.
+  assert.notEqual(row?.status, "awaiting_client_reply");
+  assert.equal(row?.human_replied_at, null);
 });
 
 test("checkPostReplyThread still detects the client's reply after the post-reply sequence is exhausted (step=undefined)", async () => {

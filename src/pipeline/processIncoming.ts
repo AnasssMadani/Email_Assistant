@@ -6,6 +6,7 @@ import { buildReplySubject } from "../utils.js";
 import { tagSource } from "./errorTag.js";
 import {
   isMessageProcessed,
+  markBodySentByAutomation,
   markMessageProcessed,
   upsertThreadReceived,
   setThreadAckSent,
@@ -85,6 +86,10 @@ export async function sendAcknowledgementAndDrafts(
     })
   );
   setThreadAckSent(incoming.threadId);
+  // Empreinte du corps envoye: permet a checkPreReplyThread de reconnaitre
+  // plus tard ce message comme "notre propre accuse", pas une reponse
+  // humaine, quand il le retrouve dans le fil relu depuis la messagerie.
+  markBodySentByAutomation(incoming.threadId, ack.body);
   // Journalise le destinataire reel de l'accuse — sans ca, un envoi vers une
   // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est
   // visible nulle part avant qu'un rebond n'arrive dans la boite, et devient

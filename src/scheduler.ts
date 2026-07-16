@@ -5,7 +5,6 @@ import { discoverOutboundOnlyThreads } from "./pipeline/discoverOutbound.js";
 import { processIncomingMessage } from "./pipeline/processIncoming.js";
 import { runRelanceCheck } from "./pipeline/relanceCheck.js";
 import { recordPipelineError } from "./db.js";
-import type { EmailConnector } from "./types.js";
 
 // Un traitement d'email (classification + accuse + 3 brouillons, plusieurs
 // appels Claude) peut prendre plus de temps que l'intervalle de scrutation.
@@ -16,13 +15,18 @@ let pollInProgress = false;
 let relanceCheckInProgress = false;
 let discoverOutboundInProgress = false;
 
-async function pollInbox(connector: EmailConnector): Promise<void> {
+async function pollInbox(): Promise<void> {
   if (pollInProgress) {
     console.log("[scrutation boite] cycle precedent encore en cours, on saute celui-ci.");
     return;
   }
   pollInProgress = true;
   try {
+    // Resolue a chaque cycle plutot que capturee une seule fois au demarrage
+    // du planificateur: sinon, connecter (ou changer de) boite via l'UI web
+    // apres coup n'a aucun effet tant que le processus n'est pas redemarre —
+    // le planificateur continue silencieusement de scruter l'ancienne boite.
+    const connector = createEmailConnector();
     const messages = await connector.listRecentInboxMessages(25);
     for (const message of messages) {
       // Isole chaque message: une erreur (Claude, API email, etc.) ne doit
@@ -43,11 +47,11 @@ async function pollInbox(connector: EmailConnector): Promise<void> {
   }
 }
 
-async function checkRelances(connector: EmailConnector): Promise<void> {
+async function checkRelances(): Promise<void> {
   if (relanceCheckInProgress) return;
   relanceCheckInProgress = true;
   try {
-    await runRelanceCheck(connector);
+    await runRelanceCheck(createEmailConnector());
   } catch (err) {
     console.error("[verification relances] erreur:", err);
   } finally {
@@ -55,11 +59,11 @@ async function checkRelances(connector: EmailConnector): Promise<void> {
   }
 }
 
-async function discoverOutbound(connector: EmailConnector): Promise<void> {
+async function discoverOutbound(): Promise<void> {
   if (discoverOutboundInProgress) return;
   discoverOutboundInProgress = true;
   try {
-    await discoverOutboundOnlyThreads(connector);
+    await discoverOutboundOnlyThreads(createEmailConnector());
   } catch (err) {
     console.error("[decouverte envois] erreur:", err);
     recordPipelineError("discover_outbound", null, (err as Error).message);
@@ -69,16 +73,14 @@ async function discoverOutbound(connector: EmailConnector): Promise<void> {
 }
 
 export function startScheduler(): void {
-  const connector = createEmailConnector();
-
-  console.log(`Connecteur actif: ${connector.name}`);
+  console.log(`Connecteur actif au demarrage: ${createEmailConnector().name}`);
   console.log(`Scrutation boite: ${config.pollIntervalCron}`);
   console.log(`Verification relances: ${config.relanceCheckCron}`);
 
-  void pollInbox(connector);
-  void discoverOutbound(connector);
+  void pollInbox();
+  void discoverOutbound();
 
-  cron.schedule(config.pollIntervalCron, () => void pollInbox(connector));
-  cron.schedule(config.pollIntervalCron, () => void discoverOutbound(connector));
-  cron.schedule(config.relanceCheckCron, () => void checkRelances(connector));
+  cron.schedule(config.pollIntervalCron, () => void pollInbox());
+  cron.schedule(config.pollIntervalCron, () => void discoverOutbound());
+  cron.schedule(config.relanceCheckCron, () => void checkRelances());
 }
