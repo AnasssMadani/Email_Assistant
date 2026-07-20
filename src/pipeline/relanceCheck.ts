@@ -210,7 +210,12 @@ export async function checkPreReplyThread(
     );
     incrementRelance(row.thread_id, "relance_sent");
     incrementAutomatedOutboundCount(row.thread_id);
-    recordReminder(row.thread_id, "external", `Relance envoyee automatiquement a ${row.sender_email}.`);
+    recordReminder(
+      row.thread_id,
+      "external",
+      `Relance envoyee automatiquement a ${row.sender_email}.`,
+      "relance_externe_pre_reponse"
+    );
     console.log(`[relance externe] ${row.sender_email} — "${row.subject}"`);
     return;
   }
@@ -230,14 +235,19 @@ export async function checkPreReplyThread(
 
   if (shouldAlertTeam) {
     await sendInternalNotification(connector, row, note);
-    recordReminder(row.thread_id, "internal", note);
+    recordReminder(row.thread_id, "internal", note, "relance_interne");
     console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
   } else {
     // Alerte volontairement filtree (categorie/urgence sous le seuil configure
     // dans /reglages) — on avance quand meme la sequence pour ne pas re-evaluer
     // indefiniment la meme etape, mais sans notifier l'equipe pour ne pas
     // noyer sa boite sous des rappels pour des demandes jugees banales.
-    recordReminder(row.thread_id, "internal", `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`);
+    recordReminder(
+      row.thread_id,
+      "internal",
+      `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`,
+      "relance_interne_filtree"
+    );
   }
   incrementRelance(row.thread_id, row.status);
 }
@@ -307,7 +317,8 @@ export async function checkPostReplyThread(
     recordReminder(
       row.thread_id,
       "external",
-      `Relance post-reponse envoyee a ${row.sender_email} (suivi de notre reponse).`
+      `Relance post-reponse envoyee a ${row.sender_email} (suivi de notre reponse).`,
+      "relance_externe_post_reponse"
     );
     console.log(`[relance post-reponse] ${row.sender_email} — "${row.subject}"`);
     return;
@@ -326,10 +337,15 @@ export async function checkPostReplyThread(
 
   if (shouldAlertTeam) {
     await sendInternalNotification(connector, row, note);
-    recordReminder(row.thread_id, "internal", note);
+    recordReminder(row.thread_id, "internal", note, "relance_interne");
     console.log(`[rappel interne post-reponse] "${row.subject}" — client silencieux.`);
   } else {
-    recordReminder(row.thread_id, "internal", `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`);
+    recordReminder(
+      row.thread_id,
+      "internal",
+      `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`,
+      "relance_interne_filtree"
+    );
   }
   incrementPostReplyRelance(row.thread_id, row.status);
 }

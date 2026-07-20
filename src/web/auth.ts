@@ -39,9 +39,12 @@ export function clearSessionCookie(res: Response): void {
 
 // ---------- Sessions (en memoire — un seul processus, single-tenant) ----------
 
+export type SessionRole = "admin" | "client";
+
 interface SessionData {
   csrfToken: string;
   expiresAt: number;
+  role: SessionRole;
 }
 
 const sessions = new Map<string, SessionData>();
@@ -53,11 +56,11 @@ function pruneExpiredSessions(): void {
   }
 }
 
-export function createSession(): { token: string; csrfToken: string } {
+export function createSession(role: SessionRole): { token: string; csrfToken: string } {
   pruneExpiredSessions();
   const token = randomBytes(32).toString("hex");
   const csrfToken = randomBytes(32).toString("hex");
-  sessions.set(token, { csrfToken, expiresAt: Date.now() + SESSION_TTL_MS });
+  sessions.set(token, { csrfToken, role, expiresAt: Date.now() + SESSION_TTL_MS });
   return { token, csrfToken };
 }
 
@@ -127,6 +130,23 @@ export function verifyLogin(username: string, password: string): boolean {
   return usernameOk && passwordOk;
 }
 
+// ---------- Identifiants du dashboard client (compte separe de l'admin) ----------
+
+export function clientAuthConfigured(): boolean {
+  return Boolean(config.auth.clientUsername) && Boolean(config.auth.clientPasswordHash);
+}
+
+export function verifyClientLogin(username: string, password: string): boolean {
+  const expectedHash = config.auth.clientPasswordHash;
+  if (!expectedHash || !config.auth.clientUsername) return false;
+  const [salt, expectedDerived] = expectedHash.split(":");
+  if (!salt || !expectedDerived) return false;
+  const candidateDerived = scryptSync(password, salt, SCRYPT_KEY_LENGTH).toString("hex");
+  const passwordOk = safeEqual(candidateDerived, expectedDerived);
+  const usernameOk = safeEqual(username, config.auth.clientUsername);
+  return usernameOk && passwordOk;
+}
+
 // ---------- Limitation des tentatives de connexion ----------
 
 const loginAttempts = new Map<string, { count: number; windowStart: number }>();
@@ -166,6 +186,17 @@ function warnAuthDisabledOnce(): void {
   );
 }
 
+let warnedClientAuthDisabled = false;
+function warnClientAuthDisabledOnce(): void {
+  if (warnedClientAuthDisabled) return;
+  warnedClientAuthDisabled = true;
+  console.warn(
+    "[avertissement] CLIENT_USERNAME / CLIENT_PASSWORD_HASH non definis: le dashboard client n'est pas protege. " +
+      "A ne jamais laisser ainsi en dehors de localhost."
+  );
+}
+
+/** Espace admin uniquement — un client authentifie sous le role "client" est refuse, meme s'il devine l'URL. */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (!authConfigured()) {
     warnAuthDisabledOnce();
@@ -174,8 +205,32 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   }
   const cookies = parseCookies(req.headers.cookie);
   const session = getSession(cookies[SESSION_COOKIE]);
-  if (!session) {
+  if (!session || session.role !== "admin") {
     res.redirect(`/login?next=${encodeURIComponent(req.originalUrl)}`);
+    return;
+  }
+  res.locals.csrfToken = session.csrfToken;
+  next();
+}
+
+/**
+ * Espace client (/client/... + le flux OAuth de reconnexion messagerie,
+ * partage avec l'admin) — accepte le role "client" ET "admin" (l'admin peut
+ * ainsi previsualiser le dashboard client), mais jamais l'inverse: une
+ * session client n'ouvre jamais une route admin (voir requireAuth ci-dessus).
+ * Verrouillage cote serveur systematique, pas un simple masquage de lien
+ * dans le menu — un client qui devine une URL admin est quand meme bloque.
+ */
+export function requireClientAuth(req: Request, res: Response, next: NextFunction): void {
+  if (!clientAuthConfigured()) {
+    warnClientAuthDisabledOnce();
+    next();
+    return;
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  const session = getSession(cookies[SESSION_COOKIE]);
+  if (!session || (session.role !== "client" && session.role !== "admin")) {
+    res.redirect(`/client/login?next=${encodeURIComponent(req.originalUrl)}`);
     return;
   }
   res.locals.csrfToken = session.csrfToken;

@@ -105,7 +105,7 @@ export async function sendAcknowledgementAndDrafts(
   // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est
   // visible nulle part avant qu'un rebond n'arrive dans la boite, et devient
   // alors impossible a relier au dossier d'origine.
-  recordReminder(incoming.threadId, "external", `Accusé de réception envoyé à ${incoming.from.email}.`);
+  recordReminder(incoming.threadId, "external", `Accusé de réception envoyé à ${incoming.from.email}.`, "accuse");
   console.log(`[accuse envoye] ${incoming.from.email} — "${incoming.subject}"`);
 
   if (!config.draftRepliesEnabled) {

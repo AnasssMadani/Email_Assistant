@@ -61,11 +61,19 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
+  -- step_type identifie precisement QUELLE etape du cycle de vie ce rappel
+  -- represente (accuse / relance interne / relance externe avant ou apres
+  -- reponse...) — kind seul ('internal'/'external') ne suffit pas a
+  -- distinguer un accuse d'une relance externe avant reponse, les deux etant
+  -- 'external'. Sert de base fiable aux cases a cocher du dashboard client
+  -- (EXISTS ... WHERE step_type = ?) plutot que de deviner depuis le texte
+  -- de note, qui peut changer de formulation avec le temps.
   CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     note TEXT,
+    step_type TEXT,
     created_at TEXT NOT NULL
   );
 
@@ -143,6 +151,7 @@ ensureCategoryAlertColumns();
 ensureSlaMinutesColumns();
 ensureAutomatedOutboundCountColumn();
 ensureRelanceSnapshotColumns();
+ensureReminderStepTypeColumn();
 seedIfNeeded();
 
 /**
@@ -194,6 +203,14 @@ function ensureAutomatedOutboundCountColumn(): void {
  * cycle de verification qui les relit, sur la base de la categorie telle
  * qu'elle est a ce moment-la.
  */
+/** Migration additive: ajoute step_type sur reminders si absente. */
+function ensureReminderStepTypeColumn(): void {
+  const columns = db.prepare("PRAGMA table_info(reminders)").all() as unknown as { name: string }[];
+  if (!columns.some((c) => c.name === "step_type")) {
+    db.exec("ALTER TABLE reminders ADD COLUMN step_type TEXT");
+  }
+}
+
 function ensureRelanceSnapshotColumns(): void {
   const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
   if (!columns.some((c) => c.name === "pre_reply_relance_snapshot")) {
@@ -452,10 +469,42 @@ export function recordDraft(params: {
   ).run(params.threadId, params.connectorDraftId, params.variant, params.label, new Date().toISOString());
 }
 
-export function recordReminder(threadId: string, kind: "internal" | "external", note: string): void {
+/**
+ * "accuse": accuse de reception envoye.
+ * "relance_interne": rappel interne REELLEMENT envoye a l'equipe (pre ou
+ * post-reponse — le dashboard client n'affiche qu'une case generique, peu
+ * importe la phase).
+ * "relance_interne_filtree": etape de rappel interne evaluee mais filtree
+ * (urgence sous le seuil configure) — la sequence avance sans notifier
+ * personne. Distinct de "relance_interne" expres: le client ne doit jamais
+ * voir "equipe alertee" pour une alerte qui n'a en realite pas ete envoyee.
+ * "relance_externe_pre_reponse" / "relance_externe_post_reponse": relance
+ * envoyee au client, avant ou apres notre reponse de fond.
+ */
+export type ReminderStepType =
+  | "accuse"
+  | "relance_interne"
+  | "relance_interne_filtree"
+  | "relance_externe_pre_reponse"
+  | "relance_externe_post_reponse";
+
+export function recordReminder(
+  threadId: string,
+  kind: "internal" | "external",
+  note: string,
+  stepType?: ReminderStepType
+): void {
   db.prepare(
-    "INSERT INTO reminders (thread_id, kind, note, created_at) VALUES (?, ?, ?, ?)"
-  ).run(threadId, kind, note, new Date().toISOString());
+    "INSERT INTO reminders (thread_id, kind, note, step_type, created_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(threadId, kind, note, stepType ?? null, new Date().toISOString());
+}
+
+/** Utilise par le dashboard client: cette etape a-t-elle deja eu lieu pour ce dossier ? */
+export function hasReminderStep(threadId: string, stepType: ReminderStepType): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM reminders WHERE thread_id = ? AND step_type = ? LIMIT 1")
+    .get(threadId, stepType);
+  return row !== undefined;
 }
 
 export function incrementRelance(threadId: string, status: ThreadStatus): void {
@@ -1016,6 +1065,252 @@ export function incrementAutomatedOutboundCount(threadId: string): void {
   db.prepare(
     "UPDATE threads SET automated_outbound_count = automated_outbound_count + 1 WHERE thread_id = ?"
   ).run(threadId);
+}
+
+// ==================== Projections dashboard client ====================
+//
+// Le dashboard client (/client/...) n'a jamais acces aux lignes completes
+// de la base — chaque fonction ci-dessous ne renvoie QUE les champs
+// autorises pour ce public. Ne jamais faire lire un ThreadRow/CategoryRow
+// complet par une vue client puis filtrer a l'affichage: un champ ajoute
+// plus tard sur ces tables (cout, id technique, config de relance...)
+// fuiterait sans qu'on y pense. threadId/categoryId restent presents dans
+// ces DTO uniquement comme identifiants de routage (URL, formulaires) —
+// jamais affiches comme "ID" dans une vue.
+
+export interface ClientThreadSummary {
+  threadId: string;
+  subject: string;
+  senderEmail: string;
+  senderName: string | null;
+  categoryLabel: string;
+  dueAt: string | null;
+  receivedAt: string;
+  resolved: boolean;
+}
+
+export interface ClientThreadChecklist {
+  accuseEnvoye: { done: boolean; at: string | null };
+  relanceInterne: { done: boolean };
+  relanceClientAvantReponse: { done: boolean };
+  reponseEquipe: { done: boolean; at: string | null; delayLabel: string | null };
+  relanceApresReponse: { done: boolean };
+  cloture: { done: boolean };
+}
+
+export interface ClientThreadDetail extends ClientThreadSummary {
+  checklist: ClientThreadChecklist;
+}
+
+export interface ClientMonthlyStats {
+  emailsTraites: number;
+  delaiMoyenReponseMinutes: number | null;
+  relancesEnvoyees: number;
+  dossiersEnCours: number;
+  dossiersResolus: number;
+}
+
+export interface ClientSendHistoryEntry {
+  sentence: string;
+  at: string;
+}
+
+export interface ClientCategorySummary {
+  id: string;
+  label: string;
+  slaMinutes: number;
+}
+
+interface ClientThreadRow {
+  thread_id: string;
+  subject: string;
+  sender_email: string;
+  sender_name: string | null;
+  category_label: string | null;
+  due_at: string | null;
+  received_at: string;
+  status: string;
+}
+
+function toClientThreadSummary(row: ClientThreadRow): ClientThreadSummary {
+  return {
+    threadId: row.thread_id,
+    subject: row.subject,
+    senderEmail: row.sender_email,
+    senderName: row.sender_name,
+    categoryLabel: row.category_label ?? "Autre",
+    dueAt: row.due_at,
+    receivedAt: row.received_at,
+    resolved: row.status === "closed",
+  };
+}
+
+/** "3h", "45 min", "2.5 j" — lisible dans un contexte client, pas une duree ISO brute. */
+function formatHumanDelay(fromIso: string, toIso: string): string {
+  const minutes = Math.max(0, Math.round((new Date(toIso).getTime() - new Date(fromIso).getTime()) / 60_000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = minutes / 60;
+  if (hours < 48) return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} h`;
+  const days = hours / 24;
+  return `${Number.isInteger(days) ? days : days.toFixed(1)} j`;
+}
+
+/**
+ * Exclut les dossiers "skipped" (spam/newsletter/communication interne):
+ * jamais accuses, jamais de vraie demande client — n'ont rien a faire dans
+ * une liste de dossiers cote client.
+ */
+export function listClientThreads(limit = 200): ClientThreadSummary[] {
+  const rows = db
+    .prepare(
+      `SELECT t.thread_id, t.subject, t.sender_email, t.sender_name, c.label AS category_label,
+              t.due_at, t.received_at, t.status
+       FROM threads t
+       LEFT JOIN categories c ON c.id = t.category_id
+       WHERE t.status != 'skipped'
+       ORDER BY t.updated_at DESC
+       LIMIT ?`
+    )
+    .all(limit) as unknown as ClientThreadRow[];
+  return rows.map(toClientThreadSummary);
+}
+
+export function getClientThreadDetail(threadId: string): ClientThreadDetail | undefined {
+  const row = db
+    .prepare(
+      `SELECT t.thread_id, t.subject, t.sender_email, t.sender_name, c.label AS category_label,
+              t.due_at, t.received_at, t.status, t.ack_sent_at, t.human_replied_at
+       FROM threads t
+       LEFT JOIN categories c ON c.id = t.category_id
+       WHERE t.thread_id = ?`
+    )
+    .get(threadId) as unknown as (ClientThreadRow & { ack_sent_at: string | null; human_replied_at: string | null }) | undefined;
+  if (!row) return undefined;
+
+  return {
+    ...toClientThreadSummary(row),
+    checklist: {
+      accuseEnvoye: { done: row.ack_sent_at !== null, at: row.ack_sent_at },
+      relanceInterne: { done: hasReminderStep(threadId, "relance_interne") },
+      relanceClientAvantReponse: { done: hasReminderStep(threadId, "relance_externe_pre_reponse") },
+      reponseEquipe: {
+        done: row.human_replied_at !== null,
+        at: row.human_replied_at,
+        delayLabel: row.human_replied_at ? formatHumanDelay(row.received_at, row.human_replied_at) : null,
+      },
+      relanceApresReponse: { done: hasReminderStep(threadId, "relance_externe_post_reponse") },
+      cloture: { done: row.status === "closed" },
+    },
+  };
+}
+
+/** Stats du mois en cours pour la page d'accueil client — aucun chiffre de cout. */
+export function getClientMonthlyStats(): ClientMonthlyStats {
+  const monthStart = new Date();
+  monthStart.setDate(1);
+  monthStart.setHours(0, 0, 0, 0);
+  const monthStartIso = monthStart.toISOString();
+
+  const traites = db
+    .prepare("SELECT COUNT(*) AS n FROM threads WHERE received_at >= ? AND status != 'skipped'")
+    .get(monthStartIso) as { n: number };
+
+  // Le delai qui compte est jusqu'a la reponse HUMAINE, pas l'accuse (quasi
+  // instantane et sans rien a prouver) — voir cahier des charges.
+  const delays = db
+    .prepare(
+      "SELECT received_at, human_replied_at FROM threads WHERE received_at >= ? AND human_replied_at IS NOT NULL"
+    )
+    .all(monthStartIso) as unknown as Array<{ received_at: string; human_replied_at: string }>;
+  const avgMinutes = delays.length
+    ? delays.reduce(
+        (sum, r) => sum + (new Date(r.human_replied_at).getTime() - new Date(r.received_at).getTime()) / 60_000,
+        0
+      ) / delays.length
+    : null;
+
+  const relances = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM reminders
+       WHERE created_at >= ? AND step_type IN ('relance_externe_pre_reponse', 'relance_externe_post_reponse')`
+    )
+    .get(monthStartIso) as { n: number };
+
+  const enCours = db
+    .prepare("SELECT COUNT(*) AS n FROM threads WHERE status NOT IN ('closed', 'skipped')")
+    .get() as { n: number };
+  const resolus = db.prepare("SELECT COUNT(*) AS n FROM threads WHERE status = 'closed'").get() as { n: number };
+
+  return {
+    emailsTraites: traites.n,
+    delaiMoyenReponseMinutes: avgMinutes !== null ? Math.round(avgMinutes) : null,
+    relancesEnvoyees: relances.n,
+    dossiersEnCours: enCours.n,
+    dossiersResolus: resolus.n,
+  };
+}
+
+function clientSendHistorySentence(stepType: string, subject: string, senderEmail: string): string {
+  switch (stepType) {
+    case "accuse":
+      return `Accusé de réception envoyé à ${senderEmail} pour "${subject}".`;
+    case "relance_interne":
+      return `Rappel interne envoyé à l'équipe pour "${subject}".`;
+    case "relance_externe_pre_reponse":
+      return `Relance envoyée à ${senderEmail} pour "${subject}".`;
+    case "relance_externe_post_reponse":
+      return `Relance de suivi envoyée à ${senderEmail} pour "${subject}".`;
+    default:
+      return `Action automatique effectuée pour "${subject}".`;
+  }
+}
+
+/**
+ * Version lisible du Journal admin, en phrases completes — exclut
+ * entierement les erreurs de pipeline (jamais interrogees ici: elles vivent
+ * dans une table separee, pipeline_errors, jamais lue par le dashboard
+ * client) et les rappels internes filtres (rien n'a ete envoye).
+ */
+export function listClientSendHistory(limit = 100): ClientSendHistoryEntry[] {
+  const rows = db
+    .prepare(
+      `SELECT r.step_type AS step_type, r.created_at AS created_at, t.subject AS subject, t.sender_email AS sender_email
+       FROM reminders r
+       JOIN threads t ON t.thread_id = r.thread_id
+       WHERE r.step_type IN ('accuse', 'relance_interne', 'relance_externe_pre_reponse', 'relance_externe_post_reponse')
+       ORDER BY r.created_at DESC
+       LIMIT ?`
+    )
+    .all(limit) as unknown as Array<{ step_type: string; created_at: string; subject: string; sender_email: string }>;
+
+  return rows.map((r) => ({
+    sentence: clientSendHistorySentence(r.step_type, r.subject, r.sender_email),
+    at: r.created_at,
+  }));
+}
+
+/**
+ * Categories editables par le client — exclut "spam_newsletter" et "interne":
+ * ces deux n'ont jamais d'accuse (acknowledgeAutomatically=false) et n'ont
+ * donc aucun delai de reponse pertinent a afficher ou ajuster.
+ */
+export function listClientCategories(): ClientCategorySummary[] {
+  return listCategories()
+    .filter((c) => c.id !== "spam_newsletter" && c.id !== "interne")
+    .map((c) => ({ id: c.id, label: c.label, slaMinutes: c.slaMinutes }));
+}
+
+/**
+ * Mise a jour limitee au delai de reponse promis (SLA) — jamais le libelle,
+ * l'activation de l'accuse automatique, ou la sequence de relance: ce sont
+ * les leviers reserves a l'admin (voir cahier des charges, "A exclure").
+ */
+export function updateClientCategorySla(categoryId: string, slaMinutes: number): void {
+  db.prepare("UPDATE categories SET sla_hours = ?, sla_minutes = ? WHERE id = ?").run(
+    slaMinutes / 60,
+    slaMinutes,
+    categoryId
+  );
 }
 
 export default db;

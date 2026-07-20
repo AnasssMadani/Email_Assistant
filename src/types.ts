@@ -13,6 +13,17 @@ export interface EmailMessage {
   subject: string;
   bodyText: string;
   receivedAt: Date;
+  // Determine par le connecteur (comparaison de l'adresse expediteur a la
+  // notre propre adresse) — jamais par classifyEmail() ou toute autre
+  // deduction IA a partir du contenu. Toute vue admin ou client qui affiche
+  // un jour un email ou un historique de fil doit distinguer "envoye par
+  // nous" de "recu du client" en lisant CE champ, pas en l'inferant du
+  // texte. Aucune vue actuelle (Journal, dossiers, dashboard client) n'
+  // affiche encore de contenu de message brut — les deux dashboards ne
+  // montrent que des metadonnees de dossier et des rappels (toujours des
+  // actions "nous"), donc la direction y est deja sans ambiguite par
+  // construction ; cette regle s'applique a la prochaine vue qui affichera
+  // un vrai historique de fil.
   isFromUs: boolean;
   /** Vrai si le message contient au moins une piece jointe (PDF, etc.) — permet a une relance automatique d'y faire reference sans l'inventer. */
   hasAttachments: boolean;

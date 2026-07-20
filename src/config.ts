@@ -62,6 +62,13 @@ export const config = {
     // Ancien mode de passe en clair, conserve uniquement pour compatibilite
     // ascendante. A migrer vers SETUP_PASSWORD_HASH.
     legacyPlaintextPassword: process.env.SETUP_PASSWORD ?? "",
+    // Identifiants separes pour le dashboard client (/client/...) — jamais
+    // le meme compte que l'admin, meme format de hash (voir
+    // npm run auth:hash-password). Si absents, le dashboard client s'ouvre
+    // sans mot de passe (meme convention que l'admin ci-dessus) — a ne
+    // jamais laisser ainsi hors localhost.
+    clientUsername: process.env.CLIENT_USERNAME ?? "",
+    clientPasswordHash: process.env.CLIENT_PASSWORD_HASH ?? "",
   },
   branding: {
     name: process.env.BRAND_NAME ?? "Accusé & Relance",
