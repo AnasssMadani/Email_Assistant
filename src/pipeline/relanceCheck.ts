@@ -5,6 +5,7 @@ import { cleanupUnusedDrafts } from "./draftCleanup.js";
 import { tagSource } from "./errorTag.js";
 import { buildReplySubject, urgencyMeetsThreshold } from "../utils.js";
 import {
+  freezeRelanceStepsSnapshot,
   getEffectiveRelanceSteps,
   incrementAutomatedOutboundCount,
   incrementPostReplyRelance,
@@ -94,6 +95,12 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
     if (!row.due_at) continue;
     if (!threadIdMatchesConnector(row.thread_id, connector.name)) continue;
 
+    // Fige la sequence sur la categorie telle qu'elle est LA, une bonne fois
+    // pour ce dossier — sans ca, corriger les delais d'une categorie plus
+    // tard rejaillirait en direct sur tous les dossiers deja en cours qui
+    // l'utilisent (voir freezeRelanceStepsSnapshot). No-op si deja fige ou
+    // personnalise.
+    freezeRelanceStepsSnapshot(row.thread_id, row.category_id, "pre_reply");
     const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "pre_reply");
     const nextStep = steps[row.relance_count];
     const fireAt = nextStep ? new Date(row.due_at).getTime() + nextStep.delayMinutes * 60_000 : null;
@@ -111,6 +118,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
     if (!row.human_replied_at) continue;
     if (!threadIdMatchesConnector(row.thread_id, connector.name)) continue;
 
+    freezeRelanceStepsSnapshot(row.thread_id, row.category_id, "post_reply");
     const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "post_reply");
     const nextStep = steps[row.post_reply_relance_count];
     const fireAt = nextStep ? new Date(row.human_replied_at).getTime() + nextStep.delayMinutes * 60_000 : null;

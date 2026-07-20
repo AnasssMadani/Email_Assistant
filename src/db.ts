@@ -142,6 +142,7 @@ ensureThreadAttachmentColumn();
 ensureCategoryAlertColumns();
 ensureSlaMinutesColumns();
 ensureAutomatedOutboundCountColumn();
+ensureRelanceSnapshotColumns();
 seedIfNeeded();
 
 /**
@@ -183,6 +184,23 @@ function ensureAutomatedOutboundCountColumn(): void {
   const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
   if (!columns.some((c) => c.name === "automated_outbound_count")) {
     db.exec("ALTER TABLE threads ADD COLUMN automated_outbound_count INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
+/**
+ * Migration additive: colonnes de gel de la sequence de relance (voir
+ * freezeRelanceStepsSnapshot ci-dessous). Nullable et vide par defaut — les
+ * dossiers deja en cours au moment de cette migration se figent au premier
+ * cycle de verification qui les relit, sur la base de la categorie telle
+ * qu'elle est a ce moment-la.
+ */
+function ensureRelanceSnapshotColumns(): void {
+  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
+  if (!columns.some((c) => c.name === "pre_reply_relance_snapshot")) {
+    db.exec("ALTER TABLE threads ADD COLUMN pre_reply_relance_snapshot TEXT");
+  }
+  if (!columns.some((c) => c.name === "post_reply_relance_snapshot")) {
+    db.exec("ALTER TABLE threads ADD COLUMN post_reply_relance_snapshot TEXT");
   }
 }
 
@@ -790,6 +808,48 @@ export function clearThreadRelanceOverride(threadId: string, phase: RelancePhase
   db.prepare(`DELETE FROM ${tableFor(phase)} WHERE owner_type = 'thread' AND owner_id = ?`).run(threadId);
 }
 
+function snapshotColumnFor(phase: RelancePhase): "pre_reply_relance_snapshot" | "post_reply_relance_snapshot" {
+  return phase === "post_reply" ? "post_reply_relance_snapshot" : "pre_reply_relance_snapshot";
+}
+
+function readRelanceStepsSnapshot(threadId: string, phase: RelancePhase): RelanceStep[] | null {
+  const column = snapshotColumnFor(phase);
+  const row = db.prepare(`SELECT ${column} AS snapshot FROM threads WHERE thread_id = ?`).get(threadId) as
+    | { snapshot: string | null }
+    | undefined;
+  if (!row?.snapshot) return null;
+  try {
+    return JSON.parse(row.snapshot) as RelanceStep[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fige la sequence de relance d'un dossier au moment ou runRelanceCheck
+ * l'examine pour la premiere fois dans une phase donnee: copie les etapes
+ * ACTUELLES de la categorie dans une colonne dediee au dossier (JSON), pour
+ * que les lectures suivantes utilisent ce cliche plutot que de relire la
+ * categorie en direct a chaque cycle. Sans ce gel, modifier les delais d'une
+ * categorie plus tard rejaillirait immediatement sur tous les dossiers deja
+ * en cours qui l'utilisent — y compris des relances externes envoyees a des
+ * clients bien plus tot ou plus tard que prevu, simplement parce que
+ * l'administrateur a corrige un reglage pour les PROCHAINS dossiers.
+ * Idempotent (n'ecrase jamais un gel deja pris) et sans effet si le dossier
+ * a deja une sequence personnalisee (owner_type='thread').
+ */
+export function freezeRelanceStepsSnapshot(threadId: string, categoryId: string, phase: RelancePhase): void {
+  if (hasThreadRelanceOverride(threadId, phase)) return;
+  const column = snapshotColumnFor(phase);
+  const row = db.prepare(`SELECT ${column} AS snapshot FROM threads WHERE thread_id = ?`).get(threadId) as
+    | { snapshot: string | null }
+    | undefined;
+  if (!row || row.snapshot !== null) return;
+
+  const steps = readSteps(phase, "category", categoryId);
+  db.prepare(`UPDATE threads SET ${column} = ? WHERE thread_id = ?`).run(JSON.stringify(steps), threadId);
+}
+
 export function getEffectiveRelanceSteps(
   threadId: string,
   categoryId: string,
@@ -797,6 +857,10 @@ export function getEffectiveRelanceSteps(
 ): { steps: RelanceStep[]; isCustom: boolean } {
   const overrideSteps = readSteps(phase, "thread", threadId);
   if (overrideSteps.length > 0) return { steps: overrideSteps, isCustom: true };
+
+  const snapshot = readRelanceStepsSnapshot(threadId, phase);
+  if (snapshot) return { steps: snapshot, isCustom: false };
+
   return { steps: readSteps(phase, "category", categoryId), isCustom: false };
 }
 

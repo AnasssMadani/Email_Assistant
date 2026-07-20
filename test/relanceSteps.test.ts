@@ -7,6 +7,7 @@ import {
   clearThreadRelanceOverride,
   deleteCategoryRelanceStep,
   deleteThreadData,
+  freezeRelanceStepsSnapshot,
   getCategoryRelanceSteps,
   getEffectiveRelanceSteps,
   getThreadRow,
@@ -216,4 +217,59 @@ test("a post-reply relance no longer makes the dossier eligible for the pre-repl
 
   assert.equal(preReplyEligible, false);
   assert.equal(postReplyEligible, true);
+});
+
+test("a dossier's relance sequence freezes at first check and ignores later category edits", () => {
+  // Regression: editing a category's delays used to apply live to every open
+  // dossier using that category's default sequence, since getEffectiveRelanceSteps
+  // read the category fresh on every cycle — a config change meant to affect
+  // future dossiers could suddenly make an already-waiting dossier "due" and
+  // fire an external relance to a client who was never supposed to get one at
+  // that moment. freezeRelanceStepsSnapshot() locks a dossier onto the
+  // category's steps as of its first check; later category edits must not
+  // reach it, while a brand-new dossier must still see the updated category.
+  const threadId = "t-frozen-snapshot";
+  upsertThreadReceived({
+    threadId,
+    subject: "Devis",
+    senderEmail: "g@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1440,
+    status: "ack_sent",
+    dueAt: new Date().toISOString(),
+  });
+
+  const stepsBeforeFreeze = getCategoryRelanceSteps("devis", "pre_reply");
+  freezeRelanceStepsSnapshot(threadId, "devis", "pre_reply");
+
+  // La categorie change APRES le gel de ce dossier.
+  addCategoryRelanceStep("devis", { channel: "external", delayMinutes: 555 }, "pre_reply");
+
+  const frozen = getEffectiveRelanceSteps(threadId, "devis", "pre_reply");
+  assert.equal(frozen.isCustom, false);
+  assert.deepEqual(frozen.steps, stepsBeforeFreeze);
+
+  const newCategorySteps = getCategoryRelanceSteps("devis", "pre_reply");
+  assert.equal(newCategorySteps.length, stepsBeforeFreeze.length + 1);
+
+  // Un dossier jamais fige voit, lui, la categorie a jour.
+  const freshThreadId = "t-fresh-after-category-change";
+  upsertThreadReceived({
+    threadId: freshThreadId,
+    subject: "Devis",
+    senderEmail: "h@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1440,
+    status: "ack_sent",
+    dueAt: new Date().toISOString(),
+  });
+  const fresh = getEffectiveRelanceSteps(freshThreadId, "devis", "pre_reply");
+  assert.deepEqual(fresh.steps, newCategorySteps);
+
+  // Nettoyage: ne pas polluer la categorie "devis" pour d'eventuels tests suivants.
+  deleteCategoryRelanceStep("devis", newCategorySteps[newCategorySteps.length - 1].order, "pre_reply");
 });
