@@ -24,6 +24,19 @@ export async function processIncomingMessage(
   if (message.isFromUs) return;
   if (isMessageProcessed(message.id)) return;
 
+  // Nos propres rappels internes (sendInternalNotification, relanceCheck.ts)
+  // portent toujours ce prefixe exact. Quand NOTIFICATION_EMAIL n'est pas
+  // definie, ce rappel part vers la messagerie connectee elle-meme — et sur
+  // certains fournisseurs, un envoi auto-adresse cree une copie "Inbox"
+  // avec un id DIFFERENT de la copie "Sent" deja marquee traitee par
+  // markMessageProcessed(sent.id, ...) dans sendInternalNotification. Sans
+  // ce garde-fou, cette copie Inbox est alors lue comme un vrai email
+  // client et recoit a tort un accuse de reception.
+  if (message.subject.startsWith("[Rappel]")) {
+    markMessageProcessed(message.id, message.threadId);
+    return;
+  }
+
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(message.threadId));
   const classification = await classifyEmail(thread, message);
   const category = getCategory(classification.categoryId);
