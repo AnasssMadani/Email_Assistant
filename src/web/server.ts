@@ -111,10 +111,18 @@ function parseAlertMode(value: string | undefined): { enabled: boolean; minUrgen
   return ALERT_MODES[(value as keyof typeof ALERT_MODES) ?? "normal"] ?? ALERT_MODES.normal;
 }
 
-/** Empeche une nouvelle etape d'avoir un delai plus court que la precedente (sequence croissante). */
+/**
+ * Empeche une nouvelle etape d'avoir un delai plus court OU EGAL a la
+ * precedente (sequence strictement croissante). Un delai egal semble anodin
+ * mais fait tomber les deux etapes sur le meme instant de declenchement
+ * (meme ancre + meme delai = meme fireAt) — runRelanceCheck n'avance qu'une
+ * etape par cycle, donc la seconde devient due des le cycle suivant (2 min
+ * plus tard avec la cadence par defaut), et le client recoit deux relances
+ * quasi coup sur coup au lieu d'un vrai suivi espace dans le temps.
+ */
 function clampAfterLastStep(steps: RelanceStep[], delayMinutes: number): number {
-  const lastDelay = steps.length ? steps[steps.length - 1].delayMinutes : 0;
-  return Math.max(delayMinutes, lastDelay);
+  const lastDelay = steps.length ? steps[steps.length - 1].delayMinutes : -1;
+  return Math.max(delayMinutes, lastDelay + 1);
 }
 
 // ---------- Sceau (public, avant l'authentification) ----------
