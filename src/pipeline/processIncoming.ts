@@ -10,7 +10,8 @@ import {
   isMessageProcessed,
   markMessageProcessed,
   upsertThreadReceived,
-  recordShadowLogEntry,
+  recordAckDraft,
+  recordClassification,
   setThreadAckSent,
   setThreadStatus,
   recordDraft,
@@ -47,6 +48,23 @@ export async function processIncomingMessage(
   const dueAt = shouldAcknowledge
     ? new Date(now + category.slaMinutes * 60_000).toISOString()
     : null;
+
+  // Journalise TOUTE classification, accuse ou non — sans ca, un email juge
+  // "pas d'accuse necessaire" (bruit, ou requiresAcknowledgement=false)
+  // n'est visible nulle part avec son contenu sur /carnet, rendant
+  // impossible de juger si l'IA l'a bien classifie (le but meme de la
+  // semaine pilote). L'accuse, s'il y en a un, complete cette ligne plus
+  // bas (voir recordAckDraft dans sendAcknowledgementAndDrafts).
+  recordClassification({
+    threadId: message.threadId,
+    messageId: message.id,
+    categoryId: category.id,
+    urgency: classification.urgency,
+    originalSubject: message.subject,
+    senderEmail: message.from.email,
+    senderName: message.from.name ?? null,
+    receivedBody: message.bodyText,
+  });
 
   upsertThreadReceived({
     threadId: message.threadId,
@@ -93,7 +111,7 @@ export async function sendAcknowledgementAndDrafts(
   const ack = await draftAcknowledgement(thread, incoming, category);
 
   if (config.shadowModeEnabled) {
-    recordShadowLogEntry({
+    recordAckDraft({
       threadId: incoming.threadId,
       messageId: incoming.id,
       categoryId: category.id,

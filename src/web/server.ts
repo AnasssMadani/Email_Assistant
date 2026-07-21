@@ -2091,33 +2091,47 @@ function renderCarnetPage(
   return pageShell(
     "carnet",
     "Carnet — semaine pilote",
-    `Ce que le pipeline a reçu et comment l'IA aurait répondu, sans rien envoyer au client. Seul le rappel personnel (${config.carnetRappelDelayMinutes} min sans réponse de l'équipe) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
+    `Tout ce que le pipeline a reçu et comment l'IA l'a classé (catégorie, urgence) — avec l'accusé qu'elle aurait rédigé quand il y en a un. Rien n'est envoyé au client. Seul le rappel personnel (${config.carnetRappelDelayMinutes} min sans réponse de l'équipe) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
     banner + analyseForm + renderCorpusPanel() + list
   );
 }
 
+const CARNET_URGENCY_LABELS: Record<string, string> = { low: "Faible", normal: "Normale", high: "Haute" };
+
 function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): string {
   const senderLabel = entry.senderName ? `${entry.senderName} <${entry.senderEmail}>` : entry.senderEmail;
-  return `<div class="ledger-row">
-    <div class="ledger-main">
-      <span class="stamp stamp-external" style="font-weight:700; margin-right:8px;" title="Catégorie choisie par l'IA">${escapeHtml(entry.categoryLabel)}</span>
-      <span class="subject-static">${escapeHtml(entry.originalSubject)}</span>
-      <div class="ledger-meta">${escapeHtml(senderLabel)} — reçu le ${escapeHtml(formatDateTime(entry.createdAt))}</div>
-      <div class="ledger-facts">
-        <div class="ledger-fact"><span class="fact-label">Accusé rédigé par l'IA</span><span class="fact-value">${escapeHtml(entry.ackBody).replace(/\n/g, "<br />")}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Rappel personnel</span><span class="fact-value">${entry.rappelEnvoye ? '<span class="stamp stamp-done">Envoyé</span>' : '<span class="stamp stamp-wait">Pas encore</span>'}</span></div>
-        <div class="ledger-fact"><span class="fact-label">Délai avant réponse humaine</span><span class="fact-value">${entry.humanReplyDelayMinutes === null ? "— pas encore répondu" : formatMinutesLabel(entry.humanReplyDelayMinutes)}</span></div>
-      </div>
-    </div>
-    <div class="ledger-actions">
-      <form method="POST" action="/carnet/${entry.id}/revue">
+  const urgencyLabel = entry.urgency ? (CARNET_URGENCY_LABELS[entry.urgency] ?? entry.urgency) : "—";
+
+  const ackFact = entry.ackDrafted
+    ? `<div class="ledger-fact"><span class="fact-label">Accusé rédigé par l'IA</span><span class="fact-value">${escapeHtml(entry.ackBody).replace(/\n/g, "<br />")}</span></div>`
+    : `<div class="ledger-fact"><span class="fact-label">Accusé</span><span class="fact-value">Aucun — l'IA a jugé qu'aucun accusé n'était nécessaire pour cet email.</span></div>`;
+
+  const reviewAction = entry.ackDrafted
+    ? `<form method="POST" action="/carnet/${entry.id}/revue">
         ${csrfField(csrfToken)}
         <div class="checkbox-cell">
           <input type="checkbox" id="revue-${entry.id}" name="reviewedOk" ${entry.reviewedOk ? "checked" : ""} />
           <label for="revue-${entry.id}">Aurait pu partir tel quel</label>
         </div>
         <button class="btn btn-sm" type="submit">Enregistrer</button>
-      </form>
+      </form>`
+    : "";
+
+  return `<div class="ledger-row">
+    <div class="ledger-main">
+      <span class="stamp stamp-external" style="font-weight:700; margin-right:8px;" title="Catégorie choisie par l'IA">${escapeHtml(entry.categoryLabel)}</span>
+      <span class="stamp stamp-internal" style="margin-right:8px;" title="Urgence choisie par l'IA">${escapeHtml(urgencyLabel)}</span>
+      <span class="subject-static">${escapeHtml(entry.originalSubject)}</span>
+      <div class="ledger-meta">${escapeHtml(senderLabel)} — reçu le ${escapeHtml(formatDateTime(entry.createdAt))}</div>
+      <div class="ledger-facts">
+        <div class="ledger-fact"><span class="fact-label">Email reçu</span><span class="fact-value">${escapeHtml(entry.receivedBody).replace(/\n/g, "<br />")}</span></div>
+        ${ackFact}
+        <div class="ledger-fact"><span class="fact-label">Rappel personnel</span><span class="fact-value">${entry.rappelEnvoye ? '<span class="stamp stamp-done">Envoyé</span>' : '<span class="stamp stamp-wait">Pas encore</span>'}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Délai avant réponse humaine</span><span class="fact-value">${entry.humanReplyDelayMinutes === null ? "— pas encore répondu" : formatMinutesLabel(entry.humanReplyDelayMinutes)}</span></div>
+      </div>
+    </div>
+    <div class="ledger-actions">
+      ${reviewAction}
     </div>
   </div>`;
 }

@@ -263,9 +263,29 @@ ensureSlaMinutesColumns();
 ensureAutomatedOutboundCountColumn();
 ensureRelanceSnapshotColumns();
 ensureReminderStepTypeColumn();
+ensureShadowLogClassificationColumns();
 seedIfNeeded();
 ensurePiloteCarnetCategories();
 syncCarnetRappelDelay();
+
+/**
+ * Migration additive: shadow_log ne couvrait au depart que les emails ayant
+ * reellement eu un accuse redige — un email classe "pas d'accuse necessaire"
+ * (categorie bruit, ou requiresAcknowledgement=false) n'apparaissait alors
+ * NULLE PART avec son contenu, rendant impossible de juger si l'IA l'a bien
+ * classifie. urgency + ack_drafted permettent desormais de journaliser
+ * TOUTE classification (voir recordClassification dans processIncoming.ts),
+ * l'accuse restant optionnel (ack_drafted=0 tant qu'aucun n'a ete redige).
+ */
+function ensureShadowLogClassificationColumns(): void {
+  const columns = db.prepare("PRAGMA table_info(shadow_log)").all() as unknown as { name: string }[];
+  if (!columns.some((c) => c.name === "urgency")) {
+    db.exec("ALTER TABLE shadow_log ADD COLUMN urgency TEXT");
+  }
+  if (!columns.some((c) => c.name === "ack_drafted")) {
+    db.exec("ALTER TABLE shadow_log ADD COLUMN ack_drafted INTEGER NOT NULL DEFAULT 1");
+  }
+}
 
 /**
  * Migration additive: les deploiements anterieurs a la bascule heures->minutes
@@ -1314,10 +1334,12 @@ export interface CarnetEntry {
   threadId: string;
   categoryId: string;
   categoryLabel: string;
+  urgency: string | null;
   originalSubject: string;
   senderEmail: string;
   senderName: string | null;
   receivedBody: string;
+  ackDrafted: boolean;
   ackSubject: string;
   ackBody: string;
   reviewedOk: boolean;
@@ -1331,10 +1353,12 @@ interface CarnetEntryRow {
   thread_id: string;
   category_id: string;
   category_label: string | null;
+  urgency: string | null;
   original_subject: string;
   sender_email: string;
   sender_name: string | null;
   received_body: string;
+  ack_drafted: number;
   ack_subject: string;
   ack_body: string;
   reviewed_ok: number;
@@ -1357,10 +1381,12 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
     threadId: row.thread_id,
     categoryId: row.category_id,
     categoryLabel: row.category_label ?? "Autre",
+    urgency: row.urgency,
     originalSubject: row.original_subject,
     senderEmail: row.sender_email,
     senderName: row.sender_name,
     receivedBody: row.received_body,
+    ackDrafted: row.ack_drafted === 1,
     ackSubject: row.ack_subject,
     ackBody: row.ack_body,
     reviewedOk: row.reviewed_ok === 1,
@@ -1370,7 +1396,49 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
   };
 }
 
-export function recordShadowLogEntry(params: {
+/**
+ * Journalise TOUTE classification (peu importe si un accuse suit) — sans ca,
+ * un email classe "pas d'accuse necessaire" (bruit, ou
+ * requiresAcknowledgement=false) n'est visible nulle part avec son contenu,
+ * rendant impossible de juger si l'IA l'a bien classifie. L'accuse, s'il y
+ * en a un, est ajoute ensuite via recordAckDraft (ack_drafted passe a 1).
+ */
+export function recordClassification(params: {
+  threadId: string;
+  messageId: string;
+  categoryId: string;
+  urgency: string;
+  originalSubject: string;
+  senderEmail: string;
+  senderName: string | null;
+  receivedBody: string;
+}): void {
+  db.prepare(
+    `INSERT INTO shadow_log (
+      thread_id, message_id, category_id, urgency, original_subject, sender_email, sender_name,
+      received_body, ack_subject, ack_body, ack_drafted, reviewed_ok, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0, 0, ?)`
+  ).run(
+    params.threadId,
+    params.messageId,
+    params.categoryId,
+    params.urgency,
+    params.originalSubject,
+    params.senderEmail,
+    params.senderName,
+    params.receivedBody,
+    new Date().toISOString()
+  );
+}
+
+/**
+ * Complete la ligne de classification (voir recordClassification) une fois
+ * l'accuse redige, en mode carnet. Si aucune ligne prealable n'existe (ex:
+ * retraitement manuel via POST /dossiers/:threadId/traiter, qui ne repasse
+ * pas par classifyEmail), insere une ligne directement plutot que de perdre
+ * cet accuse.
+ */
+export function recordAckDraft(params: {
   threadId: string;
   messageId: string;
   categoryId: string;
@@ -1381,31 +1449,36 @@ export function recordShadowLogEntry(params: {
   ackSubject: string;
   ackBody: string;
 }): void {
-  db.prepare(
-    `INSERT INTO shadow_log (
-      thread_id, message_id, category_id, original_subject, sender_email, sender_name,
-      received_body, ack_subject, ack_body, reviewed_ok, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
-  ).run(
-    params.threadId,
-    params.messageId,
-    params.categoryId,
-    params.originalSubject,
-    params.senderEmail,
-    params.senderName,
-    params.receivedBody,
-    params.ackSubject,
-    params.ackBody,
-    new Date().toISOString()
-  );
+  const result = db
+    .prepare("UPDATE shadow_log SET ack_subject = ?, ack_body = ?, ack_drafted = 1 WHERE message_id = ?")
+    .run(params.ackSubject, params.ackBody, params.messageId);
+  if (Number(result.changes) === 0) {
+    db.prepare(
+      `INSERT INTO shadow_log (
+        thread_id, message_id, category_id, urgency, original_subject, sender_email, sender_name,
+        received_body, ack_subject, ack_body, ack_drafted, reviewed_ok, created_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, 0, ?)`
+    ).run(
+      params.threadId,
+      params.messageId,
+      params.categoryId,
+      params.originalSubject,
+      params.senderEmail,
+      params.senderName,
+      params.receivedBody,
+      params.ackSubject,
+      params.ackBody,
+      new Date().toISOString()
+    );
+  }
 }
 
 export function listShadowLogEntries(limit = 500): CarnetEntry[] {
   const rows = db
     .prepare(
       `SELECT
-        s.id, s.thread_id, s.category_id, c.label AS category_label, s.original_subject,
-        s.sender_email, s.sender_name, s.received_body, s.ack_subject, s.ack_body,
+        s.id, s.thread_id, s.category_id, c.label AS category_label, s.urgency, s.original_subject,
+        s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body,
         s.reviewed_ok, s.created_at, t.received_at, t.human_replied_at,
         EXISTS(
           SELECT 1 FROM reminders r WHERE r.thread_id = s.thread_id AND r.step_type = 'relance_interne'
