@@ -7,6 +7,16 @@ import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, Urgency
 mkdirSync(path.dirname(path.resolve(config.dbPath)), { recursive: true });
 const db = new DatabaseSync(path.resolve(config.dbPath));
 
+/** Les 6 categories metier du mode carnet — voir ensurePiloteCarnetCategories/syncCarnetRappelDelay plus bas. Declaree ici (plutot qu'a cote de ces fonctions) pour etre initialisee avant leur appel au chargement du module. */
+const CARNET_BUSINESS_CATEGORY_IDS = [
+  "devis",
+  "reclamation",
+  "suivi_dossier",
+  "demande_facture",
+  "disponibilite_bad",
+  "relance_paiement_soa",
+];
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS threads (
     thread_id TEXT PRIMARY KEY,
@@ -142,6 +152,35 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
+  -- Mode "carnet" (semaine pilote, voir shadowModeEnabled): une ligne par
+  -- accuse REDIGE par l'IA mais jamais envoye ni depose en brouillon —
+  -- l'equivalent carnet de "accuse envoye a X" pour la page /carnet.
+  CREATE TABLE IF NOT EXISTS shadow_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    category_id TEXT NOT NULL,
+    original_subject TEXT NOT NULL,
+    sender_email TEXT NOT NULL,
+    sender_name TEXT,
+    received_body TEXT NOT NULL,
+    ack_subject TEXT NOT NULL,
+    ack_body TEXT NOT NULL,
+    reviewed_ok INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+
+  -- Corpus des vraies reponses de fond envoyees par l'equipe cette semaine,
+  -- par categorie — relu par la passe d'analyse (corpusAnalysis.ts) pour
+  -- generer une note de style par categorie (config/category-playbooks/).
+  CREATE TABLE IF NOT EXISTS human_reply_corpus (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    category_id TEXT NOT NULL,
+    reply_body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
 `);
 
 ensureDelayMinutesColumn();
@@ -153,6 +192,8 @@ ensureAutomatedOutboundCountColumn();
 ensureRelanceSnapshotColumns();
 ensureReminderStepTypeColumn();
 seedIfNeeded();
+ensurePiloteCarnetCategories();
+syncCarnetRappelDelay();
 
 /**
  * Migration additive: les deploiements anterieurs a la bascule heures->minutes
@@ -355,6 +396,83 @@ function seedIfNeeded(): void {
     for (const categoryId of existingCategoryIds) {
       writeSteps("post_reply", "category", categoryId, [{ channel: "external", delayMinutes: 3 * 1440 }]);
     }
+  }
+}
+
+/**
+ * Amorçage ponctuel du mode carnet (semaine pilote, transitaire): relabellise
+ * les 3 categories metier deja existantes, ajoute les 3 nouvelles, et les
+ * regle sur "toujours alerter l'equipe" (urgence min 'low'). Se declenche
+ * une seule fois: si "disponibilite_bad" existe deja, ce bloc a deja tourne,
+ * on ne reapplique rien pour ne jamais ecraser un reglage modifie depuis
+ * /reglages entre temps. N'affecte pas demande_information/candidature (hors
+ * perimetre metier pour ce client) ni les sequences post_reply (relances
+ * apres une vraie reponse humaine — comportement existant, inchange). Le
+ * delai du rappel lui-meme n'est PAS fige ici, voir syncCarnetRappelDelay
+ * ci-dessous.
+ */
+function ensurePiloteCarnetCategories(): void {
+  const already = db.prepare("SELECT 1 FROM categories WHERE id = 'disponibilite_bad'").get();
+  if (already) return;
+
+  const relabel: Array<{ id: string; label: string }> = [
+    { id: "devis", label: "Demande de devis" },
+    { id: "reclamation", label: "Réclamation" },
+    { id: "suivi_dossier", label: "Suivi de dossier" },
+  ];
+  const updateLabel = db.prepare("UPDATE categories SET label = ? WHERE id = ?");
+  for (const cat of relabel) {
+    updateLabel.run(cat.label, cat.id);
+  }
+
+  const newCategories: Array<{ id: string; label: string; slaHours: number }> = [
+    { id: "demande_facture", label: "Demande de facture", slaHours: 24 },
+    // Souvent urgent (marchandise potentiellement bloquee, frais de
+    // stockage qui courent) — SLA plus court par defaut, ajustable ensuite.
+    { id: "disponibilite_bad", label: "Disponibilité de BAD", slaHours: 4 },
+    { id: "relance_paiement_soa", label: "Relance de paiement SOA", slaHours: 48 },
+  ];
+  const maxOrderRow = db
+    .prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM categories")
+    .get() as { m: number };
+  const insertCategory = db.prepare(
+    `INSERT INTO categories (
+      id, label, sla_hours, sla_minutes, acknowledge_automatically, sort_order,
+      internal_alerts_enabled, internal_alerts_min_urgency
+    ) VALUES (?, ?, ?, ?, 1, ?, 1, 'low')`
+  );
+  newCategories.forEach((cat, index) => {
+    insertCategory.run(cat.id, cat.label, cat.slaHours, cat.slaHours * 60, maxOrderRow.m + 1 + index);
+  });
+
+  const updateAlerts = db.prepare(
+    "UPDATE categories SET internal_alerts_enabled = 1, internal_alerts_min_urgency = 'low' WHERE id = ?"
+  );
+  for (const id of CARNET_BUSINESS_CATEGORY_IDS) {
+    updateAlerts.run(id);
+  }
+}
+
+/**
+ * Contrairement a ensurePiloteCarnetCategories, tourne a CHAQUE demarrage:
+ * remet la sequence pre_reply des 6 categories metier a une seule etape
+ * "rappel interne" au delai actuellement configure
+ * (config.carnetRappelDelayMinutes, reglable via CARNET_RAPPEL_DELAY_MINUTES
+ * sur Render sans toucher au code — ex. 1 min pour tester, 30 en usage reel).
+ * Un redemarrage suffit donc a appliquer un nouveau delai. Contrepartie
+ * assumee: toute personnalisation manuelle de CES categories precises
+ * depuis /reglages (etapes pre_reply) sera ecrasee au prochain demarrage —
+ * le reglage voulu ici est bien la variable d'environnement, pas /reglages,
+ * tant que le mode carnet est actif. Ne fige aucune categorie qui n'existe
+ * pas encore (ordre d'appel: apres ensurePiloteCarnetCategories).
+ */
+function syncCarnetRappelDelay(): void {
+  for (const id of CARNET_BUSINESS_CATEGORY_IDS) {
+    const exists = db.prepare("SELECT 1 FROM categories WHERE id = ?").get(id);
+    if (!exists) continue;
+    writeSteps("pre_reply", "category", id, [
+      { channel: "internal", delayMinutes: config.carnetRappelDelayMinutes },
+    ]);
   }
 }
 
@@ -1065,6 +1183,143 @@ export function incrementAutomatedOutboundCount(threadId: string): void {
   db.prepare(
     "UPDATE threads SET automated_outbound_count = automated_outbound_count + 1 WHERE thread_id = ?"
   ).run(threadId);
+}
+
+// ==================== Mode carnet (semaine pilote) ====================
+
+export interface CarnetEntry {
+  id: number;
+  threadId: string;
+  categoryId: string;
+  categoryLabel: string;
+  originalSubject: string;
+  senderEmail: string;
+  senderName: string | null;
+  receivedBody: string;
+  ackSubject: string;
+  ackBody: string;
+  reviewedOk: boolean;
+  createdAt: string;
+  rappelEnvoye: boolean;
+  humanReplyDelayMinutes: number | null;
+}
+
+interface CarnetEntryRow {
+  id: number;
+  thread_id: string;
+  category_id: string;
+  category_label: string | null;
+  original_subject: string;
+  sender_email: string;
+  sender_name: string | null;
+  received_body: string;
+  ack_subject: string;
+  ack_body: string;
+  reviewed_ok: number;
+  created_at: string;
+  rappel_envoye: number;
+  received_at: string | null;
+  human_replied_at: string | null;
+}
+
+function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
+  const humanReplyDelayMinutes =
+    row.received_at && row.human_replied_at
+      ? Math.max(
+          0,
+          Math.round((new Date(row.human_replied_at).getTime() - new Date(row.received_at).getTime()) / 60_000)
+        )
+      : null;
+  return {
+    id: row.id,
+    threadId: row.thread_id,
+    categoryId: row.category_id,
+    categoryLabel: row.category_label ?? "Autre",
+    originalSubject: row.original_subject,
+    senderEmail: row.sender_email,
+    senderName: row.sender_name,
+    receivedBody: row.received_body,
+    ackSubject: row.ack_subject,
+    ackBody: row.ack_body,
+    reviewedOk: row.reviewed_ok === 1,
+    createdAt: row.created_at,
+    rappelEnvoye: row.rappel_envoye === 1,
+    humanReplyDelayMinutes,
+  };
+}
+
+export function recordShadowLogEntry(params: {
+  threadId: string;
+  messageId: string;
+  categoryId: string;
+  originalSubject: string;
+  senderEmail: string;
+  senderName: string | null;
+  receivedBody: string;
+  ackSubject: string;
+  ackBody: string;
+}): void {
+  db.prepare(
+    `INSERT INTO shadow_log (
+      thread_id, message_id, category_id, original_subject, sender_email, sender_name,
+      received_body, ack_subject, ack_body, reviewed_ok, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+  ).run(
+    params.threadId,
+    params.messageId,
+    params.categoryId,
+    params.originalSubject,
+    params.senderEmail,
+    params.senderName,
+    params.receivedBody,
+    params.ackSubject,
+    params.ackBody,
+    new Date().toISOString()
+  );
+}
+
+export function listShadowLogEntries(limit = 500): CarnetEntry[] {
+  const rows = db
+    .prepare(
+      `SELECT
+        s.id, s.thread_id, s.category_id, c.label AS category_label, s.original_subject,
+        s.sender_email, s.sender_name, s.received_body, s.ack_subject, s.ack_body,
+        s.reviewed_ok, s.created_at, t.received_at, t.human_replied_at,
+        EXISTS(
+          SELECT 1 FROM reminders r WHERE r.thread_id = s.thread_id AND r.step_type = 'relance_interne'
+        ) AS rappel_envoye
+       FROM shadow_log s
+       LEFT JOIN categories c ON c.id = s.category_id
+       LEFT JOIN threads t ON t.thread_id = s.thread_id
+       ORDER BY s.created_at DESC
+       LIMIT ?`
+    )
+    .all(limit) as unknown as CarnetEntryRow[];
+  return rows.map(toCarnetEntry);
+}
+
+export function setShadowLogReviewed(id: number, reviewed: boolean): void {
+  db.prepare("UPDATE shadow_log SET reviewed_ok = ? WHERE id = ?").run(reviewed ? 1 : 0, id);
+}
+
+export function recordHumanReplyCorpus(params: { threadId: string; categoryId: string; replyBody: string }): void {
+  db.prepare(
+    "INSERT INTO human_reply_corpus (thread_id, category_id, reply_body, created_at) VALUES (?, ?, ?, ?)"
+  ).run(params.threadId, params.categoryId, params.replyBody, new Date().toISOString());
+}
+
+export function listCategoriesWithCorpus(): string[] {
+  const rows = db.prepare("SELECT DISTINCT category_id FROM human_reply_corpus").all() as unknown as {
+    category_id: string;
+  }[];
+  return rows.map((r) => r.category_id);
+}
+
+export function listHumanReplyCorpusByCategory(categoryId: string): string[] {
+  const rows = db
+    .prepare("SELECT reply_body FROM human_reply_corpus WHERE category_id = ? ORDER BY created_at ASC")
+    .all(categoryId) as unknown as { reply_body: string }[];
+  return rows.map((r) => r.reply_body);
 }
 
 // ==================== Projections dashboard client ====================

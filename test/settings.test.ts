@@ -29,7 +29,10 @@ test("seeded internal-alert defaults favor high-stakes categories, stay quiet on
   assert.equal(byId.get("reclamation")?.internalAlertsMinUrgency, "low");
 
   assert.equal(byId.get("devis")?.internalAlertsEnabled, true);
-  assert.equal(byId.get("devis")?.internalAlertsMinUrgency, "normal");
+  // Mode carnet (semaine pilote): les 6 categories metier alertent
+  // systematiquement (seuil "low"), voir ensurePiloteCarnetCategories dans
+  // db.ts — devis n'est plus au seuil "normal" par defaut du seed d'origine.
+  assert.equal(byId.get("devis")?.internalAlertsMinUrgency, "low");
 
   // Categories a fort volume / faible enjeu: pas d'alerte par defaut, pour ne
   // pas noyer la boite de l'equipe sous des rappels pour des demandes banales.

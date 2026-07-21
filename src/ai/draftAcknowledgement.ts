@@ -2,7 +2,7 @@ import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { recordUsage, withRetry } from "./structured.js";
-import { loadBrandVoice } from "../config.js";
+import { loadBrandVoice, loadCategoryPlaybook } from "../config.js";
 import { formatSingleMessage, formatSlaForPrompt, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
 
@@ -31,6 +31,10 @@ async function draftAcknowledgementOnce(
 ): Promise<AckDraft> {
   const client = getClient();
   const brandVoice = loadBrandVoice();
+  // Vide tant qu'aucune analyse de corpus n'a encore tourne pour cette
+  // categorie (voir corpusAnalysis.ts) — une chaine vide ne change rien au
+  // prompt, ce n'est pas une erreur.
+  const categoryPlaybook = loadCategoryPlaybook(category.id);
 
   const tool: Anthropic.Tool = {
     name: "write_acknowledgement",
@@ -54,6 +58,8 @@ async function draftAcknowledgementOnce(
       LANGUAGE_INSTRUCTION,
       "",
       brandVoice,
+      "",
+      categoryPlaybook,
       "",
       "Regles strictes:",
       "- Cite explicitement l'objet reel de la demande (pas de formule generique du type",

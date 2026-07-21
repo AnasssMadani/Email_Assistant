@@ -10,6 +10,7 @@ import {
   isMessageProcessed,
   markMessageProcessed,
   upsertThreadReceived,
+  recordShadowLogEntry,
   setThreadAckSent,
   setThreadStatus,
   recordDraft,
@@ -90,6 +91,33 @@ export async function sendAcknowledgementAndDrafts(
   const replySubject = buildReplySubject(incoming.subject);
 
   const ack = await draftAcknowledgement(thread, incoming, category);
+
+  if (config.shadowModeEnabled) {
+    recordShadowLogEntry({
+      threadId: incoming.threadId,
+      messageId: incoming.id,
+      categoryId: category.id,
+      originalSubject: incoming.subject,
+      senderEmail: incoming.from.email,
+      senderName: incoming.from.name ?? null,
+      receivedBody: incoming.bodyText,
+      ackSubject: replySubject,
+      ackBody: ack.body,
+    });
+    // Pas d'envoi reel, mais on fait quand meme avancer le dossier en
+    // pre_reply pour que le rappel interne (30 min, seul envoi reel
+    // autorise cette semaine, voir relanceCheck.ts) se declenche
+    // normalement. incrementAutomatedOutboundCount n'est PAS appele: aucun
+    // message reel n'a rejoint le fil, donc automated_outbound_count doit
+    // rester a 0 de notre cote — sinon une VRAIE reponse de l'equipe (le
+    // fil, relu, contient alors un message isFromUs de plus que ce
+    // compteur) ne serait plus jamais detectee comme reponse humaine (voir
+    // checkPreReplyThread dans relanceCheck.ts).
+    setThreadAckSent(incoming.threadId);
+    console.log(`[mode carnet] accuse redige (non envoye) pour ${incoming.from.email} — "${incoming.subject}"`);
+    return;
+  }
+
   await tagSource("Messagerie — envoi de l'accusé", () =>
     connector.sendReply({
       threadId: incoming.threadId,

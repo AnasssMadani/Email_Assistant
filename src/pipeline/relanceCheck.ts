@@ -13,6 +13,7 @@ import {
   listThreadsAwaitingClientReply,
   listThreadsAwaitingReply,
   markMessageProcessed,
+  recordHumanReplyCorpus,
   recordPipelineError,
   recordReminder,
   setThreadHumanReplied,
@@ -158,6 +159,14 @@ export async function checkPreReplyThread(
       : undefined;
 
   if (replyAfterAck) {
+    // Corpus des vraies reponses de l'equipe (mode carnet — voir
+    // corpusAnalysis.ts): capture le contenu tel quel, avant toute autre
+    // logique, pour apprendre le ton/la structure reellement employes.
+    recordHumanReplyCorpus({
+      threadId: row.thread_id,
+      categoryId: row.category_id,
+      replyBody: replyAfterAck.bodyText,
+    });
     // Un humain vient de repondre de fond: ce n'est plus "notre equipe est
     // en retard", c'est desormais "on attend le client" — nouvelle phase.
     // On retient si cette reponse contenait une piece jointe (ex: grille
@@ -365,27 +374,47 @@ function mailboxSearchHint(connector: EmailConnector, row: ThreadRow): string {
   return `Retrouvez l'échange dans la messagerie en recherchant l'expéditeur (${row.sender_email}) ou l'objet ("${row.subject}").`;
 }
 
+const URGENCY_LABELS: Record<string, string> = { low: "Faible", normal: "Normale", high: "Haute" };
+
 /**
  * Envoie une vraie notification email pour un rappel interne — auparavant
  * seulement journalise en base (invisible sans ouvrir l'application). Part
  * vers NOTIFICATION_EMAIL si defini, sinon vers la messagerie connectee
- * elle-meme (un pense-bete dans sa propre boite). Best-effort: un echec
- * d'envoi ne doit pas empecher le rappel d'etre journalise normalement.
+ * elle-meme (un pense-bete dans sa propre boite). Volontairement tres
+ * visible (bandeau, sujet marque) — mode carnet: c'est le SEUL email reel
+ * envoye cette semaine, il doit sauter aux yeux dans une boite chargee.
+ * Best-effort: un echec d'envoi ne doit pas empecher le rappel d'etre
+ * journalise normalement.
  */
 async function sendInternalNotification(connector: EmailConnector, row: ThreadRow, note: string): Promise<void> {
   try {
     const ownEmail = await connector.getOwnEmailAddress();
     const to = config.notificationEmail || ownEmail;
     const categoryLabel = getCategory(row.category_id).label;
+    const receivedAtLabel = new Date(row.received_at).toLocaleString("fr-FR", { timeZone: config.timezone });
+    const separator = "--------------------------------------------------";
     const sent = await connector.sendNotification({
       to,
-      subject: `[Rappel] ${row.subject}`,
+      // Le prefixe exact "[Rappel]" doit rester en tete du sujet, quoi qu'on
+      // ajoute apres: processIncoming.ts s'en sert pour ignorer l'echo de ce
+      // meme email si NOTIFICATION_EMAIL est vide (voir le garde-fou "[Rappel] "
+      // dans processIncoming.ts).
+      subject: `[Rappel] 🚨 DOSSIER SANS RÉPONSE — ${row.subject}`,
       bodyText: [
+        "🚨🚨🚨 RAPPEL — DOSSIER SANS RÉPONSE DE L'ÉQUIPE 🚨🚨🚨",
+        "==================================================",
+        "",
         note,
         "",
-        `Objet: ${row.subject}`,
-        `Client: ${row.sender_name ? `${row.sender_name} ` : ""}<${row.sender_email}>`,
-        `Categorie: ${categoryLabel}`,
+        separator,
+        "DÉTAILS DU DOSSIER",
+        separator,
+        `Objet ........... ${row.subject}`,
+        `Expéditeur ...... ${row.sender_name ? `${row.sender_name} ` : ""}<${row.sender_email}>`,
+        `Catégorie ....... ${categoryLabel}`,
+        `Urgence ......... ${URGENCY_LABELS[row.urgency] ?? row.urgency}`,
+        `Reçu le ......... ${receivedAtLabel}`,
+        separator,
         "",
         mailboxSearchHint(connector, row),
       ].join("\n"),

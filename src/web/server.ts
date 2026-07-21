@@ -10,6 +10,7 @@ import { createEmailConnector } from "../connectors/index.js";
 import { cleanupUnusedDrafts } from "../pipeline/draftCleanup.js";
 import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCheck.js";
 import { sendAcknowledgementAndDrafts } from "../pipeline/processIncoming.js";
+import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
 import { getCategory } from "../settings.js";
 import {
   addCategoryRelanceStep,
@@ -31,14 +32,17 @@ import {
   listRecentAiUsage,
   listReminders,
   listRecentThreads,
+  listShadowLogEntries,
   markMessageProcessed,
   recordPipelineError,
+  setShadowLogReviewed,
   setThreadHumanReplied,
   setThreadStatus,
   updateCategory,
   upsertThreadReceived,
   type AiUsageEventRow,
   type AiUsageSummary,
+  type CarnetEntry,
   type PipelineErrorRow,
   type RelancePhase,
   type ReminderRow,
@@ -671,6 +675,46 @@ app.post("/envois/suivre", requireCsrf, (req: Request, res: Response) => {
   }
 });
 
+// ---------- Mode carnet (semaine pilote — accuses redige-mais-non-envoye) ----------
+
+app.get("/carnet", (req: Request, res: Response) => {
+  const entries = listShadowLogEntries();
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderCarnetPage(entries, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error));
+});
+
+function runOrRedirectCarnetError(res: Response, context: string, action: () => void): void {
+  try {
+    action();
+  } catch (err) {
+    console.error(`[${context}] erreur:`, err);
+    recordPipelineError(context, null, (err as Error).message);
+    res.redirect("/carnet?error=1");
+    return;
+  }
+  res.redirect("/carnet?saved=1");
+}
+
+app.post("/carnet/:id/revue", requireCsrf, (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const body = req.body as Record<string, string>;
+  runOrRedirectCarnetError(res, "carnet_revue", () => {
+    setShadowLogReviewed(id, body.reviewedOk === "on");
+  });
+});
+
+app.post("/carnet/analyser", requireCsrf, async (req: Request, res: Response) => {
+  try {
+    await runCorpusAnalysis();
+  } catch (err) {
+    console.error("[carnet_analyser] erreur:", err);
+    recordPipelineError("carnet_analyser", null, (err as Error).message);
+    res.redirect("/carnet?error=1");
+    return;
+  }
+  res.redirect("/carnet?saved=1");
+});
+
 // ---------- Ton de marque (gabarit lu par l'IA avant chaque redaction) ----------
 
 app.get("/ton-de-marque", (req: Request, res: Response) => {
@@ -706,6 +750,7 @@ type ActivePage =
   | "reglages"
   | "journal"
   | "envois"
+  | "carnet"
   | "consommation"
   | "ton-de-marque"
   | "confidentialite";
@@ -737,6 +782,7 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
     <a href="/reglages" class="${active === "reglages" ? "active" : ""}">Réglages</a>
     <a href="/journal" class="${active === "journal" ? "active" : ""}">Journal</a>
     <a href="/envois" class="${active === "envois" ? "active" : ""}">Envois</a>
+    <a href="/carnet" class="${active === "carnet" ? "active" : ""}">Carnet</a>
     <a href="/consommation" class="${active === "consommation" ? "active" : ""}">Consommation IA</a>
     <a href="/ton-de-marque" class="${active === "ton-de-marque" ? "active" : ""}">Ton de marque</a>
     <form method="POST" action="/logout"><button class="btn-link" type="submit">Déconnexion</button></form>
@@ -1536,6 +1582,7 @@ const AI_CALL_TYPE_LABELS: Record<string, string> = {
   brouillons_reponse: "Rédaction des 3 brouillons de réponse",
   relance_pre_reponse: "Rédaction d'une relance (avant notre réponse)",
   relance_post_reponse: "Rédaction d'une relance (après notre réponse)",
+  analyse_corpus: "Analyse du corpus de réponses (mode carnet)",
 };
 
 function aiCallTypeLabel(callType: string): string {
@@ -1766,6 +1813,74 @@ function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined):
             </form>`
           : `<span class="stamp stamp-skip">Destinataire inconnu</span>`
       }
+    </div>
+  </div>`;
+}
+
+// ---------- Mode carnet ----------
+
+function formatMinutesLabel(minutes: number): string {
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
+}
+
+function renderCarnetPage(
+  entries: CarnetEntry[],
+  csrfToken: string | undefined,
+  saved: string | undefined,
+  error: string | undefined
+): string {
+  const banner = error
+    ? `<div class="banner banner-error">L'action a échoué — voir la page <a href="/journal">Journal</a>.</div>`
+    : saved
+      ? `<div class="banner banner-ok">Enregistré.</div>`
+      : "";
+
+  const analyseForm = `<form method="POST" action="/carnet/analyser" style="margin-bottom:16px;">
+    ${csrfField(csrfToken)}
+    <button class="btn btn-primary btn-sm" type="submit">Analyser le corpus maintenant</button>
+    <span class="ledger-meta">Relit les vraies réponses de l'équipe reçues jusqu'ici et met à jour la note de style par catégorie.</span>
+  </form>`;
+
+  const list = entries.length
+    ? `<div class="ledger">
+        <div class="ledger-head"><span>Email reçu</span></div>
+        ${entries.map((e) => renderCarnetRow(e, csrfToken)).join("")}
+      </div>`
+    : `<div class="ledger"><div class="empty">Aucun accusé rédigé pour l'instant cette semaine.</div></div>`;
+
+  return pageShell(
+    "carnet",
+    "Carnet — semaine pilote",
+    `Ce que le pipeline a reçu et comment l'IA aurait répondu, sans rien envoyer au client. Seul le rappel personnel (${config.carnetRappelDelayMinutes} min sans réponse de l'équipe) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
+    banner + analyseForm + list
+  );
+}
+
+function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): string {
+  const senderLabel = entry.senderName ? `${entry.senderName} <${entry.senderEmail}>` : entry.senderEmail;
+  return `<div class="ledger-row">
+    <div class="ledger-main">
+      <span class="stamp stamp-external" style="font-weight:700; margin-right:8px;" title="Catégorie choisie par l'IA">${escapeHtml(entry.categoryLabel)}</span>
+      <span class="subject-static">${escapeHtml(entry.originalSubject)}</span>
+      <div class="ledger-meta">${escapeHtml(senderLabel)} — reçu le ${escapeHtml(formatDateTime(entry.createdAt))}</div>
+      <div class="ledger-facts">
+        <div class="ledger-fact"><span class="fact-label">Accusé rédigé par l'IA</span><span class="fact-value">${escapeHtml(entry.ackBody).replace(/\n/g, "<br />")}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Rappel personnel</span><span class="fact-value">${entry.rappelEnvoye ? '<span class="stamp stamp-done">Envoyé</span>' : '<span class="stamp stamp-wait">Pas encore</span>'}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Délai avant réponse humaine</span><span class="fact-value">${entry.humanReplyDelayMinutes === null ? "— pas encore répondu" : formatMinutesLabel(entry.humanReplyDelayMinutes)}</span></div>
+      </div>
+    </div>
+    <div class="ledger-actions">
+      <form method="POST" action="/carnet/${entry.id}/revue">
+        ${csrfField(csrfToken)}
+        <div class="checkbox-cell">
+          <input type="checkbox" id="revue-${entry.id}" name="reviewedOk" ${entry.reviewedOk ? "checked" : ""} />
+          <label for="revue-${entry.id}">Aurait pu partir tel quel</label>
+        </div>
+        <button class="btn btn-sm" type="submit">Enregistrer</button>
+      </form>
     </div>
   </div>`;
 }

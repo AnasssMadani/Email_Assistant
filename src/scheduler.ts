@@ -4,6 +4,7 @@ import { createEmailConnector } from "./connectors/index.js";
 import { discoverOutboundOnlyThreads } from "./pipeline/discoverOutbound.js";
 import { processIncomingMessage } from "./pipeline/processIncoming.js";
 import { runRelanceCheck } from "./pipeline/relanceCheck.js";
+import { runCorpusAnalysis } from "./pipeline/corpusAnalysis.js";
 import { recordPipelineError } from "./db.js";
 
 // Un traitement d'email (classification + accuse + 3 brouillons, plusieurs
@@ -14,6 +15,7 @@ import { recordPipelineError } from "./db.js";
 let pollInProgress = false;
 let relanceCheckInProgress = false;
 let discoverOutboundInProgress = false;
+let corpusAnalysisInProgress = false;
 
 async function pollInbox(): Promise<void> {
   if (pollInProgress) {
@@ -72,6 +74,18 @@ async function discoverOutbound(): Promise<void> {
   }
 }
 
+async function runDailyCorpusAnalysis(): Promise<void> {
+  if (corpusAnalysisInProgress) return;
+  corpusAnalysisInProgress = true;
+  try {
+    await runCorpusAnalysis();
+  } catch (err) {
+    console.error("[analyse corpus] erreur:", err);
+  } finally {
+    corpusAnalysisInProgress = false;
+  }
+}
+
 export function startScheduler(): void {
   console.log(`Connecteur actif au demarrage: ${createEmailConnector().name}`);
   console.log(`Scrutation boite: ${config.pollIntervalCron}`);
@@ -83,4 +97,10 @@ export function startScheduler(): void {
   cron.schedule(config.pollIntervalCron, () => void pollInbox());
   cron.schedule(config.pollIntervalCron, () => void discoverOutbound());
   cron.schedule(config.relanceCheckCron, () => void checkRelances());
+  // Pas de declenchement immediat au demarrage (contrairement a pollInbox/
+  // discoverOutbound): en debut de semaine pilote le corpus est vide, inutile
+  // de lancer un appel Claude a chaque redemarrage. Le bouton "Analyser
+  // maintenant" de /carnet couvre le besoin de la lancer avant l'horaire
+  // planifie.
+  cron.schedule(config.dailyAnalysisCron, () => void runDailyCorpusAnalysis());
 }

@@ -8,6 +8,7 @@ import {
   incrementAutomatedOutboundCount,
   incrementPostReplyRelance,
   incrementRelance,
+  listHumanReplyCorpusByCategory,
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
@@ -232,4 +233,39 @@ test("checkPostReplyThread still detects the client's reply after the post-reply
 
   const row = getThreadRow(threadId);
   assert.equal(row?.status, "responded");
+});
+
+test("checkPreReplyThread records the human's real reply body in the corpus (mode carnet learning material)", async () => {
+  const threadId = "t-corpus-capture";
+
+  upsertThreadReceived({
+    threadId,
+    subject: "Devis",
+    senderEmail: "client@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1,
+    status: "ack_sent",
+    dueAt: new Date(Date.now() - 4 * 60_000).toISOString(),
+  });
+  setThreadAckSent(threadId);
+  // Pas d'incrementAutomatedOutboundCount ici: automated_outbound_count reste
+  // a 0, pour que le seul message isFromUs du fil (la reponse humaine
+  // ci-dessous) soit au-dela du compteur et donc detecte comme une vraie
+  // reponse (voir la logique de comptage dans checkPreReplyThread).
+  const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
+  const humanReply = fakeMessage({
+    id: "m-human",
+    threadId,
+    isFromUs: true,
+    receivedAt: new Date(),
+    bodyText: "Voici votre devis en piece jointe, cordialement.",
+  });
+  const connector = fakeConnector({ id: threadId, messages: [clientMessage, humanReply] });
+
+  await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+
+  const corpus = listHumanReplyCorpusByCategory("devis");
+  assert.ok(corpus.includes("Voici votre devis en piece jointe, cordialement."));
 });

@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 function required(name: string): string {
@@ -55,6 +55,26 @@ export const config = {
   // notification part alors vers la messagerie connectee elle-meme, comme
   // un pense-bete dans sa propre boite plutot que dans le vide.
   notificationEmail: process.env.NOTIFICATION_EMAIL ?? "",
+  // Mode "carnet" (semaine pilote): le pipeline classe et redige normalement,
+  // mais aucun accuse/brouillon n'est reellement envoye ni depose — tout est
+  // journalise dans shadow_log a la place (voir processIncoming.ts). Seul le
+  // rappel interne personnel reste un envoi reel. Permanent tant que
+  // desactive manuellement (pas de bascule automatique, pas de date de fin).
+  shadowModeEnabled: process.env.SHADOW_MODE === "true",
+  // Delai (en minutes) du rappel interne des 6 categories metier du mode
+  // carnet — voir syncCarnetRappelDelay() dans db.ts, applique a CHAQUE
+  // demarrage (contrairement au reste de ensurePiloteCarnetCategories, qui
+  // ne tourne qu'une fois). Reglable depuis Render sans toucher au code:
+  // ex. 1 pour tester en quelques minutes, 30 en usage reel.
+  carnetRappelDelayMinutes: Number(process.env.CARNET_RAPPEL_DELAY_MINUTES ?? 30),
+  // Dossier des notes de style par categorie, generees a partir du corpus des
+  // vraies reponses de l'equipe (voir src/pipeline/corpusAnalysis.ts) et
+  // relues par le prompt de redaction de l'accuse.
+  categoryPlaybooksDir: process.env.CATEGORY_PLAYBOOKS_DIR ?? "./config/category-playbooks",
+  // Frequence de la passe d'analyse du corpus (voir corpusAnalysis.ts). Nuit,
+  // faible trafic — un declenchement manuel depuis /carnet reste disponible
+  // pour ne pas attendre l'horaire planifie avant la reunion de fin de semaine.
+  dailyAnalysisCron: process.env.DAILY_ANALYSIS_CRON ?? "0 3 * * *",
   auth: {
     username: process.env.SETUP_USERNAME ?? "",
     // Format "salt:hash" genere par `npm run auth:hash-password -- "motdepasse"`.
@@ -109,4 +129,27 @@ export function loadBrandVoice(): string {
 /** Ecrit le ton de marque depuis la page /ton-de-marque — evite d'avoir a editer le fichier a la main ou redeployer pour ajuster le style des emails generes. */
 export function saveBrandVoice(content: string): void {
   writeFileSync(path.resolve(config.brandVoicePath), content, "utf-8");
+}
+
+function categoryPlaybookPath(categoryId: string): string {
+  return path.join(path.resolve(config.categoryPlaybooksDir), `${categoryId}.md`);
+}
+
+/**
+ * Contrairement a loadBrandVoice, tous les fichiers n'existent pas encore en
+ * debut de semaine pilote (une categorie sans corpus n'a jamais ete
+ * analysee) — l'absence de fichier n'est pas une erreur, juste "pas encore
+ * de note de style", donc chaine vide plutot qu'une exception.
+ */
+export function loadCategoryPlaybook(categoryId: string): string {
+  try {
+    return readFileSync(categoryPlaybookPath(categoryId), "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+export function saveCategoryPlaybook(categoryId: string, content: string): void {
+  mkdirSync(path.resolve(config.categoryPlaybooksDir), { recursive: true });
+  writeFileSync(categoryPlaybookPath(categoryId), content, "utf-8");
 }
