@@ -192,6 +192,21 @@ export async function checkPreReplyThread(
       );
       return;
     }
+
+    // Mode carnet: "rien ne part jamais vers le client" couvre TOUTE relance
+    // externe, pas seulement l'accuse — pas de version partielle ou de
+    // brouillon ici (hors scope, voir brief), juste la sequence qui avance
+    // sans rien envoyer, comme pour une alerte interne filtree.
+    if (config.shadowModeEnabled) {
+      recordReminder(
+        row.thread_id,
+        "internal",
+        `[mode carnet] Relance externe qui aurait ete envoyee a ${row.sender_email} pour "${row.subject}" — non envoyee (mode carnet actif).`
+      );
+      incrementRelance(row.thread_id, "relance_sent");
+      return;
+    }
+
     if (!tryConsumeExternalBudget(externalBudget)) {
       console.log(
         `[relance externe] "${row.subject}" — differee (limite de ${config.maxExternalRelancesPerCycle} relances externes/cycle atteinte), retentera au prochain cycle.`
@@ -297,6 +312,20 @@ export async function checkPostReplyThread(
       );
       return;
     }
+
+    // Mode carnet: idem checkPreReplyThread — aucune relance externe reelle
+    // cette semaine, y compris celle-ci (relancer le client apres NOTRE
+    // reponse), quelle que soit la sequence post_reply configuree.
+    if (config.shadowModeEnabled) {
+      recordReminder(
+        row.thread_id,
+        "internal",
+        `[mode carnet] Relance post-reponse qui aurait ete envoyee a ${row.sender_email} pour "${row.subject}" — non envoyee (mode carnet actif).`
+      );
+      incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
+      return;
+    }
+
     if (!tryConsumeExternalBudget(externalBudget)) {
       console.log(
         `[relance post-reponse] "${row.subject}" — differee (limite de ${config.maxExternalRelancesPerCycle} relances externes/cycle atteinte), retentera au prochain cycle.`

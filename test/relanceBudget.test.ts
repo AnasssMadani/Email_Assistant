@@ -12,6 +12,11 @@ import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, Sen
 const dir = mkdtempSync(path.join(tmpdir(), "accuse-relance-budget-test-"));
 process.env.DB_PATH = path.join(dir, "budget.db");
 process.env.CATEGORIES_CONFIG_PATH = path.resolve("config/categories.json");
+// Ce test verifie de vrais envois (budget de relances externes) — force a
+// "false" explicitement, sans quoi un .env local avec SHADOW_MODE=true (mode
+// carnet, voir config.ts) serait charge par dotenv/config et ferait passer
+// tous les sendReply attendus a 0.
+process.env.SHADOW_MODE = "false";
 
 const { runRelanceCheck } = await import("../src/pipeline/relanceCheck.js");
 const { config } = await import("../src/config.js");
