@@ -1,6 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
-import { config, loadBrandVoice, saveBrandVoice } from "../config.js";
+import { config, loadBrandVoice, loadCategoryPlaybook, saveBrandVoice } from "../config.js";
 import { getConnectionState, saveConnectionState, clearConnectionState } from "../connectionState.js";
 import { buildGmailAuthUrl, exchangeCodeForGmailToken } from "../connectors/gmailAuth.js";
 import { buildGraphAuthUrl, exchangeCodeForGraphToken } from "../connectors/graphAuth.js";
@@ -16,7 +16,9 @@ import {
   addCategoryRelanceStep,
   addThreadRelanceStep,
   clearThreadRelanceOverride,
+  consumeConnectInvite,
   createCategory,
+  createConnectInvite,
   deleteCategoryRelanceStep,
   deleteThreadData,
   deleteThreadRelanceStep,
@@ -25,9 +27,13 @@ import {
   getEffectiveRelanceSteps,
   getThreadRelanceOverride,
   getThreadRow,
+  getValidConnectInvite,
   hasThreadRelanceOverride,
   listCategories,
+  listCategoriesWithCorpus,
+  listConnectInvites,
   listDraftsForThread,
+  listHumanReplyCorpusByCategory,
   listPipelineErrors,
   listRecentAiUsage,
   listReminders,
@@ -35,6 +41,7 @@ import {
   listShadowLogEntries,
   markMessageProcessed,
   recordPipelineError,
+  revokeConnectInvite,
   setShadowLogReviewed,
   setThreadHumanReplied,
   setThreadStatus,
@@ -43,6 +50,7 @@ import {
   type AiUsageEventRow,
   type AiUsageSummary,
   type CarnetEntry,
+  type ConnectInviteRow,
   type PipelineErrorRow,
   type RelancePhase,
   type ReminderRow,
@@ -242,35 +250,72 @@ function setStateCookie(res: Response, name: string, value: string): void {
 /**
  * Retour de destination apres le flux OAuth Google/Microsoft: le client peut
  * lui aussi declencher une reconnexion depuis /client/connexion (bouton
- * "Reconnecter"), donc le callback doit savoir a qui renvoyer la main.
- * Marque via un cookie ephemere pose au moment du /start plutot que dans le
- * parametre state lui-meme (qui reste le nonce anti-CSRF pur, echo par le
- * fournisseur).
+ * "Reconnecter"), donc le callback doit savoir a qui renvoyer la main. Le
+ * visiteur d'un lien d'invitation (voir requireClientAuthOrInvite ci-dessous)
+ * n'a acces ni au dashboard admin ni au dashboard client — il atterrit sur
+ * une page de confirmation minimale, /connect/succes. Marque via un cookie
+ * ephemere pose au moment du /start plutot que dans le parametre state
+ * lui-meme (qui reste le nonce anti-CSRF pur, echo par le fournisseur).
  */
-function oauthReturnTarget(req: Request): "/" | "/client" {
+function oauthReturnTarget(req: Request): "/" | "/client" | "/connect/succes" {
   const cookies = parseCookies(req.headers.cookie);
-  return cookies.oauth_from === "client" ? "/client" : "/";
+  if (cookies.oauth_from === "client") return "/client";
+  if (cookies.oauth_from === "invite") return "/connect/succes";
+  return "/";
+}
+
+/**
+ * Un token passe en query (?invite=...) ne survit pas a l'aller-retour vers
+ * Google/Microsoft (le fournisseur ne renvoie que code/state sur le
+ * callback) — on le reporte donc dans un cookie ephemere pose au /start,
+ * relu ici au besoin.
+ */
+function inviteTokenFromRequest(req: Request): string | undefined {
+  return (query(req).invite as string | undefined) || parseCookies(req.headers.cookie).connect_invite || undefined;
+}
+
+/**
+ * Gate des 4 routes OAuth: accepte une session admin/client existante
+ * (requireClientAuth, inchange) OU un token d'invitation valide — sans
+ * toucher a auth.ts/SessionRole, pour garder la surface de risque du
+ * systeme de session existant intacte. Un token invalide/expire/deja
+ * consomme retombe simplement sur requireClientAuth (donc une redirection
+ * vers /client/login si aucune session non plus).
+ */
+function requireClientAuthOrInvite(req: Request, res: Response, next: NextFunction): void {
+  const token = inviteTokenFromRequest(req);
+  if (token && getValidConnectInvite(token)) {
+    next();
+    return;
+  }
+  requireClientAuth(req, res, next);
 }
 
 // ---------- Flux OAuth de connexion messagerie ----------
 // Accessible par une session admin OU client (requireClientAuth accepte les
-// deux) — reconnecter une messagerie expiree ne doit pas obliger le client a
-// attendre l'admin. Monte AVANT le requireAuth (admin uniquement) ci-dessous:
-// une route dont l'admin ET le client ont besoin ne peut pas dependre d'un
-// gate qui exclut l'un des deux.
+// deux) OU un lien d'invitation a usage unique (requireClientAuthOrInvite,
+// voir plus haut) — reconnecter une messagerie expiree ne doit pas obliger
+// le client a attendre l'admin, et le client lui-meme ne doit pas avoir
+// besoin d'identifiants du tout via un lien d'invitation. Monte AVANT le
+// requireAuth (admin uniquement) ci-dessous: une route dont l'admin ET le
+// client ont besoin ne peut pas dependre d'un gate qui exclut l'un des deux.
 
-app.get("/auth/gmail/start", requireClientAuth, (req: Request, res: Response) => {
+app.get("/auth/gmail/start", requireClientAuthOrInvite, (req: Request, res: Response) => {
   if (!config.google.clientId || !config.google.clientSecret) {
     res.redirect("/?error=" + encodeURIComponent("Configuration Google manquante cote agence."));
     return;
   }
   const state = randomUUID();
   setStateCookie(res, "gmail_oauth_state", state);
-  setStateCookie(res, "oauth_from", query(req).from === "client" ? "client" : "admin");
+  const from = query(req).from === "client" ? "client" : query(req).from === "invite" ? "invite" : "admin";
+  setStateCookie(res, "oauth_from", from);
+  if (from === "invite" && query(req).invite) {
+    setStateCookie(res, "connect_invite", query(req).invite as string);
+  }
   res.redirect(buildGmailAuthUrl(state));
 });
 
-app.get("/auth/gmail/callback", requireClientAuth, async (req: Request, res: Response) => {
+app.get("/auth/gmail/callback", requireClientAuthOrInvite, async (req: Request, res: Response) => {
   const target = oauthReturnTarget(req);
   try {
     const cookies = parseCookies(req.headers.cookie);
@@ -282,24 +327,31 @@ app.get("/auth/gmail/callback", requireClientAuth, async (req: Request, res: Res
     await exchangeCodeForGmailToken(code);
     const email = await new GmailConnector().getOwnEmailAddress();
     saveConnectionState({ provider: "gmail", email, connectedAt: new Date().toISOString() });
+    if (cookies.oauth_from === "invite" && cookies.connect_invite && getValidConnectInvite(cookies.connect_invite)) {
+      consumeConnectInvite(cookies.connect_invite, "gmail");
+    }
     res.redirect(`${target}?connected=gmail`);
   } catch (err) {
     res.redirect(`${target}?error=` + encodeURIComponent((err as Error).message));
   }
 });
 
-app.get("/auth/graph/start", requireClientAuth, (req: Request, res: Response) => {
+app.get("/auth/graph/start", requireClientAuthOrInvite, (req: Request, res: Response) => {
   if (!config.azure.clientId || !config.azure.clientSecret) {
     res.redirect("/?error=" + encodeURIComponent("Configuration Microsoft manquante cote agence."));
     return;
   }
   const state = randomUUID();
   setStateCookie(res, "graph_oauth_state", state);
-  setStateCookie(res, "oauth_from", query(req).from === "client" ? "client" : "admin");
+  const from = query(req).from === "client" ? "client" : query(req).from === "invite" ? "invite" : "admin";
+  setStateCookie(res, "oauth_from", from);
+  if (from === "invite" && query(req).invite) {
+    setStateCookie(res, "connect_invite", query(req).invite as string);
+  }
   res.redirect(buildGraphAuthUrl(state));
 });
 
-app.get("/auth/graph/callback", requireClientAuth, async (req: Request, res: Response) => {
+app.get("/auth/graph/callback", requireClientAuthOrInvite, async (req: Request, res: Response) => {
   const target = oauthReturnTarget(req);
   try {
     const cookies = parseCookies(req.headers.cookie);
@@ -311,10 +363,32 @@ app.get("/auth/graph/callback", requireClientAuth, async (req: Request, res: Res
     await exchangeCodeForGraphToken(code);
     const email = await new GraphConnector().getOwnEmailAddress();
     saveConnectionState({ provider: "graph", email, connectedAt: new Date().toISOString() });
+    if (cookies.oauth_from === "invite" && cookies.connect_invite && getValidConnectInvite(cookies.connect_invite)) {
+      consumeConnectInvite(cookies.connect_invite, "graph");
+    }
     res.redirect(`${target}?connected=graph`);
   } catch (err) {
     res.redirect(`${target}?error=` + encodeURIComponent((err as Error).message));
   }
+});
+
+// ---------- Page publique d'invitation ----------
+// AUCUNE protection requireAuth/requireClientAuth ici, par construction —
+// c'est exactement le but (le client se connecte sans identifiants). La
+// securite repose entierement sur le token (aleatoire 256 bits, usage
+// unique, expirant, revocable depuis "/") verifie explicitement ci-dessous.
+// Ne jamais monter ces deux routes apres app.use(requireAuth).
+
+app.get("/connect", (req: Request, res: Response) => {
+  const token = query(req).token;
+  const invite = token ? getValidConnectInvite(token) : undefined;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(invite ? renderConnectPage(token, getConnectionState()) : renderConnectInvalidPage());
+});
+
+app.get("/connect/succes", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderConnectSuccessPage());
 });
 
 // ---------- Dashboard client: routeur dedie, verrouille par son propre middleware ----------
@@ -329,13 +403,28 @@ app.use("/client", requireClientAuth, clientRouter);
 app.use(requireAuth);
 
 app.get("/", (req: Request, res: Response) => {
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderConnectionPage(query(req), res.locals.csrfToken as string | undefined));
+  res.send(renderConnectionPage(query(req), res.locals.csrfToken as string | undefined, baseUrl));
 });
 
 app.post("/auth/disconnect", requireCsrf, (_req: Request, res: Response) => {
   clearConnectionState();
   res.redirect("/?disconnected=1");
+});
+
+// ---------- Invitations de connexion (lien sans identifiants admin, voir /connect) ----------
+
+app.post("/invitations/generer", requireCsrf, (req: Request, res: Response) => {
+  const raw = parseLocaleNumber((req.body as Record<string, string>).expiresInDays);
+  const days = raw > 0 ? Math.max(1, raw) : 7;
+  createConnectInvite(days);
+  res.redirect("/?invite_saved=1");
+});
+
+app.post("/invitations/:token/revoquer", requireCsrf, (req: Request, res: Response) => {
+  revokeConnectInvite(req.params.token);
+  res.redirect("/?invite_saved=1");
 });
 
 // ---------- Suivi des dossiers ----------
@@ -901,7 +990,7 @@ function renderLoginPage(opts: { next: string; error?: string; action?: string; 
 
 // ---------- Page de connexion messagerie ----------
 
-function renderConnectionPage(q: Record<string, string>, csrfToken: string | undefined): string {
+function renderConnectionPage(q: Record<string, string>, csrfToken: string | undefined, baseUrl: string): string {
   const state = getConnectionState();
   const googleReady = Boolean(config.google.clientId && config.google.clientSecret);
   const azureReady = Boolean(config.azure.clientId && config.azure.clientSecret);
@@ -912,7 +1001,9 @@ function renderConnectionPage(q: Record<string, string>, csrfToken: string | und
       ? `<div class="banner banner-ok">Compte ${escapeHtml(q.connected === "gmail" ? "Gmail" : "Outlook")} connecte avec succes.</div>`
       : q.disconnected
         ? `<div class="banner banner-ok">Messagerie deconnectee.</div>`
-        : "";
+        : q.invite_saved
+          ? `<div class="banner banner-ok">Fait.</div>`
+          : "";
 
   const body = `
   ${banner}
@@ -935,7 +1026,8 @@ function renderConnectionPage(q: Record<string, string>, csrfToken: string | und
       state,
     })}
   </div>
-  <footer>Une seule messagerie active à la fois. Se reconnecter avec l'autre bascule le pipeline automatiquement.</footer>`;
+  <footer>Une seule messagerie active à la fois. Se reconnecter avec l'autre bascule le pipeline automatiquement.</footer>
+  ${renderInvitePanel(listConnectInvites(), csrfToken, baseUrl)}`;
 
   return pageShell(
     "connexion",
@@ -943,6 +1035,56 @@ function renderConnectionPage(q: Record<string, string>, csrfToken: string | und
     "Le client choisit sa messagerie et autorise l'accès depuis cette page — aucune configuration manuelle de son côté.",
     body
   );
+}
+
+function connectInviteStatus(invite: ConnectInviteRow): { label: string; className: string; pending: boolean } {
+  if (invite.revoked_at) return { label: "Révoquée", className: "stamp-skip", pending: false };
+  if (invite.used_at) {
+    return { label: `Utilisée le ${formatDateTime(invite.used_at)}`, className: "stamp-done", pending: false };
+  }
+  if (new Date(invite.expires_at).getTime() < Date.now()) {
+    return { label: "Expirée", className: "stamp-skip", pending: false };
+  }
+  return { label: "En attente d'utilisation", className: "stamp-wait", pending: true };
+}
+
+function renderInvitePanel(invites: ConnectInviteRow[], csrfToken: string | undefined, baseUrl: string): string {
+  const rows = invites.length
+    ? invites
+        .map((invite) => {
+          const status = connectInviteStatus(invite);
+          const link = `${baseUrl}/connect?token=${invite.token}`;
+          return `<div class="ledger-row">
+            <div class="ledger-main">
+              <span class="stamp ${status.className}">${escapeHtml(status.label)}</span>
+              <div class="ledger-meta">Créée le ${escapeHtml(formatDateTime(invite.created_at))} — expire le ${escapeHtml(formatDateTime(invite.expires_at))}</div>
+              ${status.pending ? `<input type="text" readonly value="${escapeHtml(link)}" style="width:100%; margin-top:6px; font-family: var(--font-mono); font-size: 12px;" />` : ""}
+            </div>
+            <div class="ledger-actions">
+              ${
+                status.pending
+                  ? `<form method="POST" action="/invitations/${encodeURIComponent(invite.token)}/revoquer">
+                      ${csrfField(csrfToken)}
+                      <button class="btn btn-ghost btn-sm" type="submit">Révoquer</button>
+                    </form>`
+                  : ""
+              }
+            </div>
+          </div>`;
+        })
+        .join("")
+    : `<div class="empty">Aucune invitation générée pour l'instant.</div>`;
+
+  return `<div class="settings-section">
+    <h2>Lien d'invitation pour le client</h2>
+    <p class="section-hint">Un lien à usage unique et expirant qui permet au client de connecter sa propre messagerie, sans identifiants admin.</p>
+    <form method="POST" action="/invitations/generer" class="step-add-form" style="margin-bottom:14px;">
+      ${csrfField(csrfToken)}
+      <label>Valide pendant <input type="number" name="expiresInDays" value="7" min="1" step="1" style="width:70px;" /> jour(s)</label>
+      <button class="btn btn-primary btn-sm" type="submit">Générer un nouveau lien</button>
+    </form>
+    <div class="ledger">${rows}</div>
+  </div>`;
 }
 
 function renderStatus(state: ReturnType<typeof getConnectionState>, csrfToken: string | undefined): string {
@@ -971,13 +1113,15 @@ function renderProviderCard(opts: {
   ready: boolean;
   readyLabel: string;
   state: ReturnType<typeof getConnectionState>;
+  /** Ajoute a l'URL du bouton (ex: "?from=invite&invite=<token>") — vide par defaut (page admin, "from=admin" implicite cote serveur). */
+  extraQuery?: string;
 }): string {
   const isActive = opts.state?.provider === opts.provider;
   const actionLabel = isActive ? "Reconnecter" : "Connecter";
 
   const button = !opts.ready
     ? `<span class="btn btn-disabled">${escapeHtml(opts.readyLabel)}</span>`
-    : `<a class="btn btn-primary" href="/auth/${opts.provider}/start">${actionLabel}</a>`;
+    : `<a class="btn btn-primary" href="/auth/${opts.provider}/start${opts.extraQuery ?? ""}">${actionLabel}</a>`;
 
   return `<div class="card">
     <div>
@@ -986,6 +1130,90 @@ function renderProviderCard(opts: {
     </div>
     ${button}
   </div>`;
+}
+
+// ---------- Page publique d'invitation (voir /connect ci-dessus) ----------
+// Gabarit delibrement distinct de pageShell(): un visiteur arrive ici via un
+// lien d'invitation, jamais via une session admin ou client — il ne doit
+// voir ni la nav admin (Réglages, Carnet, Consommation IA...) ni aucun lien
+// vers le dashboard client. Seuls le branding et le strict necessaire pour
+// connecter une messagerie sont exposes.
+function renderPublicShell(title: string, body: string): string {
+  const brand = config.branding;
+  return `<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<title>${escapeHtml(brand.name)} — ${escapeHtml(title)}</title>
+<style>${sharedStyles(brand.primaryColor)}</style>
+</head>
+<body>
+<main>
+  <header class="brand">
+    ${
+      brand.logoUrl
+        ? `<img src="${escapeHtml(brand.logoUrl)}" alt="${escapeHtml(brand.name)}" />`
+        : `<span class="seal">${escapeHtml(brand.name.trim().charAt(0).toUpperCase() || "A")}</span>`
+    }
+    <span class="name">${escapeHtml(brand.name)}</span>
+  </header>
+  <h1>${escapeHtml(title)}</h1>
+  ${body}
+</main>
+</body>
+</html>`;
+}
+
+function renderConnectInvalidPage(): string {
+  return renderPublicShell(
+    "Lien invalide",
+    `<div class="banner banner-error">Ce lien de connexion est invalide, a déjà été utilisé, ou a expiré. Merci de demander un nouveau lien à votre interlocuteur.</div>`
+  );
+}
+
+function renderConnectPage(token: string, state: ReturnType<typeof getConnectionState>): string {
+  const googleReady = Boolean(config.google.clientId && config.google.clientSecret);
+  const azureReady = Boolean(config.azure.clientId && config.azure.clientSecret);
+  const inviteQuery = `?from=invite&invite=${encodeURIComponent(token)}`;
+
+  const status = state
+    ? `<div class="status"><div><div class="label">Statut actuel</div><div class="value">${escapeHtml(state.email)} <span class="stamp stamp-done">${state.provider === "gmail" ? "Gmail" : "Outlook / Microsoft 365"}</span></div><div class="label" style="margin-top:6px;">Se connecter ci-dessous remplacera cette connexion.</div></div></div>`
+    : `<div class="status"><div><div class="label">Statut actuel</div><div class="value">Aucune messagerie connectée</div></div></div>`;
+
+  const body = `
+  ${status}
+  <div class="cards">
+    ${renderProviderCard({
+      title: "Gmail",
+      description: "Connectez votre boîte Gmail.",
+      provider: "gmail",
+      ready: googleReady,
+      readyLabel: "Gmail momentanément indisponible — contactez l'agence.",
+      state,
+      extraQuery: inviteQuery,
+    })}
+    ${renderProviderCard({
+      title: "Outlook / Microsoft 365",
+      description: "Connectez votre boîte Outlook.",
+      provider: "graph",
+      ready: azureReady,
+      readyLabel: "Outlook momentanément indisponible — contactez l'agence.",
+      state,
+      extraQuery: inviteQuery,
+    })}
+  </div>
+  <footer>Ce lien est à usage unique : une fois votre messagerie connectée, il ne fonctionnera plus.</footer>`;
+
+  return renderPublicShell("Connexion de votre messagerie", body);
+}
+
+function renderConnectSuccessPage(): string {
+  return renderPublicShell(
+    "Messagerie connectée",
+    `<div class="banner banner-ok">Votre messagerie est connectée avec succès. Vous pouvez fermer cette page.</div>`
+  );
 }
 
 // ---------- Registre des dossiers ----------
@@ -1855,7 +2083,7 @@ function renderCarnetPage(
     "carnet",
     "Carnet — semaine pilote",
     `Ce que le pipeline a reçu et comment l'IA aurait répondu, sans rien envoyer au client. Seul le rappel personnel (${config.carnetRappelDelayMinutes} min sans réponse de l'équipe) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
-    banner + analyseForm + list
+    banner + analyseForm + renderCorpusPanel() + list
   );
 }
 
@@ -1882,6 +2110,50 @@ function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): str
         <button class="btn btn-sm" type="submit">Enregistrer</button>
       </form>
     </div>
+  </div>`;
+}
+
+/**
+ * Rend visible ce que la passe d'analyse (corpusAnalysis.ts) a produit
+ * jusqu'ici — sans ca, "l'IA a appris de vos reponses" reste une affirmation
+ * invisible: aucune autre page n'affiche le contenu du corpus ni la note de
+ * style generee. Une categorie sans aucune reponse capturee n'apparait pas
+ * ici (rien a montrer).
+ */
+function renderCorpusPanel(): string {
+  const categoryIds = listCategoriesWithCorpus();
+  if (categoryIds.length === 0) {
+    return `<div class="settings-section">
+      <h2>Corpus des réponses de l'équipe</h2>
+      <p class="section-hint">Aucune réponse humaine capturée pour l'instant cette semaine.</p>
+    </div>`;
+  }
+
+  const labelById = new Map(listCategories().map((c) => [c.id, c.label]));
+  const blocks = categoryIds
+    .map((id) => {
+      const label = labelById.get(id) ?? id;
+      const count = listHumanReplyCorpusByCategory(id).length;
+      const playbook = loadCategoryPlaybook(id);
+      return `<div class="category-block">
+        <div class="ledger-meta" style="padding: 10px 14px;">
+          <strong>${escapeHtml(label)}</strong> — ${count} réponse(s) capturée(s)${
+            playbook ? "" : ` — note de style pas encore générée (cliquez "Analyser le corpus maintenant")`
+          }
+        </div>
+        ${
+          playbook
+            ? `<pre style="white-space: pre-wrap; padding: 12px 14px; margin: 0; font-size: 12.5px; border-top: 1px solid var(--rule); font-family: var(--font-mono);">${escapeHtml(playbook)}</pre>`
+            : ""
+        }
+      </div>`;
+    })
+    .join("");
+
+  return `<div class="settings-section">
+    <h2>Corpus des réponses de l'équipe</h2>
+    <p class="section-hint">Ce que l'IA a appris jusqu'ici, catégorie par catégorie — mis à jour uniquement en cliquant "Analyser le corpus maintenant" ci-dessus (ou au cycle quotidien automatique), relu ensuite par le prompt de rédaction de l'accusé.</p>
+    ${blocks}
   </div>`;
 }
 

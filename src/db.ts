@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
@@ -235,6 +236,21 @@ db.exec(`
     category_id TEXT NOT NULL,
     reply_body TEXT NOT NULL,
     created_at TEXT NOT NULL
+  );
+
+  -- Lien d'invitation a usage unique permettant au client de connecter sa
+  -- propre messagerie (OAuth) sans identifiants admin — voir
+  -- requireClientAuthOrInvite dans web/server.ts. used_at ET revoked_at sont
+  -- deux facons distinctes d'invalider un token (utilise avec succes, vs
+  -- retire manuellement avant usage) — l'UI admin affiche un statut different
+  -- pour chacune.
+  CREATE TABLE IF NOT EXISTS connect_invites (
+    token TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    used_provider TEXT,
+    revoked_at TEXT
   );
 
 `);
@@ -1239,6 +1255,56 @@ export function incrementAutomatedOutboundCount(threadId: string): void {
   db.prepare(
     "UPDATE threads SET automated_outbound_count = automated_outbound_count + 1 WHERE thread_id = ?"
   ).run(threadId);
+}
+
+// ==================== Invitations de connexion ====================
+
+export interface ConnectInviteRow {
+  token: string;
+  created_at: string;
+  expires_at: string;
+  used_at: string | null;
+  used_provider: string | null;
+  revoked_at: string | null;
+}
+
+/** 256 bits — meme precedent que les tokens de session (auth.ts), hors de portee d'un brute-force. */
+export function createConnectInvite(expiresInDays: number): { token: string; expiresAt: string } {
+  const token = randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare(
+    "INSERT INTO connect_invites (token, created_at, expires_at) VALUES (?, ?, ?)"
+  ).run(token, now.toISOString(), expiresAt);
+  return { token, expiresAt };
+}
+
+/** Usage unique: un token deja consomme (used_at) ou revoque (revoked_at) n'est plus valide, meme avant expiration. */
+export function getValidConnectInvite(token: string): ConnectInviteRow | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM connect_invites
+       WHERE token = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`
+    )
+    .get(token, new Date().toISOString()) as ConnectInviteRow | undefined;
+}
+
+export function consumeConnectInvite(token: string, provider: "gmail" | "graph"): void {
+  db.prepare("UPDATE connect_invites SET used_at = ?, used_provider = ? WHERE token = ?").run(
+    new Date().toISOString(),
+    provider,
+    token
+  );
+}
+
+export function revokeConnectInvite(token: string): void {
+  db.prepare("UPDATE connect_invites SET revoked_at = ? WHERE token = ?").run(new Date().toISOString(), token);
+}
+
+export function listConnectInvites(limit = 50): ConnectInviteRow[] {
+  return db
+    .prepare("SELECT * FROM connect_invites ORDER BY created_at DESC LIMIT ?")
+    .all(limit) as unknown as ConnectInviteRow[];
 }
 
 // ==================== Mode carnet (semaine pilote) ====================
