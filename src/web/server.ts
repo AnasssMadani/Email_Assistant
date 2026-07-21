@@ -240,8 +240,17 @@ app.post("/logout", (req: Request, res: Response) => {
   res.redirect(req.body?.fromClient === "1" ? "/client/login" : "/login");
 });
 
+/**
+ * res.setHeader("Set-Cookie", ...) REMPLACE tout Set-Cookie deja pose sur
+ * cette meme reponse (Node ne "cumule" que si on lui passe un tableau en un
+ * seul appel) — avec 2+ appels successifs de cette fonction sur la meme
+ * reponse (state + oauth_from, +connect_invite pour un lien d'invitation),
+ * seul le DERNIER survivait reellement, et {gmail,graph}_oauth_state
+ * n'atteignait jamais le navigateur. res.append (Express) fusionne
+ * correctement les Set-Cookie successifs au lieu d'ecraser.
+ */
 function setStateCookie(res: Response, name: string, value: string): void {
-  res.setHeader(
+  res.append(
     "Set-Cookie",
     `${name}=${encodeURIComponent(value)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax`
   );
