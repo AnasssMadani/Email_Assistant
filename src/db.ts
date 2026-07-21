@@ -17,6 +17,62 @@ const CARNET_BUSINESS_CATEGORY_IDS = [
   "relance_paiement_soa",
 ];
 
+/**
+ * Certaines bases de production plus anciennes portent encore une colonne
+ * categories.allow_external_relance (NOT NULL, sans defaut) heritee d'un
+ * modele abandonne depuis (remplace par relance_steps/
+ * post_reply_relance_steps) — absente du CREATE TABLE actuel, donc jamais
+ * recreee sur une base neuve, mais toujours presente sur les bases deja
+ * migrees, ou toute insertion qui l'omet echoue avec "NOT NULL constraint
+ * failed". On la detecte a chaque insertion plutot que de tenter une
+ * migration destructive (SQLite ne sait pas retirer une contrainte NOT NULL
+ * sans recreer la table) — valeur figee a 0, plus lue nulle part dans le
+ * code actuel.
+ */
+function insertCategoryRow(params: {
+  id: string;
+  label: string;
+  slaHours: number;
+  slaMinutes: number;
+  acknowledgeAutomatically: 0 | 1;
+  sortOrder: number;
+  internalAlertsEnabled: 0 | 1;
+  internalAlertsMinUrgency: string;
+}): void {
+  const hasLegacyAllowExternalRelance = (
+    db.prepare("PRAGMA table_info(categories)").all() as unknown as { name: string }[]
+  ).some((c) => c.name === "allow_external_relance");
+
+  const columns = [
+    "id",
+    "label",
+    "sla_hours",
+    "sla_minutes",
+    "acknowledge_automatically",
+    "sort_order",
+    "internal_alerts_enabled",
+    "internal_alerts_min_urgency",
+  ];
+  const values: Array<string | number> = [
+    params.id,
+    params.label,
+    params.slaHours,
+    params.slaMinutes,
+    params.acknowledgeAutomatically,
+    params.sortOrder,
+    params.internalAlertsEnabled,
+    params.internalAlertsMinUrgency,
+  ];
+  if (hasLegacyAllowExternalRelance) {
+    columns.push("allow_external_relance");
+    values.push(0);
+  }
+
+  db.prepare(
+    `INSERT INTO categories (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`
+  ).run(...values);
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS threads (
     thread_id TEXT PRIMARY KEY,
@@ -435,14 +491,17 @@ function ensurePiloteCarnetCategories(): void {
   const maxOrderRow = db
     .prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM categories")
     .get() as { m: number };
-  const insertCategory = db.prepare(
-    `INSERT INTO categories (
-      id, label, sla_hours, sla_minutes, acknowledge_automatically, sort_order,
-      internal_alerts_enabled, internal_alerts_min_urgency
-    ) VALUES (?, ?, ?, ?, 1, ?, 1, 'low')`
-  );
   newCategories.forEach((cat, index) => {
-    insertCategory.run(cat.id, cat.label, cat.slaHours, cat.slaHours * 60, maxOrderRow.m + 1 + index);
+    insertCategoryRow({
+      id: cat.id,
+      label: cat.label,
+      slaHours: cat.slaHours,
+      slaMinutes: cat.slaHours * 60,
+      acknowledgeAutomatically: 1,
+      sortOrder: maxOrderRow.m + 1 + index,
+      internalAlertsEnabled: 1,
+      internalAlertsMinUrgency: "low",
+    });
   });
 
   const updateAlerts = db.prepare(
@@ -808,19 +867,16 @@ export function createCategory(params: {
   const maxOrderRow = db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS maxOrder FROM categories").get() as {
     maxOrder: number;
   };
-  db.prepare(
-    `INSERT INTO categories (
-      id, label, sla_hours, sla_minutes, acknowledge_automatically, sort_order,
-      internal_alerts_enabled, internal_alerts_min_urgency
-    ) VALUES (?, ?, ?, ?, ?, ?, 1, 'normal')`
-  ).run(
+  insertCategoryRow({
     id,
-    params.label,
-    params.slaMinutes / 60,
-    params.slaMinutes,
-    params.acknowledgeAutomatically ? 1 : 0,
-    maxOrderRow.maxOrder + 1
-  );
+    label: params.label,
+    slaHours: params.slaMinutes / 60,
+    slaMinutes: params.slaMinutes,
+    acknowledgeAutomatically: params.acknowledgeAutomatically ? 1 : 0,
+    sortOrder: maxOrderRow.maxOrder + 1,
+    internalAlertsEnabled: 1,
+    internalAlertsMinUrgency: "normal",
+  });
 
   writeSteps("pre_reply", "category", id, [{ channel: "internal", delayMinutes: 1440 }]);
   writeSteps("post_reply", "category", id, [{ channel: "external", delayMinutes: 3 * 1440 }]);
