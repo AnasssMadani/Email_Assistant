@@ -2,8 +2,10 @@ import express, { type Request, type Response, Router } from "express";
 import { config, loadBrandVoice, saveBrandVoice } from "../config.js";
 import { getConnectionState } from "../connectionState.js";
 import {
-  getClientMonthlyStats,
+  getClientCategoryShare,
+  getClientPeriodKpis,
   getClientThreadDetail,
+  getClientVolumeSeries,
   listClientCategories,
   listClientSendHistory,
   listClientThreads,
@@ -86,58 +88,166 @@ function htmlPage(res: Response, html: string): void {
   res.send(html);
 }
 
-// ---------- Accueil / apercu du mois ----------
+// ---------- Accueil / tableau de bord ----------
 
-clientRouter.get("/", (_req: Request, res: Response) => {
-  const stats = getClientMonthlyStats();
-  const delaiLabel =
-    stats.delaiMoyenReponseMinutes === null
-      ? "—"
-      : stats.delaiMoyenReponseMinutes < 60
-        ? `${stats.delaiMoyenReponseMinutes} min`
-        : `${(stats.delaiMoyenReponseMinutes / 60).toFixed(1)} h`;
+const CLIENT_PERIOD_LABELS: Record<"7j" | "30j" | "90j", string> = { "7j": "7 jours", "30j": "30 jours", "90j": "90 jours" };
+const CLIENT_PERIOD_DAYS: Record<"7j" | "30j" | "90j", number> = { "7j": 7, "30j": 30, "90j": 90 };
+
+function parseClientPeriod(value: string | undefined): "7j" | "30j" | "90j" {
+  return value === "30j" || value === "90j" ? value : "7j";
+}
+
+function clientDeltaLabel(value: number | null, unit: string): string {
+  if (value === null) return "Pas de donnée sur la période précédente";
+  return `${value > 0 ? "+" : ""}${value}${unit} vs période précédente`;
+}
+
+function formatMinutesLabel(minutes: number | null): string {
+  if (minutes === null) return "—";
+  return minutes < 60 ? `${minutes} min` : `${(minutes / 60).toFixed(1)} h`;
+}
+
+function corners(): string {
+  return `<i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>`;
+}
+
+clientRouter.get("/", (req: Request, res: Response) => {
+  const period = parseClientPeriod(query(req).periode);
+  const periodDays = CLIENT_PERIOD_DAYS[period];
+
+  const kpis = getClientPeriodKpis(periodDays);
+  const volume = getClientVolumeSeries(periodDays);
+  const categories = getClientCategoryShare(periodDays);
+  const activity = listClientSendHistory(8);
+  const connection = getConnectionState();
+  const maxVolume = Math.max(1, ...volume.map((v) => v.value));
+
+  const periodTabs = `<div class="filter-tabs">
+    ${(Object.keys(CLIENT_PERIOD_LABELS) as Array<"7j" | "30j" | "90j">)
+      .map((p) => `<a href="/client?periode=${p}" class="${p === period ? "active" : ""}">${CLIENT_PERIOD_LABELS[p]}</a>`)
+      .join("")}
+  </div>`;
+
+  const kpiCards = `<div class="metric-grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="metric blueprint">${corners()}
+      <div class="metric-label">Emails traités</div>
+      <div class="metric-value">${kpis.processed}</div>
+      <div class="metric-sub">${escapeHtml(clientDeltaLabel(kpis.deltaProcessedPct, "%"))}</div>
+    </div>
+    <div class="metric blueprint">${corners()}
+      <div class="metric-label">Respect du SLA</div>
+      <div class="metric-value">${kpis.slaPct}%</div>
+      <div class="metric-sub">${escapeHtml(clientDeltaLabel(kpis.deltaSlaPts, " pts"))}</div>
+    </div>
+    <div class="metric blueprint">${corners()}
+      <div class="metric-label">Temps de réponse moyen</div>
+      <div class="metric-value">${escapeHtml(formatMinutesLabel(kpis.avgResponseMinutes))}</div>
+      <div class="metric-sub">${escapeHtml(clientDeltaLabel(kpis.deltaResponseMinutes, " min"))}</div>
+    </div>
+    <div class="metric blueprint">${corners()}
+      <div class="metric-label">Dossiers en cours</div>
+      <div class="metric-value">${kpis.openCount}</div>
+      <div class="metric-sub">Actuellement ouverts</div>
+    </div>
+  </div>`;
+
+  const volumeChart = `<div class="card blueprint" style="flex-direction:column; align-items:stretch; flex:1.6; min-height:260px">
+    ${corners()}
+    <div class="card-title">Volume de dossiers</div>
+    <div style="display:flex; align-items:flex-end; gap:10px; height:180px; margin-top:14px">
+      ${volume
+        .map(
+          (v) => `<div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:8px; height:100%; justify-content:flex-end">
+              <div style="width:100%; height:100%; display:flex; align-items:flex-end; background:var(--surface)">
+                <div style="width:100%; height:${Math.round((v.value / maxVolume) * 100)}%; background:var(--brand-primary)"></div>
+              </div>
+              <div style="font-size:11px; opacity:.6">${escapeHtml(v.label)}</div>
+            </div>`
+        )
+        .join("")}
+    </div>
+  </div>`;
+
+  const categoryChart = `<div class="card blueprint" style="flex-direction:column; align-items:stretch; flex:1; min-width:300px">
+    ${corners()}
+    <div class="card-title">Répartition par catégorie</div>
+    ${
+      categories.length
+        ? `<div style="display:flex; flex-direction:column; gap:12px; margin-top:14px">
+        ${categories
+          .map(
+            (c) => `<div>
+              <div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:4px">
+                <span>${escapeHtml(c.label)}</span><span style="opacity:.6">${c.pct}%</span>
+              </div>
+              <div style="height:6px; background:var(--surface)">
+                <div style="width:${c.pct}%; height:100%; background:var(--brand-primary)"></div>
+              </div>
+            </div>`
+          )
+          .join("")}
+      </div>`
+        : `<p class="card-body" style="margin-top:14px">Aucun dossier sur cette période.</p>`
+    }
+  </div>`;
+
+  const slaRing = `<div class="card blueprint" style="flex-direction:column; align-items:center; text-align:center; justify-content:center; flex:1; min-width:280px">
+    ${corners()}
+    <div class="card-kicker">Conformité SLA</div>
+    <div style="width:132px; height:132px; border-radius:50%; margin:14px auto 10px; display:flex; align-items:center; justify-content:center; background:conic-gradient(var(--brand-primary) 0% ${kpis.slaPct}%, var(--surface) ${kpis.slaPct}% 100%)">
+      <div style="width:104px; height:104px; border-radius:50%; background:var(--paper); display:flex; align-items:center; justify-content:center; font-family:var(--font-display); font-size:26px; font-weight:600">${kpis.slaPct}%</div>
+    </div>
+    <p class="card-body" style="opacity:.6">des dossiers traités dans les délais promis</p>
+  </div>`;
+
+  const activityFeed = `<div class="card blueprint" style="flex-direction:column; align-items:stretch; flex:1.6">
+    ${corners()}
+    <div class="card-title">Activité récente</div>
+    ${
+      activity.length
+        ? `<div style="display:flex; flex-direction:column; margin-top:10px">
+        ${activity
+          .map(
+            (a) => `<div style="display:flex; gap:12px; padding:10px 0; border-bottom:1px solid var(--rule); font-size:13px">
+              <span style="font-family:var(--font-mono); font-size:11.5px; opacity:.5; flex:none; width:150px">${escapeHtml(formatDateTime(a.at))}</span>
+              <span>${escapeHtml(a.sentence)}</span>
+            </div>`
+          )
+          .join("")}
+      </div>`
+        : `<p class="card-body" style="margin-top:14px">Aucune activité pour l'instant.</p>`
+    }
+  </div>`;
+
+  const connectionBar = `<div class="blueprint" style="position:relative; margin-top:var(--space-6, 20px); padding:12px 18px; border:1px solid var(--rule); display:flex; align-items:center; gap:8px; font-size:12.5px">
+    ${corners()}
+    <span style="width:7px; height:7px; border-radius:50%; background:${connection ? "var(--stamp-done)" : "var(--stamp-late)"}; display:inline-block"></span>
+    ${
+      connection
+        ? `Messagerie connectée : ${connection.provider === "gmail" ? "Gmail" : "Outlook / Microsoft 365"} — ${escapeHtml(connection.email)}`
+        : `Messagerie non connectée — <a href="/client/connexion">connecter une boîte</a>`
+    }
+  </div>`;
 
   const body = `
-    <div class="metric-grid">
-      <div class="metric">
-        <div class="metric-label">Emails traités ce mois</div>
-        <div class="metric-value">${stats.emailsTraites}</div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">Délai moyen jusqu'à notre réponse</div>
-        <div class="metric-value">${escapeHtml(delaiLabel)}</div>
-        <div class="metric-sub">Temps moyen avant qu'un membre de l'équipe réponde personnellement.</div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">Relances envoyées ce mois</div>
-        <div class="metric-value">${stats.relancesEnvoyees}</div>
-        <div class="metric-sub">Suivis automatiques envoyés en votre nom quand une réponse tardait.</div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">Dossiers en cours</div>
-        <div class="metric-value">${stats.dossiersEnCours}</div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">Dossiers résolus</div>
-        <div class="metric-value">${stats.dossiersResolus}</div>
-      </div>
+    ${periodTabs}
+    ${kpiCards}
+    <div style="display:flex; gap:20px; align-items:stretch; margin-bottom:20px; flex-wrap:wrap">
+      ${volumeChart}
+      ${categoryChart}
     </div>
-    <div class="cards">
-      <div class="card">
-        <div>
-          <h2>Voir le détail de chaque dossier</h2>
-          <p>Suivez l'avancement de chaque échange avec vos clients, étape par étape.</p>
-        </div>
-        <a class="btn btn-primary" href="/client/dossiers">Mes dossiers</a>
-      </div>
+    <div style="display:flex; gap:20px; align-items:stretch; flex-wrap:wrap">
+      ${slaRing}
+      ${activityFeed}
     </div>
+    ${connectionBar}
   `;
   htmlPage(
     res,
     clientPageShell(
       "accueil",
-      "Aperçu du mois",
-      "Un coup d'œil sur l'activité de votre messagerie automatisée.",
+      "Tableau de bord",
+      "Aperçu de la performance de votre boîte de réception connectée — accusés, délais de réponse et relances automatiques.",
       body,
       res.locals.csrfToken as string | undefined
     )

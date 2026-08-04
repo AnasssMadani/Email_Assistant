@@ -61,12 +61,6 @@ export const config = {
   // rappel interne personnel reste un envoi reel. Permanent tant que
   // desactive manuellement (pas de bascule automatique, pas de date de fin).
   shadowModeEnabled: process.env.SHADOW_MODE === "true",
-  // Delai (en minutes) du rappel interne des 6 categories metier du mode
-  // carnet — voir syncCarnetRappelDelay() dans db.ts, applique a CHAQUE
-  // demarrage (contrairement au reste de ensurePiloteCarnetCategories, qui
-  // ne tourne qu'une fois). Reglable depuis Render sans toucher au code:
-  // ex. 1 pour tester en quelques minutes, 30 en usage reel.
-  carnetRappelDelayMinutes: Number(process.env.CARNET_RAPPEL_DELAY_MINUTES ?? 30),
   // Dossier des notes de style par categorie, generees a partir du corpus des
   // vraies reponses de l'equipe (voir src/pipeline/corpusAnalysis.ts) et
   // relues par le prompt de redaction de l'accuse.
@@ -75,6 +69,12 @@ export const config = {
   // faible trafic — un declenchement manuel depuis /carnet reste disponible
   // pour ne pas attendre l'horaire planifie avant la reunion de fin de semaine.
   dailyAnalysisCron: process.env.DAILY_ANALYSIS_CRON ?? "0 3 * * *",
+  // Purge automatique de shadow_log (corps complet des emails entrants +
+  // accuses rediges, voir db.ts) au-dela de ce nombre de jours — la page
+  // /confidentialite decrit cette retention, elle doit rester le reflet exact
+  // de ce qui tourne reellement (voir purgeShadowLogOlderThan dans db.ts et
+  // SEC-003 de l'audit securite). 0 ou negatif desactive la purge.
+  shadowLogRetentionDays: Number(process.env.SHADOW_LOG_RETENTION_DAYS ?? 90),
   auth: {
     username: process.env.SETUP_USERNAME ?? "",
     // Format "salt:hash" genere par `npm run auth:hash-password -- "motdepasse"`.
@@ -120,6 +120,18 @@ export const config = {
 
 export function requireAnthropicApiKey(): string {
   return config.anthropicApiKey || required("ANTHROPIC_API_KEY");
+}
+
+/**
+ * Distingue "deploiement reel exposant l'app au public" de "poste local de
+ * dev/test" — sert de gate pour les garde-fous fail-closed (auth
+ * obligatoire, chiffrement des jetons OAuth obligatoire). NODE_ENV=production
+ * est explicitement positionne par render.yaml ; en local/CI, NODE_ENV n'est
+ * pas defini (ou vaut autre chose), donc ces garde-fous restent desactives et
+ * n'ajoutent aucune friction au developpement.
+ */
+export function isProductionLike(): boolean {
+  return process.env.NODE_ENV === "production";
 }
 
 export function loadBrandVoice(): string {

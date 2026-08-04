@@ -171,7 +171,12 @@ export async function checkPreReplyThread(
     // en retard", c'est desormais "on attend le client" — nouvelle phase.
     // On retient si cette reponse contenait une piece jointe (ex: grille
     // tarifaire) pour que la relance post-reponse puisse y faire reference.
-    setThreadHumanReplied(row.thread_id, undefined, replyAfterAck.hasAttachments);
+    // Ancrage sur receivedAt (l'heure REELLE de la reponse), jamais sur
+    // l'heure de detection: le cycle qui remarque cette reponse peut tourner
+    // plusieurs minutes (voire plusieurs heures apres un downtime du
+    // scheduler) apres qu'elle ait ete effectivement envoyee — sinon le
+    // delai de reponse affiche au client integre cette latence d'infra.
+    setThreadHumanReplied(row.thread_id, replyAfterAck.receivedAt.toISOString(), replyAfterAck.hasAttachments);
     await cleanupUnusedDrafts(connector, row.thread_id);
     return;
   }
@@ -369,22 +374,14 @@ export async function checkPostReplyThread(
     ? Math.max(0, Math.round((Date.now() - new Date(row.human_replied_at).getTime()) / 60_000))
     : step.delayMinutes;
   const note = `Dossier "${row.subject}": client silencieux depuis plus de ${elapsedMinutesSinceReply} min apres notre reponse.`;
-  const category = getCategory(row.category_id);
-  const shouldAlertTeam =
-    category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
 
-  if (shouldAlertTeam) {
-    await sendInternalNotification(connector, row, note);
-    recordReminder(row.thread_id, "internal", note, "relance_interne");
-    console.log(`[rappel interne post-reponse] "${row.subject}" — client silencieux.`);
-  } else {
-    recordReminder(
-      row.thread_id,
-      "internal",
-      `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`,
-      "relance_interne_filtree"
-    );
-  }
+  // Rappel interne post-reponse desactive a la demande: l'equipe veut etre
+  // notifiee quand ELLE n'a pas repondu a temps (voir shouldAlertTeam dans
+  // checkPreReplyThread), pas quand c'est le CLIENT qui reste silencieux
+  // apres leur reponse — ce cas n'appelle aucune action de leur part. La
+  // sequence avance quand meme (comportement inchange pour une eventuelle
+  // etape externe suivante), seul l'envoi reel est supprime.
+  recordReminder(row.thread_id, "internal", `${note} (rappel interne post-reponse desactive)`, "relance_interne_filtree");
   incrementPostReplyRelance(row.thread_id, row.status);
 }
 

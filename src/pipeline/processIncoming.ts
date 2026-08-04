@@ -31,10 +31,15 @@ export async function processIncomingMessage(
   // definie, ce rappel part vers la messagerie connectee elle-meme — et sur
   // certains fournisseurs, un envoi auto-adresse cree une copie "Inbox"
   // avec un id DIFFERENT de la copie "Sent" deja marquee traitee par
-  // markMessageProcessed(sent.id, ...) dans sendInternalNotification. Sans
-  // ce garde-fou, cette copie Inbox est alors lue comme un vrai email
-  // client et recoit a tort un accuse de reception.
-  if (message.subject.startsWith("[Rappel]")) {
+  // markMessageProcessed(sent.id, ...) dans sendInternalNotification, ET pas
+  // forcement marquee isFromUs par le fournisseur (d'ou le if isFromUs
+  // return; ci-dessus qui ne suffit pas seul). Un vrai tiers peut cependant
+  // legitimement envoyer un objet commencant par "[Rappel]" (relance de
+  // facture, courant chez un transitaire) — on ne doit avaler ce message que
+  // s'il vient EN PLUS de notre propre boite (auto-adresse), jamais sur le
+  // seul prefixe d'objet, qui n'importe quel expediteur peut usurper.
+  const ownEmail = message.subject.startsWith("[Rappel]") ? await connector.getOwnEmailAddress() : undefined;
+  if (ownEmail && message.from.email.toLowerCase() === ownEmail.toLowerCase()) {
     markMessageProcessed(message.id, message.threadId);
     return;
   }
@@ -42,6 +47,17 @@ export async function processIncomingMessage(
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(message.threadId));
   const classification = await classifyEmail(thread, message);
   const category = getCategory(classification.categoryId);
+
+  if (category.id === "spam_newsletter") {
+    // Contrairement aux autres categories "pas d'accuse necessaire", le spam
+    // n'est journalise NULLE PART (ni shadow_log/carnet, ni threads/dossiers)
+    // — son volume noierait les vrais dossiers dans les deux registres pour
+    // un interet de revue quasi nul. Le ghosting (aucun accuse) etait deja le
+    // bon comportement ; seule la journalisation change ici.
+    markMessageProcessed(message.id, message.threadId);
+    console.log(`[skip] "${message.subject}" (spam_newsletter) — ignore, non journalise.`);
+    return;
+  }
 
   const shouldAcknowledge = category.acknowledgeAutomatically && classification.requiresAcknowledgement;
   const now = Date.now();

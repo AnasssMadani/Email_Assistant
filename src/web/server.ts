@@ -19,11 +19,14 @@ import {
   consumeConnectInvite,
   createCategory,
   createConnectInvite,
+  createEmployee,
   deleteCategoryRelanceStep,
   deleteThreadData,
   deleteThreadRelanceStep,
   getAiUsageSummarySince,
+  getCategoryPerformance,
   getCategoryRelanceSteps,
+  getEmployeePerformance,
   getEffectiveRelanceSteps,
   getThreadRelanceOverride,
   getThreadRow,
@@ -33,6 +36,7 @@ import {
   listCategoriesWithCorpus,
   listConnectInvites,
   listDraftsForThread,
+  listEmployees,
   listHumanReplyCorpusByCategory,
   listPipelineErrors,
   listRecentAiUsage,
@@ -42,7 +46,9 @@ import {
   markMessageProcessed,
   recordPipelineError,
   revokeConnectInvite,
+  setEmployeeActive,
   setShadowLogReviewed,
+  setThreadHandledBy,
   setThreadHumanReplied,
   setThreadStatus,
   updateCategory,
@@ -50,7 +56,11 @@ import {
   type AiUsageEventRow,
   type AiUsageSummary,
   type CarnetEntry,
+  type CategoryPerformanceRow,
   type ConnectInviteRow,
+  type Employee,
+  type EmployeePerformanceRow,
+  type LateBuckets,
   type PipelineErrorRow,
   type RelancePhase,
   type ReminderRow,
@@ -75,7 +85,7 @@ import {
   verifyLogin,
 } from "./auth.js";
 import { clientRouter } from "./clientServer.js";
-import { csrfField, escapeHtml, formatDateTime, sharedStyles } from "./shared.js";
+import { csrfField, escapeHtml, formatDateTime, safeNext, sharedStyles } from "./shared.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -102,6 +112,21 @@ function parseStep(body: Record<string, string>): { channel: RelanceChannel; del
   const channel: RelanceChannel = body.channel === "external" ? "external" : "internal";
   const delayMinutes = Math.max(0, parseLocaleNumber(body.delayMinutes));
   return { channel, delayMinutes };
+}
+
+function phaseTitle(phase: RelancePhase): string {
+  return phase === "pre_reply" ? "Avant notre réponse (nudge équipe)" : "Après notre réponse (relance client)";
+}
+
+/**
+ * Le petit script de /reglages (voir renderReglagesPage) marque ses requetes
+ * fetch() avec cet en-tete pour obtenir en retour le seul fragment HTML du
+ * panneau modifie, plutot qu'une redirection pleine page — sans ca, ajouter
+ * plusieurs etapes de suite rechargeait toute la page a chaque fois et
+ * refermait les <details> qu'on venait d'ouvrir (cf. retour utilisateur).
+ */
+function isFetchRequest(req: Request): boolean {
+  return req.get("X-Requested-With") === "fetch";
 }
 
 /**
@@ -168,7 +193,7 @@ app.get("/login", (req: Request, res: Response) => {
 app.post("/login", (req: Request, res: Response) => {
   const ip = req.ip ?? "unknown";
   const body = req.body as Record<string, string>;
-  const next = body.next && body.next.startsWith("/") ? body.next : "/";
+  const next = safeNext(body.next, "/");
 
   if (isLoginRateLimited(ip)) {
     res.redirect(
@@ -471,6 +496,14 @@ app.post("/dossiers/:threadId/cloturer", requireCsrf, async (req: Request, res: 
   res.redirect(req.body?._redirect === "detail" ? `/dossiers/${encodeURIComponent(threadId)}` : "/dossiers");
 });
 
+app.post("/dossiers/:threadId/traite-par", requireCsrf, (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  const body = req.body as Record<string, string>;
+  const raw = (body.employeeId ?? "").trim();
+  setThreadHandledBy(threadId, raw ? Number(raw) : null);
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+});
+
 app.post("/dossiers/:threadId/supprimer", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   await attemptCleanup(threadId);
@@ -626,9 +659,11 @@ app.get("/reglages", (req: Request, res: Response) => {
   res.send(
     renderReglagesPage(
       listCategories(),
+      listEmployees(true),
       res.locals.csrfToken as string | undefined,
       query(req).saved,
-      query(req).error
+      query(req).error,
+      query(req).open
     )
   );
 });
@@ -644,6 +679,45 @@ function runOrRedirectReglagesError(res: Response, context: string, action: () =
     return;
   }
   res.redirect("/reglages?saved=1");
+}
+
+/**
+ * Dediee aux etapes de relance d'une categorie (ajout/suppression): en
+ * requete normale (formulaire sans JS), redirige vers /reglages avec le
+ * panneau de CETTE categorie rouvert (voir renderReglagesPage) plutot que de
+ * revenir en haut de page toutes catégories refermées. En requete fetch()
+ * (voir le script de renderReglagesPage), renvoie directement le fragment
+ * HTML du panneau mis a jour — aucune navigation, aucun rechargement, ce qui
+ * permet d'enchainer plusieurs ajouts de suite sans perdre sa place.
+ */
+function handleRelanceStepMutation(
+  req: Request,
+  res: Response,
+  categoryId: string,
+  phase: RelancePhase,
+  context: string,
+  action: () => void
+): void {
+  try {
+    action();
+  } catch (err) {
+    console.error(`[${context}] erreur:`, err);
+    recordPipelineError(context, null, (err as Error).message);
+    if (isFetchRequest(req)) {
+      res.status(400).send("L'action a échoué — voir le journal.");
+      return;
+    }
+    res.redirect("/reglages?error=1");
+    return;
+  }
+  if (isFetchRequest(req)) {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(
+      renderCategoryStepsPanel(categoryId, phase, phaseTitle(phase), res.locals.csrfToken as string | undefined)
+    );
+    return;
+  }
+  res.redirect(`/reglages?saved=1&open=${encodeURIComponent(categoryId)}#cat-${encodeURIComponent(categoryId)}`);
 }
 
 app.post("/reglages/categories", requireCsrf, (req: Request, res: Response) => {
@@ -677,7 +751,7 @@ app.post("/reglages/categories/:id/relance-steps", requireCsrf, (req: Request, r
   const categoryId = req.params.id;
   const body = req.body as Record<string, string>;
   const phase = phaseFromBody(body);
-  runOrRedirectReglagesError(res, "category_relance_step_add", () => {
+  handleRelanceStepMutation(req, res, categoryId, phase, "category_relance_step_add", () => {
     const existing = getCategoryRelanceSteps(categoryId, phase);
     const parsed = parseStep(body);
     addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) }, phase);
@@ -685,9 +759,33 @@ app.post("/reglages/categories/:id/relance-steps", requireCsrf, (req: Request, r
 });
 
 app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
+  const categoryId = req.params.id;
   const phase = phaseFromBody(req.body as Record<string, string>);
-  runOrRedirectReglagesError(res, "category_relance_step_delete", () => {
-    deleteCategoryRelanceStep(req.params.id, Number(req.params.order), phase);
+  handleRelanceStepMutation(req, res, categoryId, phase, "category_relance_step_delete", () => {
+    deleteCategoryRelanceStep(categoryId, Number(req.params.order), phase);
+  });
+});
+
+// ---------- Employés (tag manuel "traité par", voir /performance) ----------
+
+app.post("/reglages/employes", requireCsrf, (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  runOrRedirectReglagesError(res, "employee_create", () => {
+    const name = (body.name ?? "").trim();
+    if (!name) throw new Error("Le nom de l'employé ne peut pas être vide.");
+    createEmployee(name);
+  });
+});
+
+app.post("/reglages/employes/:id/desactiver", requireCsrf, (req: Request, res: Response) => {
+  runOrRedirectReglagesError(res, "employee_deactivate", () => {
+    setEmployeeActive(Number(req.params.id), false);
+  });
+});
+
+app.post("/reglages/employes/:id/activer", requireCsrf, (req: Request, res: Response) => {
+  runOrRedirectReglagesError(res, "employee_activate", () => {
+    setEmployeeActive(Number(req.params.id), true);
   });
 });
 
@@ -711,6 +809,40 @@ app.get("/consommation", (_req: Request, res: Response) => {
   const recent = listRecentAiUsage(50);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderConsommationPage(summary, recent));
+});
+
+// ---------- Performance / KPI (volume par categorie, retard vs SLA, par employe) ----------
+
+type PerformancePeriod = "today" | "7d" | "30d";
+
+const PERFORMANCE_PERIOD_LABELS: Record<PerformancePeriod, string> = {
+  today: "Aujourd'hui",
+  "7d": "7 derniers jours",
+  "30d": "30 derniers jours",
+};
+
+function parsePerformancePeriod(value: string | undefined): PerformancePeriod {
+  return value === "today" || value === "30d" ? value : "7d";
+}
+
+/** Bornes en UTC, comme currentMonthStartIso ci-dessus — la precision au fuseau pres n'est pas critique pour une fenetre de plusieurs jours. */
+function performancePeriodStartIso(period: PerformancePeriod): string {
+  const now = new Date();
+  if (period === "today") {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+  }
+  const days = period === "30d" ? 30 : 7;
+  return new Date(now.getTime() - days * 24 * 60 * 60_000).toISOString();
+}
+
+app.get("/performance", (req: Request, res: Response) => {
+  const period = parsePerformancePeriod(query(req).period);
+  const sinceIso = performancePeriodStartIso(period);
+  const untilIso = new Date().toISOString();
+  const categoryRows = getCategoryPerformance(sinceIso, untilIso);
+  const employeeRows = getEmployeePerformance(sinceIso, untilIso);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderPerformancePage(categoryRows, employeeRows, period));
 });
 
 // ---------- Envois sans dossier (suivi manuel) ----------
@@ -850,11 +982,54 @@ type ActivePage =
   | "envois"
   | "carnet"
   | "consommation"
+  | "performance"
   | "ton-de-marque"
   | "confidentialite";
 
+/** Icones minimalistes (style feather-icons), 16x16, meme gabarit que la maquette importee. */
+const NAV_ICONS: Record<ActivePage, string> = {
+  connexion: `<rect x="4" y="4" width="16" height="16"/><path d="m22 6-10 7L2 6"/>`,
+  dossiers: `<rect x="3" y="3" width="18" height="18"/><path d="M3 9h18"/><path d="M9 21V9"/>`,
+  reglages: `<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>`,
+  journal: `<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>`,
+  envois: `<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>`,
+  carnet: `<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>`,
+  consommation: `<line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>`,
+  performance: `<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>`,
+  "ton-de-marque": `<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>`,
+  confidentialite: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>`,
+};
+
+const NAV_ITEMS: Array<{ key: ActivePage; href: string; label: string }> = [
+  { key: "dossiers", href: "/dossiers", label: "Registre des dossiers" },
+  { key: "reglages", href: "/reglages", label: "Réglages" },
+  { key: "journal", href: "/journal", label: "Journal" },
+  { key: "envois", href: "/envois", label: "Envois" },
+  { key: "carnet", href: "/carnet", label: "Carnet" },
+  { key: "consommation", href: "/consommation", label: "Consommation IA" },
+  { key: "performance", href: "/performance", label: "Performance" },
+  { key: "connexion", href: "/connect", label: "Connexion messagerie" },
+  { key: "ton-de-marque", href: "/ton-de-marque", label: "Ton de marque" },
+  { key: "confidentialite", href: "/confidentialite", label: "Confidentialité" },
+];
+
+function navIcon(key: ActivePage): string {
+  return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${NAV_ICONS[key]}</svg>`;
+}
+
 function pageShell(active: ActivePage, title: string, sub: string, body: string, backLink?: string): string {
   const brand = config.branding;
+  const connection = getConnectionState();
+  const connCard = connection
+    ? `<div class="conn-card">
+        <div class="conn-line"><span class="conn-dot"></span>${connection.provider === "gmail" ? "Gmail" : "Outlook / M365"} connecté</div>
+        <div class="conn-sub">${escapeHtml(connection.email)}</div>
+      </div>`
+    : `<div class="conn-card">
+        <div class="conn-line"><span class="conn-dot off"></span>Messagerie non connectée</div>
+        <div class="conn-sub"><a href="/connect">Connecter une boîte →</a></div>
+      </div>`;
+
   return `<!doctype html>
 <html lang="fr">
 <head>
@@ -865,31 +1040,34 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
 <style>${sharedStyles(brand.primaryColor)}</style>
 </head>
 <body>
-<main>
-  <header class="brand">
-    ${
-      brand.logoUrl
-        ? `<img src="${escapeHtml(brand.logoUrl)}" alt="${escapeHtml(brand.name)}" />`
-        : `<span class="seal">${escapeHtml(brand.name.trim().charAt(0).toUpperCase() || "A")}</span>`
-    }
-    <span class="name">${escapeHtml(brand.name)}</span>
-  </header>
-  <nav>
-    <a href="/" class="${active === "connexion" ? "active" : ""}">Connexion</a>
-    <a href="/dossiers" class="${active === "dossiers" ? "active" : ""}">Registre des dossiers</a>
-    <a href="/reglages" class="${active === "reglages" ? "active" : ""}">Réglages</a>
-    <a href="/journal" class="${active === "journal" ? "active" : ""}">Journal</a>
-    <a href="/envois" class="${active === "envois" ? "active" : ""}">Envois</a>
-    <a href="/carnet" class="${active === "carnet" ? "active" : ""}">Carnet</a>
-    <a href="/consommation" class="${active === "consommation" ? "active" : ""}">Consommation IA</a>
-    <a href="/ton-de-marque" class="${active === "ton-de-marque" ? "active" : ""}">Ton de marque</a>
-    <form method="POST" action="/logout"><button class="btn-link" type="submit">Déconnexion</button></form>
-  </nav>
-  ${backLink ? `<a class="back-link" href="${backLink}">&larr; Retour</a>` : ""}
-  <h1>${escapeHtml(title)}</h1>
-  <p class="sub">${sub}</p>
-  ${body}
-</main>
+<div class="admin-shell">
+  <aside class="admin-sidebar">
+    <div class="brand-block">
+      ${
+        brand.logoUrl
+          ? `<img src="${escapeHtml(brand.logoUrl)}" alt="${escapeHtml(brand.name)}" style="width:34px;height:34px;flex:none" />`
+          : `<span class="brand-mark blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>${escapeHtml(brand.name.trim().charAt(0).toUpperCase() || "A")}</span>`
+      }
+      <div>
+        <div class="brand-name">${escapeHtml(brand.name)}</div>
+        <div class="brand-sub">Assistant Email — Admin</div>
+      </div>
+    </div>
+    <nav class="admin-nav">
+      ${NAV_ITEMS.map((item) => `<a href="${item.href}" class="${active === item.key ? "active" : ""}">${navIcon(item.key)}${escapeHtml(item.label)}</a>`).join("")}
+      <form method="POST" action="/logout" style="margin-top: 4px;">
+        <button class="btn-link" type="submit" style="padding: 10px 12px; opacity: .72; font-family: var(--font-body); font-weight: 400; font-size: 14px;">Déconnexion</button>
+      </form>
+    </nav>
+    ${connCard}
+  </aside>
+  <main class="admin-main">
+    ${backLink ? `<a class="back-link" href="${backLink}">&larr; Retour</a>` : ""}
+    <h1>${escapeHtml(title)}</h1>
+    <p class="sub">${sub}</p>
+    ${body}
+  </main>
+</div>
 </body>
 </html>`;
 }
@@ -1367,9 +1545,9 @@ function renderThreadRow(
     <div class="ledger-main">
       <a class="subject-link" href="${detailHref}">${escapeHtml(row.subject)}</a>
       <div class="ledger-meta">${escapeHtml(row.sender_name ? `${row.sender_name} — ` : "")}${escapeHtml(row.sender_email)}</div>
+      <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap"><span class="tag tag-accent">${escapeHtml(categoryLabel)}</span></div>
     </div>
     <div class="ledger-facts">
-      <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(categoryLabel)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Statut</span><span class="stamp ${stamp.stampClass}">${escapeHtml(stamp.label)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="stamp ${urgencyStamp(row.urgency).stampClass}" title="${escapeHtml(urgencyStamp(row.urgency).hint)}">${escapeHtml(urgencyStamp(row.urgency).label)}</span></div>
       <div class="ledger-fact"><span class="fact-label">Échéance</span><span class="fact-value">${escapeHtml(dueLabel)}</span></div>
@@ -1482,11 +1660,12 @@ function renderDossierDetailPage(
             : ""
         }
         <form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/supprimer"
-              onsubmit="return confirm('Supprimer definitivement les donnees de ce dossier ?');">
+              onsubmit="return confirm('Supprimer definitivement ce dossier ET son historique (rappels, relances, delais) ? Il disparaitra aussi des tableaux de performance. Pour un dossier simplement termine, utilisez plutot « Marquer repondu » ci-dessus, qui garde l\\'historique. Cette action est irreversible.');">
           ${csrfField(csrfToken)}
-          <button class="btn btn-ghost btn-sm" type="submit">Supprimer les données</button>
+          <button class="btn btn-ghost btn-sm" type="submit">Supprimer les données (définitif)</button>
         </form>
       </div>
+      <p class="section-hint">« Marquer répondu » clôture le dossier tout en gardant son historique pour les statistiques — c'est l'action à utiliser au quotidien. « Supprimer les données » est réservé aux erreurs (mauvais fil, doublon, test) : le dossier et tout ce qu'il contient disparaissent définitivement, y compris des tableaux de performance.</p>
     </div>`;
 
   const overrideBanner = isCustom
@@ -1540,6 +1719,26 @@ function renderDossierDetailPage(
       ${addForm}
     </div>`;
 
+  const employees = listEmployees(true);
+  const handledBySection = `
+    <div class="settings-section">
+      <h2>Traité par</h2>
+      <p class="section-hint">Tag manuel — sert uniquement au tableau <a href="/performance">Performance</a> (aucune détection automatique n'est possible depuis la boîte partagée).</p>
+      <form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/traite-par">
+        ${csrfField(csrfToken)}
+        <select name="employeeId">
+          <option value="">— Non assigné —</option>
+          ${employees
+            .map(
+              (e) =>
+                `<option value="${e.id}" ${e.id === thread.handled_by_employee_id ? "selected" : ""}>${escapeHtml(e.name)}${e.active ? "" : " (désactivé)"}</option>`
+            )
+            .join("")}
+        </select>
+        <button class="btn btn-secondary btn-sm" type="submit">Enregistrer</button>
+      </form>
+    </div>`;
+
   const misclassifiedSection =
     thread.status === "skipped"
       ? `<div class="settings-section">
@@ -1567,7 +1766,7 @@ function renderDossierDetailPage(
     "dossiers",
     "Dossier",
     "Détail du dossier, statut de traitement, et séquence de relance appliquée.",
-    banner + header + misclassifiedSection + stepsSection,
+    banner + header + misclassifiedSection + handledBySection + stepsSection,
     "/dossiers"
   );
 }
@@ -1644,7 +1843,7 @@ function renderCategoryStepsPanel(
     executedCount: -1,
     phase,
   });
-  return `<div class="steps-panel">
+  return `<div class="steps-panel" id="steps-panel-${escapeHtml(categoryId)}-${phase}">
     <div class="steps-title">${escapeHtml(title)}</div>
     ${stepsList}
     <form class="step-add-form" method="POST" action="/reglages/categories/${encodeURIComponent(categoryId)}/relance-steps">
@@ -1661,9 +1860,11 @@ function renderCategoryStepsPanel(
 
 function renderReglagesPage(
   categories: CategoryConfig[],
+  employees: Employee[],
   csrfToken: string | undefined,
   saved: string | undefined,
-  error: string | undefined
+  error: string | undefined,
+  openCategory?: string
 ): string {
   const banner = error
     ? `<div class="banner banner-error">L'action a échoué — l'erreur a été journalisée, voir la page <a href="/journal">Journal</a>.</div>`
@@ -1681,7 +1882,7 @@ function renderReglagesPage(
   const categoryBlocks = categories
     .map((cat) => {
       const currentMode = alertModeOf(cat);
-      return `<div class="category-block">
+      return `<div class="category-block" id="cat-${escapeHtml(cat.id)}">
         <form class="category-head-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}">
           ${csrfField(csrfToken)}
           <div>
@@ -1711,10 +1912,10 @@ function renderReglagesPage(
           </div>
           <div><button class="btn btn-primary btn-sm" type="submit">Enregistrer</button></div>
         </form>
-        <details class="advanced-steps">
+        <details class="advanced-steps" ${cat.id === openCategory ? "open" : ""}>
           <summary>Réglages avancés de la séquence de relance (délais précis, étapes multiples)</summary>
-          ${renderCategoryStepsPanel(cat.id, "pre_reply", "Avant notre réponse (nudge équipe)", csrfToken)}
-          ${renderCategoryStepsPanel(cat.id, "post_reply", "Après notre réponse (relance client)", csrfToken)}
+          ${renderCategoryStepsPanel(cat.id, "pre_reply", phaseTitle("pre_reply"), csrfToken)}
+          ${renderCategoryStepsPanel(cat.id, "post_reply", phaseTitle("post_reply"), csrfToken)}
         </details>
       </div>`;
     })
@@ -1733,7 +1934,78 @@ function renderReglagesPage(
         <label class="checkbox-cell"><input type="checkbox" name="acknowledgeAutomatically" checked /> Accusé auto.</label>
         <button class="btn btn-secondary btn-sm" type="submit">+ Nouvelle catégorie</button>
       </form>
-    </div>`;
+    </div>
+    <div class="settings-section">
+      <h2>Employés</h2>
+      <p class="section-hint">Roster utilisé pour le tag « Traité par » sur chaque dossier et le tableau <a href="/performance">Performance</a>. Aucune détection automatique n'est possible (toute l'équipe répond depuis la même boîte connectée) — ce tag reste manuel.</p>
+      <div class="step-list">
+        ${
+          employees.length
+            ? employees
+                .map(
+                  (emp) => `<div class="step-item">
+                    <span class="step-delay">${escapeHtml(emp.name)}</span>
+                    ${emp.active ? "" : `<span class="stamp stamp-late">Désactivé</span>`}
+                    <form method="POST" action="/reglages/employes/${emp.id}/${emp.active ? "desactiver" : "activer"}">
+                      ${csrfField(csrfToken)}
+                      <button class="btn btn-ghost btn-sm" type="submit">${emp.active ? "Désactiver" : "Réactiver"}</button>
+                    </form>
+                  </div>`
+                )
+                .join("")
+            : `<div class="step-empty">Aucun employé enregistré pour l'instant.</div>`
+        }
+      </div>
+      <form class="new-category-form" method="POST" action="/reglages/employes">
+        ${csrfField(csrfToken)}
+        <input type="text" name="name" placeholder="Nom de l'employé" required />
+        <button class="btn btn-secondary btn-sm" type="submit">+ Nouvel employé</button>
+      </form>
+    </div>
+    <script>
+      // Enchainer plusieurs ajouts/suppressions d'etapes de relance sans
+      // rechargement de page (et sans refermer les autres panneaux <details>
+      // ouverts) — voir handleRelanceStepMutation cote serveur, qui renvoie
+      // le fragment HTML du panneau au lieu d'une redirection quand cet
+      // en-tete est present. Repli sur la soumission normale du formulaire
+      // (rechargement complet) si la requete fetch echoue, pour ne jamais
+      // bloquer l'utilisateur en cas de souci reseau.
+      (function () {
+        function enhance(panel) {
+          panel.querySelectorAll("form").forEach(function (form) {
+            if (form.dataset.enhanced) return;
+            form.dataset.enhanced = "1";
+            form.addEventListener("submit", function (event) {
+              if (event.defaultPrevented) return; // ex: confirm() de suppression annulé
+              event.preventDefault();
+              var params = new URLSearchParams(new FormData(form));
+              fetch(form.getAttribute("action"), {
+                method: "POST",
+                headers: { "X-Requested-With": "fetch" },
+                body: params,
+              })
+                .then(function (res) {
+                  if (!res.ok) throw new Error("bad status");
+                  return res.text();
+                })
+                .then(function (html) {
+                  var wrapper = document.createElement("div");
+                  wrapper.innerHTML = html;
+                  var next = wrapper.firstElementChild;
+                  if (next && panel.parentNode) {
+                    panel.parentNode.replaceChild(next, panel);
+                    enhance(next);
+                  }
+                })
+                .catch(function () {
+                  form.submit();
+                });
+            });
+          });
+        }
+        document.querySelectorAll(".steps-panel").forEach(enhance);
+      })();
+    </script>`;
 
   return pageShell(
     "reglages",
@@ -1928,6 +2200,99 @@ function renderConsommationPage(summary: AiUsageSummary, recent: AiUsageEventRow
   );
 }
 
+function formatMinutesPlain(minutes: number): string {
+  if (minutes < 60) return `${trimNumber(minutes)} min`;
+  if (minutes < 1440) return `${trimNumber(minutes / 60)} h`;
+  return `${trimNumber(minutes / 1440)} j`;
+}
+
+function renderLateBucketsCell(buckets: LateBuckets): string {
+  const parts: string[] = [];
+  if (buckets.under30) parts.push(`${buckets.under30}×0-30min`);
+  if (buckets.under60) parts.push(`${buckets.under60}×30-60min`);
+  if (buckets.under240) parts.push(`${buckets.under240}×1-4h`);
+  if (buckets.over240) parts.push(`${buckets.over240}×4h+`);
+  return parts.length ? parts.join(", ") : "—";
+}
+
+function renderPerformancePage(
+  categoryRows: CategoryPerformanceRow[],
+  employeeRows: EmployeePerformanceRow[],
+  period: PerformancePeriod
+): string {
+  const periodTabs = `<div class="filter-tabs">
+    ${(Object.keys(PERFORMANCE_PERIOD_LABELS) as PerformancePeriod[])
+      .map(
+        (p) =>
+          `<a href="/performance?period=${p}" class="${p === period ? "active" : ""}">${escapeHtml(PERFORMANCE_PERIOD_LABELS[p])}</a>`
+      )
+      .join("")}
+  </div>`;
+
+  const totalReceived = categoryRows.reduce((sum, r) => sum + r.received, 0);
+  const totalLate = categoryRows.reduce((sum, r) => sum + r.late, 0);
+  const totalEscalations = categoryRows.reduce((sum, r) => sum + r.escalations, 0);
+
+  const summary = `<div class="metric-grid">
+    <div class="metric"><div class="metric-label">Dossiers reçus</div><div class="metric-value">${totalReceived}</div></div>
+    <div class="metric ${totalLate > 0 ? "metric-warn" : ""}"><div class="metric-label">En retard (vs SLA)</div><div class="metric-value">${totalLate}</div></div>
+    <div class="metric"><div class="metric-label">Escalades (rappel interne envoyé)</div><div class="metric-value">${totalEscalations}</div></div>
+  </div>`;
+
+  const categoryTableRows = categoryRows
+    .map(
+      (row) => `<div class="ledger-row">
+        <div class="ledger-main"><span class="subject-static">${escapeHtml(row.categoryLabel)}</span></div>
+        <div class="ledger-facts">
+          <div class="ledger-fact"><span class="fact-label">Reçus</span><span class="fact-value">${row.received}</span></div>
+          <div class="ledger-fact"><span class="fact-label">À l'heure</span><span class="fact-value">${row.onTime}</span></div>
+          <div class="ledger-fact"><span class="fact-label">En retard</span><span class="stamp ${row.late > 0 ? "stamp-late" : ""}">${row.late}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Détail retards</span><span class="fact-value">${renderLateBucketsCell(row.lateBuckets)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Escalades</span><span class="fact-value">${row.escalations}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Délai moyen de réponse</span><span class="fact-value">${row.avgResponseMinutes !== null ? formatMinutesPlain(row.avgResponseMinutes) : "—"}</span></div>
+        </div>
+      </div>`
+    )
+    .join("");
+  const categoryTable = categoryRows.length
+    ? `<div class="ledger"><div class="ledger-head"><span>Catégorie</span></div>${categoryTableRows}</div>`
+    : `<div class="ledger"><div class="empty">Aucun dossier reçu sur cette période.</div></div>`;
+
+  const employeeTableRows = employeeRows
+    .map(
+      (row) => `<div class="ledger-row">
+        <div class="ledger-main"><span class="subject-static">${escapeHtml(row.employeeName)}</span></div>
+        <div class="ledger-facts">
+          <div class="ledger-fact"><span class="fact-label">Traités</span><span class="fact-value">${row.handled}</span></div>
+          <div class="ledger-fact"><span class="fact-label">À l'heure</span><span class="fact-value">${row.onTime}</span></div>
+          <div class="ledger-fact"><span class="fact-label">En retard</span><span class="stamp ${row.late > 0 ? "stamp-late" : ""}">${row.late}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Détail retards</span><span class="fact-value">${renderLateBucketsCell(row.lateBuckets)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Délai moyen de réponse</span><span class="fact-value">${row.avgResponseMinutes !== null ? formatMinutesPlain(row.avgResponseMinutes) : "—"}</span></div>
+        </div>
+      </div>`
+    )
+    .join("");
+  const employeeTable = employeeRows.length
+    ? `<div class="ledger"><div class="ledger-head"><span>Employé</span></div>${employeeTableRows}</div>`
+    : `<div class="ledger"><div class="empty">Aucun dossier tagué « Traité par » sur cette période — ajoutez des employés depuis Réglages, puis taguez un dossier depuis sa page de détail.</div></div>`;
+
+  const body = `
+    ${periodTabs}
+    ${summary}
+    <div class="settings-section">
+      <h2>Par catégorie</h2>
+      <p class="section-hint">« En retard » se compte contre l'échéance SLA de la catégorie, jamais contre le délai de réponse brut. « Escalades » = dossiers ayant nécessité au moins un vrai rappel interne avant réponse — un signe qu'un dossier a été oublié plutôt que traité dans les temps.</p>
+      ${categoryTable}
+    </div>
+    <div class="settings-section">
+      <h2>Par employé</h2>
+      <p class="section-hint">Basé uniquement sur le tag manuel « Traité par » (page de détail d'un dossier) — aucune détection automatique n'est possible depuis la boîte partagée.</p>
+      ${employeeTable}
+    </div>`;
+
+  return pageShell("performance", "Performance", "Volume traité, respect des délais SLA, et charge par employé.", body);
+}
+
 const PIPELINE_ERROR_CONTEXT_LABELS: Record<string, string> = {
   process_incoming: "Traitement d'un email entrant",
   relance_check: "Vérification des relances",
@@ -2091,7 +2456,7 @@ function renderCarnetPage(
   return pageShell(
     "carnet",
     "Carnet — semaine pilote",
-    `Tout ce que le pipeline a reçu et comment l'IA l'a classé (catégorie, urgence) — avec l'accusé qu'elle aurait rédigé quand il y en a un. Rien n'est envoyé au client. Seul le rappel personnel (${config.carnetRappelDelayMinutes} min sans réponse de l'équipe) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
+    `Tout ce que le pipeline a reçu et comment l'IA l'a classé (catégorie, urgence) — avec l'accusé qu'elle aurait rédigé quand il y en a un. Rien n'est envoyé au client. Seul le rappel interne à l'équipe (délai réglable par catégorie dans Réglages) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
     banner + analyseForm + renderCorpusPanel() + list
   );
 }
@@ -2224,14 +2589,18 @@ function renderConfidentialitePage(): string {
       <div class="card" style="flex-direction:column; align-items:flex-start; gap:8px;">
         <h2>Ce qui est stocké</h2>
         <p>Pour chaque dossier: le sujet de l'email, le nom et l'adresse de l'expéditeur, la catégorie détectée,
-        les dates de réception/accusé/relance, et le nombre de relances envoyées. Le contenu (corps) des messages
-        n'est jamais persisté en base — il transite uniquement vers le connecteur email (Gmail/Outlook) et
+        les dates de réception/accusé/relance, et le nombre de relances envoyées. Le contenu (corps) de chaque
+        email entrant, ainsi que le texte de l'accusé rédigé, sont également journalisés (table de revue "Carnet")
+        pour permettre de vérifier la qualité de la classification et de la rédaction automatiques — ce n'est
+        pas un journal jetable, jamais transmis à des tiers en dehors du connecteur email (Gmail/Outlook) et de
         l'API Claude au moment du traitement.</p>
       </div>
       <div class="card" style="flex-direction:column; align-items:flex-start; gap:8px;">
         <h2>Durée de conservation</h2>
-        <p>Les données sont conservées indéfiniment tant qu'un dossier n'est pas supprimé manuellement depuis
-        sa page de détail (bouton "Supprimer les données"). Il n'y a pas de purge automatique à ce jour.</p>
+        <p>Les données des dossiers (sujet, expéditeur, dates, nombre de relances) sont conservées indéfiniment
+        tant qu'un dossier n'est pas supprimé manuellement depuis sa page de détail (bouton "Supprimer les
+        données"). Le contenu (corps) journalisé pour la revue "Carnet" est purgé automatiquement au-delà de
+        ${config.shadowLogRetentionDays > 0 ? `${config.shadowLogRetentionDays} jours` : "— purge désactivée sur cet environnement"}.</p>
       </div>
       <div class="card" style="flex-direction:column; align-items:flex-start; gap:8px;">
         <h2>Demande de suppression</h2>

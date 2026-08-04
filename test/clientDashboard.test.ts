@@ -12,7 +12,7 @@ process.env.DB_PATH = path.join(dir, "client.db");
 process.env.CATEGORIES_CONFIG_PATH = path.resolve("config/categories.json");
 
 const {
-  getClientMonthlyStats,
+  getClientPeriodKpis,
   getClientThreadDetail,
   hasReminderStep,
   listClientCategories,
@@ -131,29 +131,49 @@ test("getClientThreadDetail builds a checklist from real timestamps and reminder
   assert.equal(detail!.resolved, true);
 });
 
-test("getClientMonthlyStats counts relances only from external step types, not internal ones", () => {
-  const threadId = "t-stats";
+test("BUG-002/005: getClientPeriodKpis excludes outbound-discovered dossiers from the average response time and the processed count", () => {
+  // Dossier normal (inbound): repondu il y a 30 min -> compte dans "processed"
+  // et contribue au delai moyen de reponse.
   upsertThreadReceived({
-    threadId,
-    subject: "Devis stats",
-    senderEmail: "d@example.com",
+    threadId: "t-inbound-delay",
+    subject: "Devis inbound",
+    senderEmail: "inbound@example.com",
     senderName: null,
     categoryId: "devis",
     urgency: "normal",
     slaMinutes: 1440,
-    status: "ack_sent",
-    dueAt: new Date().toISOString(),
+    status: "awaiting_client_reply",
+    dueAt: null,
   });
-  setThreadHumanReplied(threadId);
-  recordReminder(threadId, "internal", "Rappel interne.", "relance_interne");
-  recordReminder(threadId, "external", "Relance externe.", "relance_externe_pre_reponse");
+  setThreadHumanReplied("t-inbound-delay", new Date(Date.now() - 30 * 60_000).toISOString());
 
-  const before = getClientMonthlyStats();
-  recordReminder(threadId, "external", "Encore une relance.", "relance_externe_post_reponse");
-  const after = getClientMonthlyStats();
+  const before = getClientPeriodKpis(7);
 
-  assert.equal(after.relancesEnvoyees, before.relancesEnvoyees + 1);
-  assert.ok(after.delaiMoyenReponseMinutes !== null);
+  // Dossier decouvert en sortie (outbound): received_at = maintenant (heure
+  // de decouverte), human_replied_at = il y a 5 min (heure du vrai envoi) ->
+  // span negatif s'il etait inclus. Doit etre exclu du delai moyen ET du
+  // compteur "processed" (ce n'est pas un email client traite).
+  upsertThreadReceived({
+    threadId: "t-outbound-negative",
+    subject: "Devis a froid",
+    senderEmail: "prospect@example.com",
+    senderName: null,
+    categoryId: "devis",
+    urgency: "normal",
+    slaMinutes: 1440,
+    status: "awaiting_client_reply",
+    dueAt: null,
+    origin: "outbound",
+  });
+  setThreadHumanReplied("t-outbound-negative", new Date(Date.now() - 5 * 60_000).toISOString());
+
+  const after = getClientPeriodKpis(7);
+
+  // La moyenne ne doit jamais devenir negative ni etre tiree vers le bas par
+  // le dossier outbound, et le compteur "processed" ne doit pas bouger.
+  assert.ok(after.avgResponseMinutes !== null && after.avgResponseMinutes >= 0);
+  assert.equal(after.avgResponseMinutes, before.avgResponseMinutes);
+  assert.equal(after.processed, before.processed);
 });
 
 test("listClientCategories excludes spam_newsletter and interne, and updateClientCategorySla only touches the SLA", () => {
