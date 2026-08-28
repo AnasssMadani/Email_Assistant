@@ -353,6 +353,22 @@ implemented. Never mark a phase complete based only on planned code.
   are implemented but unexercised; Phase 2.5 (human approval, ai_runs/ai_decisions/
   approvals tables) has not been started.
 
+- 2026-08-28 (later same day): `apps/web` rebuilt on real shadcn/ui (Button, Card,
+  Input, Label, Table, Badge — hand-authored to match the CLI's actual output,
+  `components.json` + CSS-variable theme in place) instead of raw Tailwind-on-HTML.
+  The `npx shadcn` CLI itself cannot run from this sandboxed environment
+  (`ui.shadcn.com` is not on the allowed outbound domain list — confirmed via a 403
+  at the network proxy, not a local misconfiguration); components were written by
+  hand to the same source shadcn's CLI generates, so `npx shadcn add <component>`
+  from a real dev machine will still work and match. Verified with a real
+  `next build` + a rendered screenshot (Playwright), not just a clean compile.
+  Also clarified with the user: this branch has never been deployed anywhere
+  (Render only auto-deploys `main`), and once merged, the existing Render service
+  needs its Root Directory set to `legacy/` in the dashboard — the repo restructure
+  moved the old root-level `package.json`/`render.yaml` there, so a plain merge to
+  main without that dashboard change would break the legacy service's build/start
+  commands (no `start:all` at the new repo root).
+
 ## DECISION PRINCIPLE
 
 When choosing between:

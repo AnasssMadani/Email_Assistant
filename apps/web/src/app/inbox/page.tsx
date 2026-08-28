@@ -4,6 +4,9 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { apiFetch } from "@/lib/apiClient";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 interface ThreadRow {
   id: string;
@@ -15,6 +18,12 @@ interface ThreadRow {
   receivedAt: string;
   updatedAt: string;
 }
+
+const URGENCY_VARIANT: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
+  low: "outline",
+  normal: "secondary",
+  high: "destructive",
+};
 
 /**
  * Phase 1 Inbox: the dossier list from apps/api. No thread-detail view, no
@@ -61,36 +70,43 @@ export default function InboxPage() {
 
   return (
     <main className="mx-auto max-w-4xl px-6 py-10">
-      <h1 className="text-xl font-semibold">Inbox</h1>
+      <Card>
+        <CardHeader>
+          <CardTitle>Inbox</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          {!error && threads === null && <p className="text-sm text-muted-foreground">Loading…</p>}
+          {threads !== null && threads.length === 0 && <p className="text-sm text-muted-foreground">No dossiers yet.</p>}
 
-      {error && <p className="mt-4 text-sm text-red-600">{error}</p>}
-      {!error && threads === null && <p className="mt-4 text-sm text-slate-500">Loading…</p>}
-      {threads !== null && threads.length === 0 && <p className="mt-4 text-sm text-slate-500">No dossiers yet.</p>}
-
-      {threads !== null && threads.length > 0 && (
-        <table className="mt-6 w-full text-left text-sm">
-          <thead className="border-b border-slate-200 text-slate-500">
-            <tr>
-              <th className="py-2 pr-4">Subject</th>
-              <th className="py-2 pr-4">From</th>
-              <th className="py-2 pr-4">Status</th>
-              <th className="py-2 pr-4">Urgency</th>
-              <th className="py-2">Received</th>
-            </tr>
-          </thead>
-          <tbody>
-            {threads.map((t) => (
-              <tr key={t.id} className="border-b border-slate-100">
-                <td className="py-2 pr-4">{t.subject}</td>
-                <td className="py-2 pr-4">{t.senderName ?? t.senderEmail}</td>
-                <td className="py-2 pr-4">{t.status}</td>
-                <td className="py-2 pr-4">{t.urgency}</td>
-                <td className="py-2">{new Date(t.receivedAt).toLocaleString()}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+          {threads !== null && threads.length > 0 && (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Subject</TableHead>
+                  <TableHead>From</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Urgency</TableHead>
+                  <TableHead>Received</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {threads.map((t) => (
+                  <TableRow key={t.id}>
+                    <TableCell className="font-medium">{t.subject}</TableCell>
+                    <TableCell>{t.senderName ?? t.senderEmail}</TableCell>
+                    <TableCell>{t.status}</TableCell>
+                    <TableCell>
+                      <Badge variant={URGENCY_VARIANT[t.urgency] ?? "secondary"}>{t.urgency}</Badge>
+                    </TableCell>
+                    <TableCell>{new Date(t.receivedAt).toLocaleString()}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
     </main>
   );
 }
