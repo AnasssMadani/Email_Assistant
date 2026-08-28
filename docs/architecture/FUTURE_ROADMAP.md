@@ -369,6 +369,32 @@ implemented. Never mark a phase complete based only on planned code.
   main without that dashboard change would break the legacy service's build/start
   commands (no `start:all` at the new repo root).
 
+- 2026-08-28 (deploy incident + resolution): turned out the assumption above was
+  wrong in one respect — the **production** Render service (`accuse-reception-
+  relance`, Blueprint-managed) was itself pointed at this branch, not `main`, and
+  went down (crash-looping on the now-nonexistent `start:all` script) for a window
+  while this was being debugged. Root-caused and fixed in order:
+  (1) the root `package.json`'s own `build` script used `npm run build --workspaces`,
+  which races workspaces concurrently instead of respecting dependency order —
+  fixed to build one workspace at a time via `-w`, in order (this was a real bug,
+  independent of the deploy confusion, and is what CI now uses too — see
+  `.github/workflows/ci.yml` and root `package.json`'s `build`/`build:packages`);
+  (2) `apps/web`'s `start` script hardcoded port 4300 instead of Render's assigned
+  `$PORT` — fixed; (3) the production service's Branch was switched back to `main`
+  by the user, restoring the pilot to the last known-good `legacy/` deploy. A
+  **separate**, non-Blueprint, free-tier Render service (`Email_Assistant`,
+  `email-assistant-qf3t.onrender.com`) was then set up pointed at this branch as
+  the actual place to test the new monorepo — confirmed live and rendering
+  correctly (Dashboard/Inbox/Connections/Login pages, real shadcn/ui). It has no
+  `NEXT_PUBLIC_SUPABASE_*` env vars yet (no Supabase project exists), so Login
+  fails gracefully but the rest of the UI works.
+
+  **Lesson for future sessions**: never assume which branch a Render service
+  watches from `render.yaml` alone — a service's Branch is a dashboard/Blueprint
+  setting that can drift independently of the repo. When restructuring a repo that
+  has a live Render deployment, confirm the connected service's Branch AND whether
+  it's Blueprint-managed before pushing, not after a failure surfaces.
+
 ## DECISION PRINCIPLE
 
 When choosing between:
