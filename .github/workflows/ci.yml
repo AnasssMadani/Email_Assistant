@@ -32,19 +32,12 @@ jobs:
       # that doesn't touch a live database (typecheck across all workspaces, plus
       # packages/core's pure-function unit tests: prefilter, template engine).
       #
-      # Built one workspace per line, in dependency order, NOT as a single
-      # `--workspace=a --workspace=b ...` command — npm does not run multiple
-      # -w targets sequentially (they can start before an earlier one's dist/
-      # output exists), so combining them here silently races and intermittently
-      # fails on a cold cache. Each package only needs its own deps built first.
+      # `npm run build` (root package.json) is the single source of truth for
+      # build order — it builds packages one at a time via `-w`, in dependency
+      # order, NOT `npm run build --workspaces` (that runs targets concurrently
+      # and can start a dependent before its dependency's dist/ output exists —
+      # this is exactly what broke the first Render deploy of this monorepo).
       - run: npm ci
-      - run: npm run build -w packages/shared
-      - run: npm run build -w packages/db
-      - run: npm run build -w packages/queue
-      - run: npm run build -w packages/email
-      - run: npm run build -w packages/ai
-      - run: npm run build -w packages/core
-      - run: npm run build -w packages/auth
+      - run: npm run build
       - run: npm run typecheck --workspaces --if-present
       - run: npm test -w packages/core
-      - run: npm run build -w apps/web

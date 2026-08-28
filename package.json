@@ -14,7 +14,8 @@
   "scripts": {
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build:packages && npm run build -w apps/api --if-present && npm run build -w apps/worker --if-present && npm run build -w apps/web --if-present",
+    "build:packages": "npm run build -w packages/shared && npm run build -w packages/db && npm run build -w packages/queue && npm run build -w packages/email && npm run build -w packages/ai && npm run build -w packages/core && npm run build -w packages/auth",
     "db:generate": "npm run generate -w @global-link/db",
     "db:migrate": "npm run migrate -w @global-link/db"
   },
