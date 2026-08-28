@@ -1,0 +1,22 @@
+{
+  "name": "@global-link/ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "node --max-old-space-size=4096 ../../node_modules/typescript/bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "@global-link/shared": "*",
+    "@global-link/db": "*",
+    "@anthropic-ai/sdk": "^0.122.0",
+    "drizzle-orm": "^0.36.4",
+    "zod": "^3.23.8"
+  }
+}

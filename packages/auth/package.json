@@ -1,0 +1,23 @@
+{
+  "name": "@global-link/auth",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "node --max-old-space-size=4096 ../../node_modules/typescript/bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "@global-link/shared": "*",
+    "@global-link/db": "*",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7"
+  }
+}

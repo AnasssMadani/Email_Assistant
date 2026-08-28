@@ -1,0 +1,25 @@
+{
+  "name": "@global-link/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "node --max-old-space-size=4096 ../../node_modules/typescript/bin/tsc --noEmit",
+    "generate": "drizzle-kit generate",
+    "migrate": "npm run build && node dist/migrate.js"
+  },
+  "dependencies": {
+    "@global-link/shared": "*",
+    "drizzle-orm": "^0.36.4",
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.28.1"
+  }
+}

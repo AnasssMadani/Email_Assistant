@@ -1,0 +1,26 @@
+{
+  "name": "@global-link/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js",
+    "dev": "node ../../node_modules/tsx/dist/cli.mjs watch src/index.ts",
+    "typecheck": "node --max-old-space-size=4096 ../../node_modules/typescript/bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "@global-link/shared": "*",
+    "@global-link/db": "*",
+    "@global-link/email": "*",
+    "@global-link/auth": "*",
+    "fastify": "^5.1.0",
+    "fastify-plugin": "^5.0.1",
+    "@fastify/cors": "^10.0.1",
+    "drizzle-orm": "^0.36.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

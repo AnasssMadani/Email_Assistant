@@ -1,0 +1,26 @@
+{
+  "name": "@global-link/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "node --max-old-space-size=4096 ../../node_modules/typescript/bin/tsc --noEmit",
+    "test": "node ../../node_modules/tsx/dist/cli.mjs --test test/**/*.test.ts"
+  },
+  "dependencies": {
+    "@global-link/shared": "*",
+    "@global-link/db": "*",
+    "@global-link/ai": "*",
+    "drizzle-orm": "^0.36.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

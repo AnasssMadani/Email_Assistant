@@ -1,0 +1,21 @@
+{
+  "name": "@global-link/email",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "node --max-old-space-size=4096 ../../node_modules/typescript/bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "@global-link/shared": "*",
+    "@global-link/db": "*",
+    "google-auth-library": "^9.15.0",
+    "googleapis": "^144.0.0"
+  }
+}

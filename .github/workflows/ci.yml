@@ -6,13 +6,45 @@ on:
   pull_request:
 
 jobs:
-  test:
+  legacy:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: legacy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm ci
-      - run: npm run typecheck
+      - run: NODE_OPTIONS="--max-old-space-size=4096" node ./node_modules/typescript/bin/tsc --noEmit
       - run: npm test
+
+  platform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # No Supabase/Postgres service here — packages/db's own tests would need a
+      # real Postgres (see packages/db/README.md); this stage covers everything
+      # that doesn't touch a live database (typecheck across all workspaces, plus
+      # packages/core's pure-function unit tests: prefilter, template engine).
+      #
+      # Built one workspace per line, in dependency order, NOT as a single
+      # `--workspace=a --workspace=b ...` command — npm does not run multiple
+      # -w targets sequentially (they can start before an earlier one's dist/
+      # output exists), so combining them here silently races and intermittently
+      # fails on a cold cache. Each package only needs its own deps built first.
+      - run: npm ci
+      - run: npm run build -w packages/shared
+      - run: npm run build -w packages/db
+      - run: npm run build -w packages/queue
+      - run: npm run build -w packages/email
+      - run: npm run build -w packages/ai
+      - run: npm run build -w packages/core
+      - run: npm run build -w packages/auth
+      - run: npm run typecheck --workspaces --if-present
+      - run: npm test -w packages/core
+      - run: npm run build -w apps/web
