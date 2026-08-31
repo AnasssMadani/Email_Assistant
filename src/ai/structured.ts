@@ -8,8 +8,8 @@ import { recordAiUsage } from "../db.js";
  * alimente le compteur de consommation/cout de la page /consommation.
  * `callType` identifie l'appel (ex: "classification", "accuse_reception").
  */
-export function recordUsage(callType: string, threadId: string | null, usage: Anthropic.Usage): void {
-  recordAiUsage({
+export async function recordUsage(callType: string, threadId: string | null, usage: Anthropic.Usage): Promise<void> {
+  await recordAiUsage({
     callType,
     threadId,
     model: CLAUDE_MODEL,

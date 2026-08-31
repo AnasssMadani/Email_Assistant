@@ -11,3 +11,8 @@ export function getClient(): Anthropic {
   }
   return client;
 }
+
+/** Reserve aux tests: injecte un client Anthropic factice, sans appel reseau ni cle API. */
+export function setClientForTesting(testClient: Anthropic): void {
+  client = testClient;
+}

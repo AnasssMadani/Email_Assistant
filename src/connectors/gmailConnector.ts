@@ -90,9 +90,9 @@ export class GmailConnector implements EmailConnector {
       })
     );
 
-    const ids = (list.data.messages ?? [])
-      .map((m) => m.id)
-      .filter((id): id is string => !!id && !isMessageProcessed(id));
+    const candidateIds = (list.data.messages ?? []).map((m) => m.id).filter((id): id is string => !!id);
+    const processedFlags = await Promise.all(candidateIds.map((id) => isMessageProcessed(id)));
+    const ids = candidateIds.filter((_id, i) => !processedFlags[i]);
 
     const fulls = await Promise.all(
       ids.map((id) => withBackoff(() => gmail.users.messages.get({ userId: "me", id, format: "full" })))

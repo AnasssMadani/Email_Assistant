@@ -714,6 +714,25 @@ export async function listReminders(limit = 150): Promise<ReminderRow[]> {
   return result.rows;
 }
 
+/**
+ * Rappels/relances (reels ou "mode test" — voir shadowModeEnabled) d'UN
+ * dossier precis, du plus recent au plus ancien — utilise sur la page de
+ * detail du dossier pour revoir l'integralite de ce que le pipeline a
+ * rédigé le concernant (accuse via /carnet, relances ici), avant d'activer
+ * les envois reels.
+ */
+export async function listRemindersForThread(threadId: string): Promise<ReminderRow[]> {
+  const result = await pool.query<ReminderRow>(
+    `SELECT r.id, r.thread_id, r.kind, r.note, r.created_at, t.subject, t.sender_email
+     FROM reminders r
+     JOIN threads t ON t.thread_id = r.thread_id
+     WHERE r.thread_id = $1
+     ORDER BY r.created_at DESC`,
+    [threadId]
+  );
+  return result.rows;
+}
+
 // ---------- Erreurs du pipeline (visibles depuis le Journal) ----------
 
 export interface PipelineErrorRow {

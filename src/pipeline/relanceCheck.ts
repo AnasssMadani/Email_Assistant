@@ -196,15 +196,18 @@ export async function checkPreReplyThread(
       return;
     }
 
-    // Mode carnet: "rien ne part jamais vers le client" couvre TOUTE relance
-    // externe, pas seulement l'accuse — pas de version partielle ou de
-    // brouillon ici (hors scope, voir brief), juste la sequence qui avance
-    // sans rien envoyer, comme pour une alerte interne filtree.
+    const category = await getCategory(row.category_id);
+
+    // Mode test: aucune relance externe reelle n'est envoyee, mais le texte
+    // est quand meme redige par Claude et journalise integralement (objet +
+    // corps) pour permettre une revue complete depuis la page du dossier
+    // avant d'activer les envois reels (voir shadowModeEnabled).
     if (config.shadowModeEnabled) {
+      const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
       await recordReminder(
         row.thread_id,
         "internal",
-        `[mode carnet] Relance externe qui aurait ete envoyee a ${row.sender_email} pour "${row.subject}" — non envoyee (mode carnet actif).`
+        `[Mode test] Relance externe qui aurait ete envoyee a ${row.sender_email} — non envoyee.\n\nObjet: ${buildReplySubject(row.subject)}\n\n${relance.body}`
       );
       await incrementRelance(row.thread_id, "relance_sent");
       return;
@@ -224,7 +227,6 @@ export async function checkPreReplyThread(
     // au lieu de l'enchainer a la suite de notre accuse.
     const lastMessageInThread = thread.messages[thread.messages.length - 1];
 
-    const category = await getCategory(row.category_id);
     const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
     await tagSource("Messagerie — envoi de la relance", () =>
       connector.sendReply({
@@ -316,14 +318,24 @@ export async function checkPostReplyThread(
       return;
     }
 
-    // Mode carnet: idem checkPreReplyThread — aucune relance externe reelle
+    const category = await getCategory(row.category_id);
+
+    // Mode test: idem checkPreReplyThread — aucune relance externe reelle
     // cette semaine, y compris celle-ci (relancer le client apres NOTRE
-    // reponse), quelle que soit la sequence post_reply configuree.
+    // reponse), quelle que soit la sequence post_reply configuree. Le texte
+    // est quand meme redige et journalise integralement pour revue.
     if (config.shadowModeEnabled) {
+      const relance = await draftRelance(
+        thread,
+        lastOutbound,
+        category,
+        "post_reply",
+        row.outbound_had_attachment === 1
+      );
       await recordReminder(
         row.thread_id,
         "internal",
-        `[mode carnet] Relance post-reponse qui aurait ete envoyee a ${row.sender_email} pour "${row.subject}" — non envoyee (mode carnet actif).`
+        `[Mode test] Relance post-reponse qui aurait ete envoyee a ${row.sender_email} — non envoyee.\n\nObjet: ${buildReplySubject(row.subject)}\n\n${relance.body}`
       );
       await incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
       return;
@@ -336,7 +348,6 @@ export async function checkPostReplyThread(
       return; // post_reply_relance_count intact: reessaie identiquement au prochain cycle
     }
 
-    const category = await getCategory(row.category_id);
     const relance = await draftRelance(
       thread,
       lastOutbound,

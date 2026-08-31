@@ -153,7 +153,7 @@ async function draftRelanceOnce(
     tool_choice: { type: "tool", name: "write_relance" },
     messages: [{ role: "user", content: formatSingleMessage(anchorMessage) }],
   });
-  recordUsage(phase === "post_reply" ? "relance_post_reponse" : "relance_pre_reponse", thread.id, response.usage);
+  await recordUsage(phase === "post_reply" ? "relance_post_reponse" : "relance_pre_reponse", thread.id, response.usage);
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"

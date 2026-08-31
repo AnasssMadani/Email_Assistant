@@ -75,7 +75,7 @@ async function draftAcknowledgementOnce(
     tool_choice: { type: "tool", name: "write_acknowledgement" },
     messages: [{ role: "user", content: formatSingleMessage(incoming) }],
   });
-  recordUsage("accuse_reception", thread.id, response.usage);
+  await recordUsage("accuse_reception", thread.id, response.usage);
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"

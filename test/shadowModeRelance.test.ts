@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type Anthropic from "@anthropic-ai/sdk";
 import { freshTestDb } from "./_pgTestDb.js";
 import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
 
@@ -13,11 +14,27 @@ process.env.SHADOW_MODE = "true";
 const {
   addThreadRelanceStep,
   getThreadRow,
+  listRemindersForThread,
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
 } = await freshTestDb();
 const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
+const { setClientForTesting } = await import("../src/ai/client.js");
+
+// Mode test rédige quand même le texte de la relance (voir relanceCheck.ts)
+// pour qu'il soit journalisé et relisible — donc draftRelance() appelle
+// bien Claude ici, sans clé API reelle dans cet environnement de test.
+setClientForTesting({
+  messages: {
+    async create() {
+      return {
+        content: [{ type: "tool_use", input: { subject: "Re: Devis", body: "Relance factice pour le test." } }],
+        usage: { input_tokens: 10, output_tokens: 10 },
+      };
+    },
+  },
+} as unknown as Anthropic);
 
 function fakeMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
   return {
@@ -87,6 +104,12 @@ test("checkPreReplyThread never sends a real external relance when shadowModeEna
   assert.equal(sendReplyCalls, 0);
   const after = await getThreadRow(threadId);
   assert.equal(after?.relance_count, 1); // sequence advanced despite no real send
+
+  // Le texte redige par Claude doit rester consultable — mode test n'est pas
+  // un simple "rien ne se passe", c'est "rien n'est envoye mais tout est
+  // redige et journalise pour revue".
+  const reminders = await listRemindersForThread(threadId);
+  assert.ok(reminders.some((r) => r.note?.includes("[Mode test]") && r.note?.includes("Relance factice pour le test.")));
 });
 
 test("checkPostReplyThread never sends a real external relance when shadowModeEnabled, but still advances the sequence", async () => {
@@ -115,4 +138,7 @@ test("checkPostReplyThread never sends a real external relance when shadowModeEn
   assert.equal(sendReplyCalls, 0);
   const after = await getThreadRow(threadId);
   assert.equal(after?.post_reply_relance_count, 1); // sequence advanced despite no real send
+
+  const reminders = await listRemindersForThread(threadId);
+  assert.ok(reminders.some((r) => r.note?.includes("[Mode test]") && r.note?.includes("Relance factice pour le test.")));
 });

@@ -67,7 +67,7 @@ async function analyzeCategoryCorpusOnce(categoryLabel: string, replies: string[
     tool_choice: { type: "tool", name: "analyze_reply_corpus" },
     messages: [{ role: "user", content: examplesBlock }],
   });
-  recordUsage("analyse_corpus", null, response.usage);
+  await recordUsage("analyse_corpus", null, response.usage);
 
   const toolUse = response.content.find((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
   if (!toolUse) {

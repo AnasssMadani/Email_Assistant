@@ -37,6 +37,7 @@ import {
   listPipelineErrors,
   listRecentAiUsage,
   listReminders,
+  listRemindersForThread,
   listRecentThreads,
   listShadowLogEntries,
   markMessageProcessed,
@@ -428,9 +429,16 @@ app.get("/dossiers/:threadId", async (req: Request, res: Response) => {
     res.redirect("/dossiers");
     return;
   }
+  const reminders = await listRemindersForThread(thread.thread_id);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(
-    await renderDossierDetailPage(thread, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error)
+    await renderDossierDetailPage(
+      thread,
+      reminders,
+      res.locals.csrfToken as string | undefined,
+      query(req).saved,
+      query(req).error
+    )
   );
 });
 
@@ -1455,6 +1463,7 @@ function renderThreadRow(
 
 async function renderDossierDetailPage(
   thread: ThreadRow,
+  reminders: ReminderRow[],
   csrfToken: string | undefined,
   saved: string | undefined,
   error: string | undefined
@@ -1616,11 +1625,34 @@ async function renderDossierDetailPage(
         </div>`
       : "";
 
+  const remindersSection = reminders.length
+    ? `<div class="settings-section">
+        <h2>Rappels &amp; relances de ce dossier</h2>
+        <p class="section-hint">Historique complet, du plus récent au plus ancien — y compris le texte intégral de ce qui aurait été envoyé en mode test.</p>
+        <div class="ledger">
+          ${reminders
+            .map((r) => {
+              const isTestDraft = (r.note ?? "").startsWith("[Mode test]");
+              return `<div class="ledger-row">
+                <div class="ledger-main">
+                  ${isTestDraft ? `<span class="stamp stamp-wait">Mode test — non envoyé</span>` : `<span class="stamp stamp-done">Envoyé</span>`}
+                  <div class="ledger-fact" style="margin-top:8px;"><span class="fact-value" style="white-space:pre-wrap;">${escapeHtml(r.note ?? "")}</span></div>
+                </div>
+                <div class="ledger-facts">
+                  <div class="ledger-fact"><span class="fact-label">Date</span><span class="fact-value">${escapeHtml(formatDateTime(r.created_at))}</span></div>
+                </div>
+              </div>`;
+            })
+            .join("")}
+        </div>
+      </div>`
+    : "";
+
   return pageShell(
     "dossiers",
     "Dossier",
     "Détail du dossier, statut de traitement, et séquence de relance appliquée.",
-    banner + header + misclassifiedSection + stepsSection,
+    banner + header + misclassifiedSection + stepsSection + remindersSection,
     "/dossiers"
   );
 }

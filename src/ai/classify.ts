@@ -65,7 +65,7 @@ async function classifyEmailOnce(
     tool_choice: { type: "tool", name: "classify_email" },
     messages: [{ role: "user", content: formatSingleMessage(incoming) }],
   });
-  recordUsage("classification", thread.id, response.usage);
+  await recordUsage("classification", thread.id, response.usage);
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
