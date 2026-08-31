@@ -1,8 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { freshTestDb } from "./_pgTestDb.js";
 import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
 
 // Regression: l'equipe veut etre alertee quand ELLE n'a pas repondu a temps
@@ -10,11 +8,6 @@ import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, Sen
 // reponse (post_reply) - ce second cas n'appelle aucune action de leur part
 // et ne doit plus jamais envoyer de vrai rappel interne, quelle que soit la
 // categorie/urgence configuree.
-const dir = mkdtempSync(path.join(tmpdir(), "post-reply-internal-alert-test-"));
-process.env.DB_PATH = path.join(dir, "post-reply-internal-alert.db");
-process.env.CATEGORIES_CONFIG_PATH = path.resolve("config/categories.json");
-
-const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
 const {
   addThreadRelanceStep,
   getThreadRow,
@@ -22,7 +15,8 @@ const {
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
-} = await import("../src/db.js");
+} = await freshTestDb();
+const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
 
 function fakeMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
   return {
@@ -72,7 +66,7 @@ test("checkPostReplyThread never sends a real internal notification when the cli
   const threadId = "t-post-reply-internal-disabled";
   let notificationCalls = 0;
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -83,19 +77,19 @@ test("checkPostReplyThread never sends a real internal notification when the cli
     status: "ack_sent",
     dueAt: new Date(Date.now() - 60_000).toISOString(),
   });
-  setThreadHumanReplied(threadId, new Date(Date.now() - 30_000).toISOString());
-  addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "post_reply");
+  await setThreadHumanReplied(threadId, new Date(Date.now() - 30_000).toISOString());
+  await addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "post_reply");
 
   const ourReply = fakeMessage({ id: "m-our-reply", threadId, isFromUs: true, receivedAt: new Date(Date.now() - 20_000) });
   const connector = fakeConnector({ id: threadId, messages: [ourReply] }, () => notificationCalls++);
 
-  const row = getThreadRow(threadId)!;
+  const row = (await getThreadRow(threadId))!;
   await checkPostReplyThread(connector, row, { order: 1, channel: "internal", delayMinutes: 0 });
 
   assert.equal(notificationCalls, 0);
-  assert.equal(hasReminderStep(threadId, "relance_interne"), false);
-  assert.equal(hasReminderStep(threadId, "relance_interne_filtree"), true);
-  const after = getThreadRow(threadId);
+  assert.equal(await hasReminderStep(threadId, "relance_interne"), false);
+  assert.equal(await hasReminderStep(threadId, "relance_interne_filtree"), true);
+  const after = await getThreadRow(threadId);
   assert.equal(after?.post_reply_relance_count, 1); // sequence advances regardless
 });
 
@@ -106,7 +100,7 @@ test("checkPreReplyThread still sends a real internal notification when the team
   const threadId = "t-pre-reply-internal-still-real";
   let notificationCalls = 0;
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -117,15 +111,15 @@ test("checkPreReplyThread still sends a real internal notification when the team
     status: "ack_sent",
     dueAt: new Date(Date.now() - 60_000).toISOString(),
   });
-  setThreadAckSent(threadId);
-  addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
+  await setThreadAckSent(threadId);
+  await addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
 
   const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
   const connector = fakeConnector({ id: threadId, messages: [clientMessage] }, () => notificationCalls++);
 
-  const row = getThreadRow(threadId)!;
+  const row = (await getThreadRow(threadId))!;
   await checkPreReplyThread(connector, row, { order: 1, channel: "internal", delayMinutes: 0 });
 
   assert.equal(notificationCalls, 1);
-  assert.equal(hasReminderStep(threadId, "relance_interne"), true);
+  assert.equal(await hasReminderStep(threadId, "relance_interne"), true);
 });

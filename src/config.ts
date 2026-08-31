@@ -1,6 +1,4 @@
 import "dotenv/config";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -37,8 +35,16 @@ export const config = {
   // (quelques minutes, meme jour) fiables — reste ajustable via l'env si
   // besoin d'un intervalle different.
   relanceCheckCron: process.env.RELANCE_CHECK_CRON ?? "*/2 * * * *",
-  dbPath: process.env.DB_PATH ?? "./data/app.db",
+  // Chaine de connexion Postgres/Supabase (postgresql://user:pass@host:port/db).
+  // Une instance par environnement (dev/prod) — voir README, section Supabase.
+  databaseUrl: process.env.DATABASE_URL ?? "",
   categoriesConfigPath: process.env.CATEGORIES_CONFIG_PATH ?? "./config/categories.json",
+  // Contenu par defaut, lu UNE SEULE FOIS au tout premier demarrage (base
+  // vide) pour amorcer la ligne `brand_voice` en base — modifiable ensuite
+  // uniquement depuis /ton-de-marque, jamais relu depuis ce fichier. Le
+  // stockage en base (plutot que ce fichier seul) evite que Render ne
+  // reinitialise silencieusement les modifications a chaque redeploiement
+  // (le disque de build n'est pas persistant, contrairement a /var/data).
   brandVoicePath: process.env.BRAND_VOICE_PATH ?? "./config/brand-voice.md",
   connectionStatePath: process.env.CONNECTION_STATE_PATH ?? "./data/connection.json",
   emailConnector: (process.env.EMAIL_CONNECTOR ?? "gmail") as "gmail" | "graph",
@@ -58,7 +64,9 @@ export const config = {
   shadowModeEnabled: process.env.SHADOW_MODE === "true",
   // Dossier des notes de style par categorie, generees a partir du corpus des
   // vraies reponses de l'equipe (voir src/pipeline/corpusAnalysis.ts) et
-  // relues par le prompt de redaction de l'accuse.
+  // relues par le prompt de redaction de l'accuse. Le contenu vit en base
+  // (table category_playbooks) — ce dossier ne sert plus que de source pour
+  // d'eventuels fichiers de depart versionnes avec le projet.
   categoryPlaybooksDir: process.env.CATEGORY_PLAYBOOKS_DIR ?? "./config/category-playbooks",
   // Frequence de la passe d'analyse du corpus (voir corpusAnalysis.ts). Nuit,
   // faible trafic — un declenchement manuel depuis /carnet reste disponible
@@ -120,36 +128,4 @@ export function requireAnthropicApiKey(): string {
  */
 export function isProductionLike(): boolean {
   return process.env.NODE_ENV === "production";
-}
-
-export function loadBrandVoice(): string {
-  return readFileSync(path.resolve(config.brandVoicePath), "utf-8");
-}
-
-/** Ecrit le ton de marque depuis la page /ton-de-marque — evite d'avoir a editer le fichier a la main ou redeployer pour ajuster le style des emails generes. */
-export function saveBrandVoice(content: string): void {
-  writeFileSync(path.resolve(config.brandVoicePath), content, "utf-8");
-}
-
-function categoryPlaybookPath(categoryId: string): string {
-  return path.join(path.resolve(config.categoryPlaybooksDir), `${categoryId}.md`);
-}
-
-/**
- * Contrairement a loadBrandVoice, tous les fichiers n'existent pas encore en
- * debut de semaine pilote (une categorie sans corpus n'a jamais ete
- * analysee) — l'absence de fichier n'est pas une erreur, juste "pas encore
- * de note de style", donc chaine vide plutot qu'une exception.
- */
-export function loadCategoryPlaybook(categoryId: string): string {
-  try {
-    return readFileSync(categoryPlaybookPath(categoryId), "utf-8");
-  } catch {
-    return "";
-  }
-}
-
-export function saveCategoryPlaybook(categoryId: string, content: string): void {
-  mkdirSync(path.resolve(config.categoryPlaybooksDir), { recursive: true });
-  writeFileSync(categoryPlaybookPath(categoryId), content, "utf-8");
 }

@@ -38,12 +38,12 @@ async function pollInbox(): Promise<void> {
         await processIncomingMessage(connector, message);
       } catch (err) {
         console.error(`[scrutation boite] erreur sur le message ${message.id}:`, err);
-        recordPipelineError("process_incoming", message.threadId || null, (err as Error).message);
+        await recordPipelineError("process_incoming", message.threadId || null, (err as Error).message);
       }
     }
   } catch (err) {
     console.error("[scrutation boite] erreur:", err);
-    recordPipelineError("process_incoming", null, (err as Error).message);
+    await recordPipelineError("process_incoming", null, (err as Error).message);
   } finally {
     pollInProgress = false;
   }
@@ -68,7 +68,7 @@ async function discoverOutbound(): Promise<void> {
     await discoverOutboundOnlyThreads(createEmailConnector());
   } catch (err) {
     console.error("[decouverte envois] erreur:", err);
-    recordPipelineError("discover_outbound", null, (err as Error).message);
+    await recordPipelineError("discover_outbound", null, (err as Error).message);
   } finally {
     discoverOutboundInProgress = false;
   }
@@ -92,10 +92,10 @@ async function runDailyCorpusAnalysis(): Promise<void> {
  * /confidentialite dise vrai (voir SEC-003 de l'audit securite). Desactivee
  * si shadowLogRetentionDays <= 0.
  */
-function runShadowLogPurge(): void {
+async function runShadowLogPurge(): Promise<void> {
   if (config.shadowLogRetentionDays <= 0) return;
   try {
-    const deleted = purgeShadowLogOlderThan(config.shadowLogRetentionDays);
+    const deleted = await purgeShadowLogOlderThan(config.shadowLogRetentionDays);
     if (deleted > 0) {
       console.log(`[purge carnet] ${deleted} entree(s) shadow_log de plus de ${config.shadowLogRetentionDays}j supprimee(s).`);
     }
@@ -121,5 +121,5 @@ export function startScheduler(): void {
   // maintenant" de /carnet couvre le besoin de la lancer avant l'horaire
   // planifie.
   cron.schedule(config.dailyAnalysisCron, () => void runDailyCorpusAnalysis());
-  cron.schedule(config.dailyAnalysisCron, runShadowLogPurge);
+  cron.schedule(config.dailyAnalysisCron, () => void runShadowLogPurge());
 }

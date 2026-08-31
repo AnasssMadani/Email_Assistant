@@ -1,16 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { freshTestDb } from "./_pgTestDb.js";
 import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
 
-const dir = mkdtempSync(path.join(tmpdir(), "process-incoming-test-"));
-process.env.DB_PATH = path.join(dir, "process-incoming.db");
-process.env.CATEGORIES_CONFIG_PATH = path.resolve("config/categories.json");
-
+const { getThreadRow, isMessageProcessed } = await freshTestDb();
 const { processIncomingMessage } = await import("../src/pipeline/processIncoming.js");
-const { getThreadRow, isMessageProcessed } = await import("../src/db.js");
 
 function fakeConnector(onGetThread: () => Promise<EmailThread>): EmailConnector {
   return {
@@ -67,8 +61,8 @@ test("a self-addressed internal rappel is never treated as a new client email, e
   await processIncomingMessage(connector, message);
 
   assert.equal(getThreadCalls, 0);
-  assert.equal(getThreadRow(message.threadId), undefined);
-  assert.equal(isMessageProcessed(message.id), true);
+  assert.equal(await getThreadRow(message.threadId), undefined);
+  assert.equal(await isMessageProcessed(message.id), true);
 });
 
 test("a genuine third-party email whose subject starts with our exact [Rappel] prefix is still processed (BUG-003)", async () => {

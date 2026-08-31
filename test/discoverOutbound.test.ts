@@ -1,8 +1,9 @@
-import "./_settingsEnv.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { discoverOutboundOnlyThreads } from "../src/pipeline/discoverOutbound.js";
-import { getThreadRow, setThreadHumanReplied, upsertThreadReceived } from "../src/db.js";
+import { freshTestDb } from "./_pgTestDb.js";
+
+const { getThreadRow, setThreadHumanReplied, upsertThreadReceived } = await freshTestDb();
+const { discoverOutboundOnlyThreads } = await import("../src/pipeline/discoverOutbound.js");
 import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
 
 function fakeSentMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
@@ -50,7 +51,7 @@ test("a brand-new outbound thread gets registered as awaiting_client_reply", asy
 
   await discoverOutboundOnlyThreads(connector);
 
-  const row = getThreadRow("thread-new");
+  const row = await getThreadRow("thread-new");
   assert.equal(row?.status, "awaiting_client_reply");
   assert.equal(row?.sender_email, "prospect@example.com");
   assert.equal(row?.category_id, "autre");
@@ -60,7 +61,7 @@ test("a brand-new outbound thread gets registered as awaiting_client_reply", asy
   assert.equal(row?.origin, "outbound");
 });
 
-test("BUG-004: a thread already in post_reply (human_replied_at set) is never downgraded back to 'received' by a later upsertThreadReceived", () => {
+test("BUG-004: a thread already in post_reply (human_replied_at set) is never downgraded back to 'received' by a later upsertThreadReceived", async () => {
   // Reproduit la course discoverOutbound / pollInbox: l'equipe repond a la
   // main avant que l'email entrant n'ait ete scrute. discoverOutbound cree
   // le dossier en awaiting_client_reply avec human_replied_at pose ; le
@@ -68,7 +69,7 @@ test("BUG-004: a thread already in post_reply (human_replied_at set) is never do
   // "received", ni reculer son due_at, sous peine d'un etat incoherent
   // (phase pre_reply + human_replied_at deja non nul).
   const threadId = "thread-race";
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis urgent",
     senderEmail: "client@example.com",
@@ -80,11 +81,11 @@ test("BUG-004: a thread already in post_reply (human_replied_at set) is never do
     dueAt: null,
     origin: "outbound",
   });
-  setThreadHumanReplied(threadId, new Date(Date.now() - 60_000).toISOString());
-  const before = getThreadRow(threadId)!;
+  await setThreadHumanReplied(threadId, new Date(Date.now() - 60_000).toISOString());
+  const before = (await getThreadRow(threadId))!;
   assert.ok(before.human_replied_at);
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis urgent",
     senderEmail: "client@example.com",
@@ -96,7 +97,7 @@ test("BUG-004: a thread already in post_reply (human_replied_at set) is never do
     dueAt: new Date(Date.now() + 1440 * 60_000).toISOString(),
   });
 
-  const after = getThreadRow(threadId)!;
+  const after = (await getThreadRow(threadId))!;
   assert.notEqual(after.status, "received");
   assert.equal(after.status, before.status);
   assert.equal(after.due_at, before.due_at);
@@ -104,7 +105,7 @@ test("BUG-004: a thread already in post_reply (human_replied_at set) is never do
 });
 
 test("a thread that already has a dossier is left untouched", async () => {
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId: "thread-existing",
     subject: "Deja suivi",
     senderEmail: "client@example.com",
@@ -122,7 +123,7 @@ test("a thread that already has a dossier is left untouched", async () => {
 
   await discoverOutboundOnlyThreads(connector);
 
-  const row = getThreadRow("thread-existing");
+  const row = await getThreadRow("thread-existing");
   assert.equal(row?.status, "ack_sent");
   assert.equal(row?.category_id, "devis");
 });
@@ -137,5 +138,5 @@ test("messages sent before the pipeline started observing are ignored", async ()
 
   await discoverOutboundOnlyThreads(connector);
 
-  assert.equal(getThreadRow("thread-old"), undefined);
+  assert.equal(await getThreadRow("thread-old"), undefined);
 });

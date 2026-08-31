@@ -91,7 +91,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
   // donc systematiquement la fonction pour chaque dossier eligible, en ne
   // passant une etape que si elle existe ET qu'elle est due — la detection
   // de reponse, elle, tourne a chaque cycle quoi qu'il arrive.
-  for (const row of listThreadsAwaitingReply()) {
+  for (const row of await listThreadsAwaitingReply()) {
     if (!row.due_at) continue;
     if (!threadIdMatchesConnector(row.thread_id, connector.name)) continue;
 
@@ -100,8 +100,8 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
     // tard rejaillirait en direct sur tous les dossiers deja en cours qui
     // l'utilisent (voir freezeRelanceStepsSnapshot). No-op si deja fige ou
     // personnalise.
-    freezeRelanceStepsSnapshot(row.thread_id, row.category_id, "pre_reply");
-    const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "pre_reply");
+    await freezeRelanceStepsSnapshot(row.thread_id, row.category_id, "pre_reply");
+    const { steps } = await getEffectiveRelanceSteps(row.thread_id, row.category_id, "pre_reply");
     const nextStep = steps[row.relance_count];
     const fireAt = nextStep ? new Date(row.due_at).getTime() + nextStep.delayMinutes * 60_000 : null;
     const dueStep = nextStep && fireAt !== null && now >= fireAt ? nextStep : undefined;
@@ -110,16 +110,16 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
       await checkPreReplyThread(connector, row, dueStep, externalBudget);
     } catch (err) {
       console.error(`[verification relances] erreur sur le dossier ${row.thread_id}:`, err);
-      recordPipelineError("relance_check", row.thread_id, (err as Error).message);
+      await recordPipelineError("relance_check", row.thread_id, (err as Error).message);
     }
   }
 
-  for (const row of listThreadsAwaitingClientReply()) {
+  for (const row of await listThreadsAwaitingClientReply()) {
     if (!row.human_replied_at) continue;
     if (!threadIdMatchesConnector(row.thread_id, connector.name)) continue;
 
-    freezeRelanceStepsSnapshot(row.thread_id, row.category_id, "post_reply");
-    const { steps } = getEffectiveRelanceSteps(row.thread_id, row.category_id, "post_reply");
+    await freezeRelanceStepsSnapshot(row.thread_id, row.category_id, "post_reply");
+    const { steps } = await getEffectiveRelanceSteps(row.thread_id, row.category_id, "post_reply");
     const nextStep = steps[row.post_reply_relance_count];
     const fireAt = nextStep ? new Date(row.human_replied_at).getTime() + nextStep.delayMinutes * 60_000 : null;
     const dueStep = nextStep && fireAt !== null && now >= fireAt ? nextStep : undefined;
@@ -128,7 +128,7 @@ export async function runRelanceCheck(connector: EmailConnector): Promise<void> 
       await checkPostReplyThread(connector, row, dueStep, externalBudget);
     } catch (err) {
       console.error(`[verification relances post-reponse] erreur sur le dossier ${row.thread_id}:`, err);
-      recordPipelineError("relance_check", row.thread_id, (err as Error).message);
+      await recordPipelineError("relance_check", row.thread_id, (err as Error).message);
     }
   }
 }
@@ -161,7 +161,7 @@ export async function checkPreReplyThread(
     // Corpus des vraies reponses de l'equipe (mode carnet — voir
     // corpusAnalysis.ts): capture le contenu tel quel, avant toute autre
     // logique, pour apprendre le ton/la structure reellement employes.
-    recordHumanReplyCorpus({
+    await recordHumanReplyCorpus({
       threadId: row.thread_id,
       categoryId: row.category_id,
       replyBody: replyAfterAck.bodyText,
@@ -175,7 +175,7 @@ export async function checkPreReplyThread(
     // plusieurs minutes (voire plusieurs heures apres un downtime du
     // scheduler) apres qu'elle ait ete effectivement envoyee — sinon le
     // delai de reponse affiche au client integre cette latence d'infra.
-    setThreadHumanReplied(row.thread_id, replyAfterAck.receivedAt.toISOString(), replyAfterAck.hasAttachments);
+    await setThreadHumanReplied(row.thread_id, replyAfterAck.receivedAt.toISOString(), replyAfterAck.hasAttachments);
     return;
   }
 
@@ -188,7 +188,7 @@ export async function checkPreReplyThread(
   if (step.channel === "external") {
     const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
     if (!lastInbound) {
-      recordPipelineError(
+      await recordPipelineError(
         "relance_check",
         row.thread_id,
         "Relance externe annulee: aucun message entrant trouve dans le fil recupere depuis la messagerie."
@@ -201,12 +201,12 @@ export async function checkPreReplyThread(
     // brouillon ici (hors scope, voir brief), juste la sequence qui avance
     // sans rien envoyer, comme pour une alerte interne filtree.
     if (config.shadowModeEnabled) {
-      recordReminder(
+      await recordReminder(
         row.thread_id,
         "internal",
         `[mode carnet] Relance externe qui aurait ete envoyee a ${row.sender_email} pour "${row.subject}" — non envoyee (mode carnet actif).`
       );
-      incrementRelance(row.thread_id, "relance_sent");
+      await incrementRelance(row.thread_id, "relance_sent");
       return;
     }
 
@@ -224,7 +224,7 @@ export async function checkPreReplyThread(
     // au lieu de l'enchainer a la suite de notre accuse.
     const lastMessageInThread = thread.messages[thread.messages.length - 1];
 
-    const category = getCategory(row.category_id);
+    const category = await getCategory(row.category_id);
     const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
     await tagSource("Messagerie — envoi de la relance", () =>
       connector.sendReply({
@@ -235,9 +235,9 @@ export async function checkPreReplyThread(
         inReplyToMessageId: lastMessageInThread.rfcMessageId,
       })
     );
-    incrementRelance(row.thread_id, "relance_sent");
-    incrementAutomatedOutboundCount(row.thread_id);
-    recordReminder(
+    await incrementRelance(row.thread_id, "relance_sent");
+    await incrementAutomatedOutboundCount(row.thread_id);
+    await recordReminder(
       row.thread_id,
       "external",
       `Relance envoyee automatiquement a ${row.sender_email}.`,
@@ -256,27 +256,27 @@ export async function checkPreReplyThread(
     ? Math.max(0, Math.round((Date.now() - new Date(row.due_at).getTime()) / 60_000))
     : step.delayMinutes;
   const note = `Dossier "${row.subject}" en attente depuis plus de ${elapsedMinutes} min apres l'echeance — aucune reponse envoyee.`;
-  const category = getCategory(row.category_id);
+  const category = await getCategory(row.category_id);
   const shouldAlertTeam =
     category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
 
   if (shouldAlertTeam) {
     await sendInternalNotification(connector, row, note);
-    recordReminder(row.thread_id, "internal", note, "relance_interne");
+    await recordReminder(row.thread_id, "internal", note, "relance_interne");
     console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
   } else {
     // Alerte volontairement filtree (categorie/urgence sous le seuil configure
     // dans /reglages) — on avance quand meme la sequence pour ne pas re-evaluer
     // indefiniment la meme etape, mais sans notifier l'equipe pour ne pas
     // noyer sa boite sous des rappels pour des demandes jugees banales.
-    recordReminder(
+    await recordReminder(
       row.thread_id,
       "internal",
       `${note} (alerte équipe non envoyée — sous le seuil configuré pour "${category.label}")`,
       "relance_interne_filtree"
     );
   }
-  incrementRelance(row.thread_id, row.status);
+  await incrementRelance(row.thread_id, row.status);
 }
 
 /** Exportee pour permettre un declenchement manuel immediat depuis l'UI admin (voir web/server.ts). */
@@ -295,7 +295,7 @@ export async function checkPostReplyThread(
     );
 
   if (clientRepliedAfterOurReply) {
-    setThreadStatus(row.thread_id, "responded");
+    await setThreadStatus(row.thread_id, "responded");
     return;
   }
 
@@ -308,7 +308,7 @@ export async function checkPostReplyThread(
   if (step.channel === "external") {
     const lastOutbound = [...thread.messages].reverse().find((m) => m.isFromUs);
     if (!lastOutbound) {
-      recordPipelineError(
+      await recordPipelineError(
         "relance_check",
         row.thread_id,
         "Relance post-reponse annulee: aucun message sortant trouve dans le fil recupere depuis la messagerie."
@@ -320,12 +320,12 @@ export async function checkPostReplyThread(
     // cette semaine, y compris celle-ci (relancer le client apres NOTRE
     // reponse), quelle que soit la sequence post_reply configuree.
     if (config.shadowModeEnabled) {
-      recordReminder(
+      await recordReminder(
         row.thread_id,
         "internal",
         `[mode carnet] Relance post-reponse qui aurait ete envoyee a ${row.sender_email} pour "${row.subject}" — non envoyee (mode carnet actif).`
       );
-      incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
+      await incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
       return;
     }
 
@@ -336,7 +336,7 @@ export async function checkPostReplyThread(
       return; // post_reply_relance_count intact: reessaie identiquement au prochain cycle
     }
 
-    const category = getCategory(row.category_id);
+    const category = await getCategory(row.category_id);
     const relance = await draftRelance(
       thread,
       lastOutbound,
@@ -353,9 +353,9 @@ export async function checkPostReplyThread(
         inReplyToMessageId: lastOutbound.rfcMessageId,
       })
     );
-    incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
-    incrementAutomatedOutboundCount(row.thread_id);
-    recordReminder(
+    await incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
+    await incrementAutomatedOutboundCount(row.thread_id);
+    await recordReminder(
       row.thread_id,
       "external",
       `Relance post-reponse envoyee a ${row.sender_email} (suivi de notre reponse).`,
@@ -379,8 +379,8 @@ export async function checkPostReplyThread(
   // apres leur reponse — ce cas n'appelle aucune action de leur part. La
   // sequence avance quand meme (comportement inchange pour une eventuelle
   // etape externe suivante), seul l'envoi reel est supprime.
-  recordReminder(row.thread_id, "internal", `${note} (rappel interne post-reponse desactive)`, "relance_interne_filtree");
-  incrementPostReplyRelance(row.thread_id, row.status);
+  await recordReminder(row.thread_id, "internal", `${note} (rappel interne post-reponse desactive)`, "relance_interne_filtree");
+  await incrementPostReplyRelance(row.thread_id, row.status);
 }
 
 /**
@@ -414,7 +414,7 @@ async function sendInternalNotification(connector: EmailConnector, row: ThreadRo
   try {
     const ownEmail = await connector.getOwnEmailAddress();
     const to = config.notificationEmail || ownEmail;
-    const categoryLabel = getCategory(row.category_id).label;
+    const categoryLabel = (await getCategory(row.category_id)).label;
     const receivedAtLabel = new Date(row.received_at).toLocaleString("fr-FR", { timeZone: config.timezone });
     const separator = "--------------------------------------------------";
     const sent = await connector.sendNotification({
@@ -451,9 +451,9 @@ async function sendInternalNotification(connector: EmailConnector, row: ThreadRo
     // "envoye a froid" (avec le destinataire du rappel comme faux client).
     // sent.id sert de threadId de remplacement: ce rappel n'appartient a
     // aucun dossier reel, seul le marquage "deja traite" compte ici.
-    markMessageProcessed(sent.id, sent.id);
+    await markMessageProcessed(sent.id, sent.id);
   } catch (err) {
-    recordPipelineError(
+    await recordPipelineError(
       "relance_check",
       row.thread_id,
       `Echec envoi de la notification de rappel interne: ${(err as Error).message}`

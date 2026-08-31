@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withRetry } from "../src/ai/structured.js";
+import { freshTestDb } from "./_pgTestDb.js";
+
+// structured.ts imports recordAiUsage from db.js — the pg-mem pool must be
+// wired up before that transitive import evaluates, even though this file
+// never touches the database directly.
+await freshTestDb();
+const { withRetry } = await import("../src/ai/structured.js");
 
 test("withRetry returns the result on first success", async () => {
   let calls = 0;

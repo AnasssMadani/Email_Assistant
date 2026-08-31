@@ -1,12 +1,17 @@
 services:
+  # ---------- Production ----------
   - type: web
-    name: accuse-reception-relance
+    name: globallink-prod
     runtime: node
     plan: starter
     region: frankfurt
+    branch: main
     buildCommand: npm install --include=dev && npm run build
     startCommand: npm run start:all
     autoDeployTrigger: commit
+    # Conserve pour connection.json (messagerie active) et les jetons OAuth
+    # Gmail/Graph (gmail-token.json, graph-token.json) — ces fichiers restent
+    # sur disque, seule la base applicative a migre vers Postgres/Supabase.
     disk:
       name: data
       mountPath: /var/data
@@ -16,13 +21,10 @@ services:
         value: production
       - key: NODE_VERSION
         value: "22"
-      # Filet de securite: sur certaines versions 22.x, node:sqlite exige
-      # encore ce flag explicitement. Sans effet (juste un avertissement)
-      # sur les versions ou il est deja actif par defaut.
-      - key: NODE_OPTIONS
-        value: --experimental-sqlite
-      - key: DB_PATH
-        value: /var/data/app.db
+      # Chaine de connexion du projet Supabase de PRODUCTION — jamais le
+      # meme projet que globallink-dev ci-dessous.
+      - key: DATABASE_URL
+        sync: false
       - key: CONNECTION_STATE_PATH
         value: /var/data/connection.json
       - key: GOOGLE_TOKEN_PATH
@@ -59,5 +61,71 @@ services:
         value: Accusé & Relance
       - key: BRAND_PRIMARY_COLOR
         value: "#16202A"
+      - key: BRAND_LOGO_URL
+        sync: false
+
+  # ---------- Developpement ----------
+  # Meme code, meme build — deux garde-fous independants l'empechent
+  # d'atteindre un vrai client: (1) sa propre messagerie de test connectee
+  # (jamais celle de production), et (2) SHADOW_MODE=true ("Mode test"), qui
+  # classe et redige normalement mais ne fait REELEMENT partir aucun accuse
+  # ni relance externe. Un seul de ces deux garde-fous mal configure ne
+  # suffit donc jamais a joindre un client reel.
+  - type: web
+    name: globallink-dev
+    runtime: node
+    plan: starter
+    region: frankfurt
+    branch: dev
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm run start:all
+    autoDeployTrigger: commit
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      # Chaine de connexion du projet Supabase de DEV — un projet Supabase
+      # separe de celui de production, jamais partage.
+      - key: DATABASE_URL
+        sync: false
+      - key: SHADOW_MODE
+        value: "true"
+      - key: CONNECTION_STATE_PATH
+        value: /var/data/connection.json
+      - key: GOOGLE_TOKEN_PATH
+        value: /var/data/gmail-token.json
+      - key: AZURE_TOKEN_PATH
+        value: /var/data/graph-token.json
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: AZURE_CLIENT_SECRET
+        sync: false
+      - key: AZURE_TENANT_ID
+        sync: false
+      - key: AZURE_REDIRECT_URI
+        sync: false
+      - key: SETUP_USERNAME
+        sync: false
+      - key: SETUP_PASSWORD_HASH
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: BRAND_NAME
+        value: Accusé & Relance (dev)
+      - key: BRAND_PRIMARY_COLOR
+        value: "#B23B2E"
       - key: BRAND_LOGO_URL
         sync: false

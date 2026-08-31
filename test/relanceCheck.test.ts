@@ -1,8 +1,10 @@
-import "./_settingsEnv.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkPreReplyThread, checkPostReplyThread } from "../src/pipeline/relanceCheck.js";
-import {
+import { freshTestDb } from "./_pgTestDb.js";
+import type { ThreadRow } from "../src/db.js";
+import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
+
+const {
   addThreadRelanceStep,
   getThreadRow,
   incrementAutomatedOutboundCount,
@@ -12,9 +14,8 @@ import {
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
-  type ThreadRow,
-} from "../src/db.js";
-import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
+} = await freshTestDb();
+const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
 
 function fakeMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
   return {
@@ -60,7 +61,7 @@ test("checkPreReplyThread still detects a human reply after the pre-reply sequen
   const threadId = "t-exhausted-pre-reply";
   const ackSentAt = new Date(Date.now() - 60_000).toISOString();
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -71,11 +72,11 @@ test("checkPreReplyThread still detects a human reply after the pre-reply sequen
     status: "ack_sent",
     dueAt: new Date(Date.now() - 30_000).toISOString(),
   });
-  setThreadAckSent(threadId);
+  await setThreadAckSent(threadId);
   // Sequence a une seule etape, deja consommee (relance_count=1 >= steps.length):
   // reproduit exactement l'etat "sequence epuisee" observe en production.
-  addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
-  incrementRelance(threadId, "relance_sent");
+  await addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
+  await incrementRelance(threadId, "relance_sent");
 
   const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
   const ourRealReply = fakeMessage({
@@ -90,9 +91,9 @@ test("checkPreReplyThread still detects a human reply after the pre-reply sequen
   // Avant le correctif, cette fonction exigeait un RelanceStep concret et
   // n'etait jamais appelee du tout une fois la sequence epuisee — la reponse
   // humaine n'etait donc jamais detectee.
-  await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+  await checkPreReplyThread(connector, (await getThreadRow(threadId)) as ThreadRow, undefined);
 
-  const row = getThreadRow(threadId);
+  const row = await getThreadRow(threadId);
   assert.equal(row?.status, "awaiting_client_reply");
   assert.ok(row?.human_replied_at);
 });
@@ -112,7 +113,7 @@ test("checkPreReplyThread does not mistake its own already-sent ack/relance for 
   // on the old approaches this would have false-positived.
   const threadId = "t-self-sends-not-a-reply";
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -123,11 +124,11 @@ test("checkPreReplyThread does not mistake its own already-sent ack/relance for 
     status: "ack_sent",
     dueAt: new Date(Date.now() - 4 * 60_000).toISOString(),
   });
-  setThreadAckSent(threadId);
-  incrementAutomatedOutboundCount(threadId); // the ack
-  addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
-  incrementRelance(threadId, "relance_sent");
-  incrementAutomatedOutboundCount(threadId); // the pre-reply relance
+  await setThreadAckSent(threadId);
+  await incrementAutomatedOutboundCount(threadId); // the ack
+  await addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
+  await incrementRelance(threadId, "relance_sent");
+  await incrementAutomatedOutboundCount(threadId); // the pre-reply relance
 
   const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
   const ourAckRefetched = fakeMessage({
@@ -149,9 +150,9 @@ test("checkPreReplyThread does not mistake its own already-sent ack/relance for 
     messages: [clientMessage, ourAckRefetched, ourRelanceRefetched],
   });
 
-  await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+  await checkPreReplyThread(connector, (await getThreadRow(threadId)) as ThreadRow, undefined);
 
-  const row = getThreadRow(threadId);
+  const row = await getThreadRow(threadId);
   // Ne doit PAS avoir bascule en post-reponse: aucune reponse humaine reelle,
   // seulement 2 messages isFromUs, exactement le nombre qu'on sait avoir envoye.
   assert.notEqual(row?.status, "awaiting_client_reply");
@@ -161,7 +162,7 @@ test("checkPreReplyThread does not mistake its own already-sent ack/relance for 
 test("checkPreReplyThread detects a genuine human reply even after several automated sends", async () => {
   const threadId = "t-real-reply-after-automated-sends";
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -172,11 +173,11 @@ test("checkPreReplyThread detects a genuine human reply even after several autom
     status: "ack_sent",
     dueAt: new Date(Date.now() - 4 * 60_000).toISOString(),
   });
-  setThreadAckSent(threadId);
-  incrementAutomatedOutboundCount(threadId); // the ack
-  addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
-  incrementRelance(threadId, "relance_sent");
-  incrementAutomatedOutboundCount(threadId); // the pre-reply relance
+  await setThreadAckSent(threadId);
+  await incrementAutomatedOutboundCount(threadId); // the ack
+  await addThreadRelanceStep(threadId, { channel: "internal", delayMinutes: 0 }, "pre_reply");
+  await incrementRelance(threadId, "relance_sent");
+  await incrementAutomatedOutboundCount(threadId); // the pre-reply relance
 
   const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
   const ourAck = fakeMessage({ id: "m-ack", threadId, isFromUs: true, receivedAt: new Date(Date.now() - 120_000) });
@@ -190,9 +191,9 @@ test("checkPreReplyThread detects a genuine human reply even after several autom
   });
   const connector = fakeConnector({ id: threadId, messages: [clientMessage, ourAck, ourRelance, humanReply] });
 
-  await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+  await checkPreReplyThread(connector, (await getThreadRow(threadId)) as ThreadRow, undefined);
 
-  const row = getThreadRow(threadId);
+  const row = await getThreadRow(threadId);
   assert.equal(row?.status, "awaiting_client_reply");
   assert.ok(row?.human_replied_at);
 });
@@ -201,7 +202,7 @@ test("checkPostReplyThread still detects the client's reply after the post-reply
   const threadId = "t-exhausted-post-reply";
   const humanRepliedAt = new Date(Date.now() - 60_000).toISOString();
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -212,8 +213,8 @@ test("checkPostReplyThread still detects the client's reply after the post-reply
     status: "ack_sent",
     dueAt: new Date(Date.now() - 30_000).toISOString(),
   });
-  setThreadHumanReplied(threadId, humanRepliedAt);
-  incrementPostReplyRelance(threadId, "relance_sent");
+  await setThreadHumanReplied(threadId, humanRepliedAt);
+  await incrementPostReplyRelance(threadId, "relance_sent");
 
   const ourReply = fakeMessage({ id: "m-our-reply", threadId, isFromUs: true, receivedAt: new Date(Date.now() - 55_000) });
   const clientFinallyReplied = fakeMessage({
@@ -225,16 +226,16 @@ test("checkPostReplyThread still detects the client's reply after the post-reply
   });
   const connector = fakeConnector({ id: threadId, messages: [ourReply, clientFinallyReplied] });
 
-  await checkPostReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+  await checkPostReplyThread(connector, (await getThreadRow(threadId)) as ThreadRow, undefined);
 
-  const row = getThreadRow(threadId);
+  const row = await getThreadRow(threadId);
   assert.equal(row?.status, "responded");
 });
 
 test("checkPreReplyThread records the human's real reply body in the corpus (mode carnet learning material)", async () => {
   const threadId = "t-corpus-capture";
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -245,7 +246,7 @@ test("checkPreReplyThread records the human's real reply body in the corpus (mod
     status: "ack_sent",
     dueAt: new Date(Date.now() - 4 * 60_000).toISOString(),
   });
-  setThreadAckSent(threadId);
+  await setThreadAckSent(threadId);
   // Pas d'incrementAutomatedOutboundCount ici: automated_outbound_count reste
   // a 0, pour que le seul message isFromUs du fil (la reponse humaine
   // ci-dessous) soit au-dela du compteur et donc detecte comme une vraie
@@ -260,8 +261,8 @@ test("checkPreReplyThread records the human's real reply body in the corpus (mod
   });
   const connector = fakeConnector({ id: threadId, messages: [clientMessage, humanReply] });
 
-  await checkPreReplyThread(connector, getThreadRow(threadId) as ThreadRow, undefined);
+  await checkPreReplyThread(connector, (await getThreadRow(threadId)) as ThreadRow, undefined);
 
-  const corpus = listHumanReplyCorpusByCategory("devis");
+  const corpus = await listHumanReplyCorpusByCategory("devis");
   assert.ok(corpus.includes("Voici votre devis en piece jointe, cordialement."));
 });

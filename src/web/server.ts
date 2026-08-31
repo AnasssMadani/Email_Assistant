@@ -1,6 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
-import { config, loadBrandVoice, loadCategoryPlaybook, saveBrandVoice } from "../config.js";
+import { config } from "../config.js";
 import { getConnectionState, saveConnectionState, clearConnectionState } from "../connectionState.js";
 import { buildGmailAuthUrl, exchangeCodeForGmailToken } from "../connectors/gmailAuth.js";
 import { buildGraphAuthUrl, exchangeCodeForGraphToken } from "../connectors/graphAuth.js";
@@ -22,6 +22,8 @@ import {
   deleteThreadData,
   deleteThreadRelanceStep,
   getAiUsageSummarySince,
+  getBrandVoice,
+  getCategoryPlaybook,
   getCategoryRelanceSteps,
   getEffectiveRelanceSteps,
   getThreadRelanceOverride,
@@ -40,6 +42,7 @@ import {
   markMessageProcessed,
   recordPipelineError,
   revokeConnectInvite,
+  setBrandVoice,
   setShadowLogReviewed,
   setThreadHumanReplied,
   setThreadStatus,
@@ -258,9 +261,9 @@ function inviteTokenFromRequest(req: Request): string | undefined {
  * token invalide/expire/deja consomme retombe simplement sur requireAuth
  * (donc une redirection vers /login si aucune session non plus).
  */
-function requireAuthOrInvite(req: Request, res: Response, next: NextFunction): void {
+async function requireAuthOrInvite(req: Request, res: Response, next: NextFunction): Promise<void> {
   const token = inviteTokenFromRequest(req);
-  if (token && getValidConnectInvite(token)) {
+  if (token && (await getValidConnectInvite(token))) {
     next();
     return;
   }
@@ -302,8 +305,12 @@ app.get("/auth/gmail/callback", requireAuthOrInvite, async (req: Request, res: R
     await exchangeCodeForGmailToken(code);
     const email = await new GmailConnector().getOwnEmailAddress();
     saveConnectionState({ provider: "gmail", email, connectedAt: new Date().toISOString() });
-    if (cookies.oauth_from === "invite" && cookies.connect_invite && getValidConnectInvite(cookies.connect_invite)) {
-      consumeConnectInvite(cookies.connect_invite, "gmail");
+    if (
+      cookies.oauth_from === "invite" &&
+      cookies.connect_invite &&
+      (await getValidConnectInvite(cookies.connect_invite))
+    ) {
+      await consumeConnectInvite(cookies.connect_invite, "gmail");
     }
     res.redirect(`${target}?connected=gmail`);
   } catch (err) {
@@ -338,8 +345,12 @@ app.get("/auth/graph/callback", requireAuthOrInvite, async (req: Request, res: R
     await exchangeCodeForGraphToken(code);
     const email = await new GraphConnector().getOwnEmailAddress();
     saveConnectionState({ provider: "graph", email, connectedAt: new Date().toISOString() });
-    if (cookies.oauth_from === "invite" && cookies.connect_invite && getValidConnectInvite(cookies.connect_invite)) {
-      consumeConnectInvite(cookies.connect_invite, "graph");
+    if (
+      cookies.oauth_from === "invite" &&
+      cookies.connect_invite &&
+      (await getValidConnectInvite(cookies.connect_invite))
+    ) {
+      await consumeConnectInvite(cookies.connect_invite, "graph");
     }
     res.redirect(`${target}?connected=graph`);
   } catch (err) {
@@ -354,9 +365,9 @@ app.get("/auth/graph/callback", requireAuthOrInvite, async (req: Request, res: R
 // revocable depuis "/") verifie explicitement ci-dessous. Ne jamais monter
 // ces deux routes apres app.use(requireAuth).
 
-app.get("/connect", (req: Request, res: Response) => {
+app.get("/connect", async (req: Request, res: Response) => {
   const token = query(req).token;
-  const invite = token ? getValidConnectInvite(token) : undefined;
+  const invite = token ? await getValidConnectInvite(token) : undefined;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(invite ? renderConnectPage(token, getConnectionState()) : renderConnectInvalidPage());
 });
@@ -370,10 +381,10 @@ app.get("/connect/succes", (_req: Request, res: Response) => {
 
 app.use(requireAuth);
 
-app.get("/", (req: Request, res: Response) => {
+app.get("/", async (req: Request, res: Response) => {
   const baseUrl = `${req.protocol}://${req.get("host")}`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderConnectionPage(query(req), res.locals.csrfToken as string | undefined, baseUrl));
+  res.send(await renderConnectionPage(query(req), res.locals.csrfToken as string | undefined, baseUrl));
 });
 
 app.post("/auth/disconnect", requireCsrf, (_req: Request, res: Response) => {
@@ -383,15 +394,15 @@ app.post("/auth/disconnect", requireCsrf, (_req: Request, res: Response) => {
 
 // ---------- Invitations de connexion (lien sans identifiants admin, voir /connect) ----------
 
-app.post("/invitations/generer", requireCsrf, (req: Request, res: Response) => {
+app.post("/invitations/generer", requireCsrf, async (req: Request, res: Response) => {
   const raw = parseLocaleNumber((req.body as Record<string, string>).expiresInDays);
   const days = raw > 0 ? Math.max(1, raw) : 7;
-  createConnectInvite(days);
+  await createConnectInvite(days);
   res.redirect("/?invite_saved=1");
 });
 
-app.post("/invitations/:token/revoquer", requireCsrf, (req: Request, res: Response) => {
-  revokeConnectInvite(req.params.token);
+app.post("/invitations/:token/revoquer", requireCsrf, async (req: Request, res: Response) => {
+  await revokeConnectInvite(req.params.token);
   res.redirect("/?invite_saved=1");
 });
 
@@ -403,45 +414,45 @@ function parseDossierFilter(value: string | undefined): DossierFilter {
   return value === "en_retard" || value === "resolus" || value === "tous" ? value : "a_traiter";
 }
 
-app.get("/dossiers", (req: Request, res: Response) => {
-  const threads = listRecentThreads(150);
-  const usageSummary = getAiUsageSummarySince(currentMonthStartIso());
+app.get("/dossiers", async (req: Request, res: Response) => {
+  const threads = await listRecentThreads(150);
+  const usageSummary = await getAiUsageSummarySince(currentMonthStartIso());
   const filter = parseDossierFilter(query(req).filtre);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderDossiersPage(threads, res.locals.csrfToken as string | undefined, usageSummary, filter));
+  res.send(await renderDossiersPage(threads, res.locals.csrfToken as string | undefined, usageSummary, filter));
 });
 
-app.get("/dossiers/:threadId", (req: Request, res: Response) => {
-  const thread = getThreadRow(req.params.threadId);
+app.get("/dossiers/:threadId", async (req: Request, res: Response) => {
+  const thread = await getThreadRow(req.params.threadId);
   if (!thread) {
     res.redirect("/dossiers");
     return;
   }
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(
-    renderDossierDetailPage(thread, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error)
+    await renderDossierDetailPage(thread, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error)
   );
 });
 
 app.post("/dossiers/:threadId/cloturer", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  setThreadStatus(threadId, "closed");
+  await setThreadStatus(threadId, "closed");
   res.redirect(req.body?._redirect === "detail" ? `/dossiers/${encodeURIComponent(threadId)}` : "/dossiers");
 });
 
 app.post("/dossiers/:threadId/supprimer", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  deleteThreadData(threadId);
+  await deleteThreadData(threadId);
   res.redirect("/dossiers");
 });
 
 app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  const thread = getThreadRow(threadId);
+  const thread = await getThreadRow(threadId);
   if (thread) {
     const isPostReply = isPostReplyStatus(thread.status);
     const phase = isPostReply ? "post_reply" : "pre_reply";
-    const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id, phase);
+    const { steps } = await getEffectiveRelanceSteps(threadId, thread.category_id, phase);
     const nextStep = steps[isPostReply ? thread.post_reply_relance_count : thread.relance_count];
     if (nextStep) {
       try {
@@ -453,7 +464,7 @@ app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Req
         }
       } catch (err) {
         console.error(`[relance manuelle] erreur sur le dossier ${threadId}:`, err);
-        recordPipelineError("relance_check", threadId, (err as Error).message);
+        await recordPipelineError("relance_check", threadId, (err as Error).message);
       }
     }
   }
@@ -461,12 +472,17 @@ app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Req
 });
 
 /** Journalise et redirige avec une banniere d'erreur au lieu de laisser une route synchrone planter jusqu'a la page 500 generique. */
-function runOrRedirectError(res: Response, context: string, threadId: string, action: () => void): void {
+async function runOrRedirectError(
+  res: Response,
+  context: string,
+  threadId: string,
+  action: () => Promise<void> | void
+): Promise<void> {
   try {
-    action();
+    await action();
   } catch (err) {
     console.error(`[${context}] erreur sur le dossier ${threadId}:`, err);
-    recordPipelineError(context, threadId, (err as Error).message);
+    await recordPipelineError(context, threadId, (err as Error).message);
     res.redirect(`/dossiers/${encodeURIComponent(threadId)}?error=1`);
     return;
   }
@@ -477,47 +493,47 @@ function phaseFromBody(body: Record<string, string>): RelancePhase {
   return body.phase === "post_reply" ? "post_reply" : "pre_reply";
 }
 
-app.post("/dossiers/:threadId/relance-steps", requireCsrf, (req: Request, res: Response) => {
+app.post("/dossiers/:threadId/relance-steps", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   const body = req.body as Record<string, string>;
   const phase = phaseFromBody(body);
-  runOrRedirectError(res, "relance_step_add", threadId, () => {
+  await runOrRedirectError(res, "relance_step_add", threadId, async () => {
     // Le clamp doit porter sur la propre sequence du dossier (vide au premier
     // ajout), pas sur celle de la categorie de repli — sinon la premiere etape
     // d'une nouvelle surcharge se retrouve poussee au delai de la derniere
     // etape de la categorie au lieu de rester libre.
-    const existing = getThreadRelanceOverride(threadId, phase);
+    const existing = await getThreadRelanceOverride(threadId, phase);
     const parsed = parseStep(body);
-    addThreadRelanceStep(threadId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) }, phase);
+    await addThreadRelanceStep(threadId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) }, phase);
   });
 });
 
-app.post("/dossiers/:threadId/relance-steps/personnaliser", requireCsrf, (req: Request, res: Response) => {
+app.post("/dossiers/:threadId/relance-steps/personnaliser", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   const phase = phaseFromBody(req.body as Record<string, string>);
-  runOrRedirectError(res, "relance_step_personnaliser", threadId, () => {
-    const thread = getThreadRow(threadId);
-    if (thread && !hasThreadRelanceOverride(threadId, phase)) {
-      const { steps } = getEffectiveRelanceSteps(threadId, thread.category_id, phase);
+  await runOrRedirectError(res, "relance_step_personnaliser", threadId, async () => {
+    const thread = await getThreadRow(threadId);
+    if (thread && !(await hasThreadRelanceOverride(threadId, phase))) {
+      const { steps } = await getEffectiveRelanceSteps(threadId, thread.category_id, phase);
       const base = steps.length > 0 ? steps : [{ channel: "internal" as const, delayMinutes: 1440 }];
-      for (const step of base) addThreadRelanceStep(threadId, { channel: step.channel, delayMinutes: step.delayMinutes }, phase);
+      for (const step of base) await addThreadRelanceStep(threadId, { channel: step.channel, delayMinutes: step.delayMinutes }, phase);
     }
   });
 });
 
-app.post("/dossiers/:threadId/relance-steps/reset", requireCsrf, (req: Request, res: Response) => {
+app.post("/dossiers/:threadId/relance-steps/reset", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   const phase = phaseFromBody(req.body as Record<string, string>);
-  runOrRedirectError(res, "relance_step_reset", threadId, () => {
-    clearThreadRelanceOverride(threadId, phase);
+  await runOrRedirectError(res, "relance_step_reset", threadId, async () => {
+    await clearThreadRelanceOverride(threadId, phase);
   });
 });
 
-app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
+app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   const phase = phaseFromBody(req.body as Record<string, string>);
-  runOrRedirectError(res, "relance_step_delete", threadId, () => {
-    deleteThreadRelanceStep(threadId, Number(req.params.order), phase);
+  await runOrRedirectError(res, "relance_step_delete", threadId, async () => {
+    await deleteThreadRelanceStep(threadId, Number(req.params.order), phase);
   });
 });
 
@@ -530,7 +546,7 @@ app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, (req: R
  */
 app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  const threadRow = getThreadRow(threadId);
+  const threadRow = await getThreadRow(threadId);
   const body = req.body as Record<string, string>;
   if (threadRow && body.categoryId) {
     try {
@@ -538,9 +554,9 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
       const thread = await connector.getThread(threadId);
       const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
       if (!lastInbound) throw new Error("Aucun message entrant trouve dans ce fil.");
-      const category = getCategory(body.categoryId);
+      const category = await getCategory(body.categoryId);
       const dueAt = new Date(Date.now() + category.slaMinutes * 60_000).toISOString();
-      upsertThreadReceived({
+      await upsertThreadReceived({
         threadId,
         subject: threadRow.subject,
         senderEmail: lastInbound.from.email,
@@ -554,7 +570,7 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
       await sendAcknowledgement(connector, thread, lastInbound, category);
     } catch (err) {
       console.error(`[traitement manuel] erreur sur le dossier ${threadId}:`, err);
-      recordPipelineError("manual_override", threadId, (err as Error).message);
+      await recordPipelineError("manual_override", threadId, (err as Error).message);
     }
   }
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
@@ -562,11 +578,11 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
 
 // ---------- Reglages (categories + sequences de relance) ----------
 
-app.get("/reglages", (req: Request, res: Response) => {
+app.get("/reglages", async (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(
-    renderReglagesPage(
-      listCategories(),
+    await renderReglagesPage(
+      await listCategories(),
       res.locals.csrfToken as string | undefined,
       query(req).saved,
       query(req).error,
@@ -576,12 +592,16 @@ app.get("/reglages", (req: Request, res: Response) => {
 });
 
 /** Meme filet de securite que runOrRedirectError, mais pour les routes /reglages (redirection sans threadId). */
-function runOrRedirectReglagesError(res: Response, context: string, action: () => void): void {
+async function runOrRedirectReglagesError(
+  res: Response,
+  context: string,
+  action: () => Promise<void> | void
+): Promise<void> {
   try {
-    action();
+    await action();
   } catch (err) {
     console.error(`[${context}] erreur:`, err);
-    recordPipelineError(context, null, (err as Error).message);
+    await recordPipelineError(context, null, (err as Error).message);
     res.redirect("/reglages?error=1");
     return;
   }
@@ -597,19 +617,19 @@ function runOrRedirectReglagesError(res: Response, context: string, action: () =
  * HTML du panneau mis a jour — aucune navigation, aucun rechargement, ce qui
  * permet d'enchainer plusieurs ajouts de suite sans perdre sa place.
  */
-function handleRelanceStepMutation(
+async function handleRelanceStepMutation(
   req: Request,
   res: Response,
   categoryId: string,
   phase: RelancePhase,
   context: string,
-  action: () => void
-): void {
+  action: () => Promise<void> | void
+): Promise<void> {
   try {
-    action();
+    await action();
   } catch (err) {
     console.error(`[${context}] erreur:`, err);
-    recordPipelineError(context, null, (err as Error).message);
+    await recordPipelineError(context, null, (err as Error).message);
     if (isFetchRequest(req)) {
       res.status(400).send("L'action a échoué — voir le journal.");
       return;
@@ -620,19 +640,19 @@ function handleRelanceStepMutation(
   if (isFetchRequest(req)) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(
-      renderCategoryStepsPanel(categoryId, phase, phaseTitle(phase), res.locals.csrfToken as string | undefined)
+      await renderCategoryStepsPanel(categoryId, phase, phaseTitle(phase), res.locals.csrfToken as string | undefined)
     );
     return;
   }
   res.redirect(`/reglages?saved=1&open=${encodeURIComponent(categoryId)}#cat-${encodeURIComponent(categoryId)}`);
 }
 
-app.post("/reglages/categories", requireCsrf, (req: Request, res: Response) => {
+app.post("/reglages/categories", requireCsrf, async (req: Request, res: Response) => {
   const body = req.body as Record<string, string>;
-  runOrRedirectReglagesError(res, "category_create", () => {
+  await runOrRedirectReglagesError(res, "category_create", async () => {
     const label = (body.label ?? "").trim();
     if (!label) throw new Error("Le nom de la catégorie ne peut pas être vide.");
-    createCategory({
+    await createCategory({
       label,
       slaMinutes: Math.max(0, parseLocaleNumber(body.slaMinutes) || 1440),
       acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
@@ -640,11 +660,11 @@ app.post("/reglages/categories", requireCsrf, (req: Request, res: Response) => {
   });
 });
 
-app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) => {
+app.post("/reglages/categories/:id", requireCsrf, async (req: Request, res: Response) => {
   const body = req.body as Record<string, string>;
   const alertMode = parseAlertMode(body.alertMode);
-  runOrRedirectReglagesError(res, "category_update", () => {
-    updateCategory(req.params.id, {
+  await runOrRedirectReglagesError(res, "category_update", async () => {
+    await updateCategory(req.params.id, {
       label: (body.label ?? "").trim() || req.params.id,
       slaMinutes: Math.max(0, parseLocaleNumber(body.slaMinutes)),
       acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
@@ -654,30 +674,30 @@ app.post("/reglages/categories/:id", requireCsrf, (req: Request, res: Response) 
   });
 });
 
-app.post("/reglages/categories/:id/relance-steps", requireCsrf, (req: Request, res: Response) => {
+app.post("/reglages/categories/:id/relance-steps", requireCsrf, async (req: Request, res: Response) => {
   const categoryId = req.params.id;
   const body = req.body as Record<string, string>;
   const phase = phaseFromBody(body);
-  handleRelanceStepMutation(req, res, categoryId, phase, "category_relance_step_add", () => {
-    const existing = getCategoryRelanceSteps(categoryId, phase);
+  await handleRelanceStepMutation(req, res, categoryId, phase, "category_relance_step_add", async () => {
+    const existing = await getCategoryRelanceSteps(categoryId, phase);
     const parsed = parseStep(body);
-    addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) }, phase);
+    await addCategoryRelanceStep(categoryId, { ...parsed, delayMinutes: clampAfterLastStep(existing, parsed.delayMinutes) }, phase);
   });
 });
 
-app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, (req: Request, res: Response) => {
+app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, async (req: Request, res: Response) => {
   const categoryId = req.params.id;
   const phase = phaseFromBody(req.body as Record<string, string>);
-  handleRelanceStepMutation(req, res, categoryId, phase, "category_relance_step_delete", () => {
-    deleteCategoryRelanceStep(categoryId, Number(req.params.order), phase);
+  await handleRelanceStepMutation(req, res, categoryId, phase, "category_relance_step_delete", async () => {
+    await deleteCategoryRelanceStep(categoryId, Number(req.params.order), phase);
   });
 });
 
 // ---------- Journal (audit des relances) ----------
 
-app.get("/journal", (_req: Request, res: Response) => {
+app.get("/journal", async (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderJournalPage(listReminders(150), listPipelineErrors(100)));
+  res.send(renderJournalPage(await listReminders(150), await listPipelineErrors(100)));
 });
 
 // ---------- Consommation IA (tokens Claude & cout estime) ----------
@@ -688,9 +708,9 @@ function currentMonthStartIso(): string {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
 }
 
-app.get("/consommation", (_req: Request, res: Response) => {
-  const summary = getAiUsageSummarySince(currentMonthStartIso());
-  const recent = listRecentAiUsage(50);
+app.get("/consommation", async (_req: Request, res: Response) => {
+  const summary = await getAiUsageSummarySince(currentMonthStartIso());
+  const recent = await listRecentAiUsage(50);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderConsommationPage(summary, recent));
 });
@@ -708,16 +728,17 @@ app.get("/envois", async (req: Request, res: Response) => {
   try {
     const connector = createEmailConnector();
     const sent = await connector.listRecentSentMessages(25);
-    const untracked = sent.filter((m) => !getThreadRow(m.threadId));
+    const trackedFlags = await Promise.all(sent.map((m) => getThreadRow(m.threadId)));
+    const untracked = sent.filter((_m, i) => !trackedFlags[i]);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(
-      renderNewSentPage(untracked, res.locals.csrfToken as string | undefined, query(req).saved, undefined)
+      await renderNewSentPage(untracked, res.locals.csrfToken as string | undefined, query(req).saved, undefined)
     );
   } catch (err) {
-    recordPipelineError("web_request", null, `[Messagerie — lecture des envois] ${(err as Error).message}`);
+    await recordPipelineError("web_request", null, `[Messagerie — lecture des envois] ${(err as Error).message}`);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(
-      renderNewSentPage(
+      await renderNewSentPage(
         [],
         res.locals.csrfToken as string | undefined,
         undefined,
@@ -727,13 +748,13 @@ app.get("/envois", async (req: Request, res: Response) => {
   }
 });
 
-app.post("/envois/suivre", requireCsrf, (req: Request, res: Response) => {
+app.post("/envois/suivre", requireCsrf, async (req: Request, res: Response) => {
   const body = req.body as Record<string, string>;
   try {
-    if (!getThreadRow(body.threadId)) {
+    if (!(await getThreadRow(body.threadId))) {
       // deja suivi entre-temps (double-clic, etc.) sinon
-      const category = getCategory(body.categoryId || "autre");
-      upsertThreadReceived({
+      const category = await getCategory(body.categoryId || "autre");
+      await upsertThreadReceived({
         threadId: body.threadId,
         subject: body.subject,
         senderEmail: body.recipientEmail,
@@ -744,42 +765,46 @@ app.post("/envois/suivre", requireCsrf, (req: Request, res: Response) => {
         status: "awaiting_client_reply",
         dueAt: null,
       });
-      setThreadHumanReplied(body.threadId, body.sentAt || undefined, body.hasAttachments === "1");
-      if (body.messageId) markMessageProcessed(body.messageId, body.threadId);
+      await setThreadHumanReplied(body.threadId, body.sentAt || undefined, body.hasAttachments === "1");
+      if (body.messageId) await markMessageProcessed(body.messageId, body.threadId);
     }
     res.redirect(`/dossiers/${encodeURIComponent(body.threadId)}?saved=1`);
   } catch (err) {
     console.error(`[suivi manuel d'un envoi] erreur sur ${body.threadId}:`, err);
-    recordPipelineError("discover_outbound", body.threadId || null, (err as Error).message);
+    await recordPipelineError("discover_outbound", body.threadId || null, (err as Error).message);
     res.redirect("/envois?error=1");
   }
 });
 
 // ---------- Mode carnet (semaine pilote — accuses redige-mais-non-envoye) ----------
 
-app.get("/carnet", (req: Request, res: Response) => {
-  const entries = listShadowLogEntries();
+app.get("/carnet", async (req: Request, res: Response) => {
+  const entries = await listShadowLogEntries();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderCarnetPage(entries, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error));
+  res.send(await renderCarnetPage(entries, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error));
 });
 
-function runOrRedirectCarnetError(res: Response, context: string, action: () => void): void {
+async function runOrRedirectCarnetError(
+  res: Response,
+  context: string,
+  action: () => Promise<void> | void
+): Promise<void> {
   try {
-    action();
+    await action();
   } catch (err) {
     console.error(`[${context}] erreur:`, err);
-    recordPipelineError(context, null, (err as Error).message);
+    await recordPipelineError(context, null, (err as Error).message);
     res.redirect("/carnet?error=1");
     return;
   }
   res.redirect("/carnet?saved=1");
 }
 
-app.post("/carnet/:id/revue", requireCsrf, (req: Request, res: Response) => {
+app.post("/carnet/:id/revue", requireCsrf, async (req: Request, res: Response) => {
   const id = Number(req.params.id);
   const body = req.body as Record<string, string>;
-  runOrRedirectCarnetError(res, "carnet_revue", () => {
-    setShadowLogReviewed(id, body.reviewedOk === "on");
+  await runOrRedirectCarnetError(res, "carnet_revue", async () => {
+    await setShadowLogReviewed(id, body.reviewedOk === "on");
   });
 });
 
@@ -788,7 +813,7 @@ app.post("/carnet/analyser", requireCsrf, async (req: Request, res: Response) =>
     await runCorpusAnalysis();
   } catch (err) {
     console.error("[carnet_analyser] erreur:", err);
-    recordPipelineError("carnet_analyser", null, (err as Error).message);
+    await recordPipelineError("carnet_analyser", null, (err as Error).message);
     res.redirect("/carnet?error=1");
     return;
   }
@@ -797,20 +822,20 @@ app.post("/carnet/analyser", requireCsrf, async (req: Request, res: Response) =>
 
 // ---------- Ton de marque (gabarit lu par l'IA avant chaque redaction) ----------
 
-app.get("/ton-de-marque", (req: Request, res: Response) => {
+app.get("/ton-de-marque", async (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(
-    renderBrandVoicePage(loadBrandVoice(), res.locals.csrfToken as string | undefined, query(req).saved, query(req).error)
+    renderBrandVoicePage(await getBrandVoice(), res.locals.csrfToken as string | undefined, query(req).saved, query(req).error)
   );
 });
 
-app.post("/ton-de-marque", requireCsrf, (req: Request, res: Response) => {
+app.post("/ton-de-marque", requireCsrf, async (req: Request, res: Response) => {
   const body = req.body as Record<string, string>;
   try {
-    saveBrandVoice(body.content ?? "");
+    await setBrandVoice(body.content ?? "");
     res.redirect("/ton-de-marque?saved=1");
   } catch (err) {
-    recordPipelineError("web_request", null, `[Ton de marque] ${(err as Error).message}`);
+    await recordPipelineError("web_request", null, `[Ton de marque] ${(err as Error).message}`);
     res.redirect("/ton-de-marque?error=1");
   }
 });
@@ -877,6 +902,17 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
         <div class="conn-sub"><a href="/connect">Connecter une boîte →</a></div>
       </div>`;
 
+  // Bandeau permanent, sur CHAQUE page admin, quand SHADOW_MODE est actif —
+  // second garde-fou de securite pour l'instance de dev (voir render.yaml):
+  // meme si la messagerie de dev est mal reconnectee vers une vraie boite,
+  // ce mode empeche tout accuse/relance externe reel de partir. Doit rester
+  // impossible a manquer, pas un simple badge discret dans un coin.
+  const shadowModeBanner = config.shadowModeEnabled
+    ? `<div class="banner banner-error" style="margin-bottom: 16px; font-weight: 600;">
+        🧪 Mode test actif — aucun accusé ni relance n'est réellement envoyé au client, tout est journalisé sans être expédié.
+      </div>`
+    : "";
+
   return `<!doctype html>
 <html lang="fr">
 <head>
@@ -909,6 +945,7 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
     ${connCard}
   </aside>
   <main class="admin-main">
+    ${shadowModeBanner}
     ${backLink ? `<a class="back-link" href="${backLink}">&larr; Retour</a>` : ""}
     <h1>${escapeHtml(title)}</h1>
     <p class="sub">${sub}</p>
@@ -1024,7 +1061,7 @@ function renderLoginPage(opts: { next: string; error?: string; action?: string; 
 
 // ---------- Page de connexion messagerie ----------
 
-function renderConnectionPage(q: Record<string, string>, csrfToken: string | undefined, baseUrl: string): string {
+async function renderConnectionPage(q: Record<string, string>, csrfToken: string | undefined, baseUrl: string): Promise<string> {
   const state = getConnectionState();
   const googleReady = Boolean(config.google.clientId && config.google.clientSecret);
   const azureReady = Boolean(config.azure.clientId && config.azure.clientSecret);
@@ -1061,7 +1098,7 @@ function renderConnectionPage(q: Record<string, string>, csrfToken: string | und
     })}
   </div>
   <footer>Une seule messagerie active à la fois. Se reconnecter avec l'autre bascule le pipeline automatiquement.</footer>
-  ${renderInvitePanel(listConnectInvites(), csrfToken, baseUrl)}`;
+  ${renderInvitePanel(await listConnectInvites(), csrfToken, baseUrl)}`;
 
   return pageShell(
     "connexion",
@@ -1274,13 +1311,13 @@ function matchesDossierFilter(row: ThreadRow, filter: DossierFilter): boolean {
   }
 }
 
-function renderDossiersPage(
+async function renderDossiersPage(
   threads: ThreadRow[],
   csrfToken: string | undefined,
   usageSummary: AiUsageSummary,
   filter: DossierFilter
-): string {
-  const categoryLabels = new Map(listCategories().map((c) => [c.id, c.label]));
+): Promise<string> {
+  const categoryLabels = new Map((await listCategories()).map((c) => [c.id, c.label]));
 
   // Les compteurs et le filtre "En retard" portent toujours sur l'ensemble des
   // dossiers charges (pas seulement ceux affiches), pour que le tableau de
@@ -1416,13 +1453,14 @@ function renderThreadRow(
 
 // ---------- Detail d'un dossier ----------
 
-function renderDossierDetailPage(
+async function renderDossierDetailPage(
   thread: ThreadRow,
   csrfToken: string | undefined,
   saved: string | undefined,
   error: string | undefined
-): string {
-  const categoryLabels = new Map(listCategories().map((c) => [c.id, c.label]));
+): Promise<string> {
+  const categories = await listCategories();
+  const categoryLabels = new Map(categories.map((c) => [c.id, c.label]));
   const categoryLabel = categoryLabels.get(thread.category_id) ?? thread.category_id;
   const stamp = statusStamp(thread);
   const canClose = !["responded", "closed", "skipped"].includes(thread.status);
@@ -1434,7 +1472,7 @@ function renderDossierDetailPage(
 
   const isPostReply = isPostReplyStatus(thread.status);
   const phase: RelancePhase = isPostReply ? "post_reply" : "pre_reply";
-  const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id, phase);
+  const { steps, isCustom } = await getEffectiveRelanceSteps(thread.thread_id, thread.category_id, phase);
   const nextStep = steps[isPostReply ? thread.post_reply_relance_count : thread.relance_count];
   const anchorAt = isPostReply ? thread.human_replied_at : thread.due_at;
   const canTriggerNow =
@@ -1566,7 +1604,7 @@ function renderDossierDetailPage(
           <form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/traiter">
             ${csrfField(csrfToken)}
             <select name="categoryId">
-              ${listCategories()
+              ${categories
                 .map(
                   (c) =>
                     `<option value="${escapeHtml(c.id)}" ${c.id === thread.category_id ? "selected" : ""}>${escapeHtml(c.label)}</option>`
@@ -1643,13 +1681,13 @@ function renderStepList(opts: {
   return `<div class="step-list">${items}</div>`;
 }
 
-function renderCategoryStepsPanel(
+async function renderCategoryStepsPanel(
   categoryId: string,
   phase: RelancePhase,
   title: string,
   csrfToken: string | undefined
-): string {
-  const steps = getCategoryRelanceSteps(categoryId, phase);
+): Promise<string> {
+  const steps = await getCategoryRelanceSteps(categoryId, phase);
   const stepsList = renderStepList({
     steps,
     editable: true,
@@ -1674,13 +1712,13 @@ function renderCategoryStepsPanel(
 
 // ---------- Reglages ----------
 
-function renderReglagesPage(
+async function renderReglagesPage(
   categories: CategoryConfig[],
   csrfToken: string | undefined,
   saved: string | undefined,
   error: string | undefined,
   openCategory?: string
-): string {
+): Promise<string> {
   const banner = error
     ? `<div class="banner banner-error">L'action a échoué — l'erreur a été journalisée, voir la page <a href="/journal">Journal</a>.</div>`
     : saved
@@ -1694,9 +1732,12 @@ function renderReglagesPage(
     always: "Toujours",
   };
 
-  const categoryBlocks = categories
-    .map((cat) => {
+  const categoryBlocks = (
+    await Promise.all(
+      categories.map(async (cat) => {
       const currentMode = alertModeOf(cat);
+      const preReplyPanel = await renderCategoryStepsPanel(cat.id, "pre_reply", phaseTitle("pre_reply"), csrfToken);
+      const postReplyPanel = await renderCategoryStepsPanel(cat.id, "post_reply", phaseTitle("post_reply"), csrfToken);
       return `<div class="category-block" id="cat-${escapeHtml(cat.id)}">
         <form class="category-head-form" method="POST" action="/reglages/categories/${encodeURIComponent(cat.id)}">
           ${csrfField(csrfToken)}
@@ -1729,12 +1770,13 @@ function renderReglagesPage(
         </form>
         <details class="advanced-steps" ${cat.id === openCategory ? "open" : ""}>
           <summary>Réglages avancés de la séquence de relance (délais précis, étapes multiples)</summary>
-          ${renderCategoryStepsPanel(cat.id, "pre_reply", phaseTitle("pre_reply"), csrfToken)}
-          ${renderCategoryStepsPanel(cat.id, "post_reply", phaseTitle("post_reply"), csrfToken)}
+          ${preReplyPanel}
+          ${postReplyPanel}
         </details>
       </div>`;
-    })
-    .join("");
+      })
+    )
+  ).join("");
 
   const body = `
     ${banner}
@@ -2050,22 +2092,23 @@ function renderReminderRow(row: ReminderRow): string {
 
 // ---------- Envois sans dossier (suivi manuel) ----------
 
-function renderNewSentPage(
+async function renderNewSentPage(
   messages: EmailMessage[],
   csrfToken: string | undefined,
   saved: string | undefined,
   loadError: string | undefined
-): string {
+): Promise<string> {
   const banner = loadError
     ? `<div class="banner banner-error">${escapeHtml(loadError)}</div>`
     : saved
       ? `<div class="banner banner-ok">Suivi démarré pour ce dossier.</div>`
       : "";
 
+  const categories = await listCategories();
   const list = messages.length
     ? `<div class="ledger">
         <div class="ledger-head"><span>Envoi</span></div>
-        ${messages.map((m) => renderNewSentRow(m, csrfToken)).join("")}
+        ${messages.map((m) => renderNewSentRow(m, csrfToken, categories)).join("")}
       </div>`
     : `<div class="ledger"><div class="empty">Aucun envoi récent sans dossier — tout ce que vous avez envoyé récemment est déjà suivi.</div></div>`;
 
@@ -2077,7 +2120,7 @@ function renderNewSentPage(
   );
 }
 
-function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined): string {
+function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined, categories: CategoryConfig[]): string {
   const recipient = message.to[0];
   const recipientLabel = recipient
     ? `${recipient.name ? `${recipient.name} — ` : ""}${recipient.email}`
@@ -2100,7 +2143,7 @@ function renderNewSentRow(message: EmailMessage, csrfToken: string | undefined):
               <input type="hidden" name="sentAt" value="${escapeHtml(message.receivedAt.toISOString())}" />
               <input type="hidden" name="hasAttachments" value="${message.hasAttachments ? "1" : "0"}" />
               <select name="categoryId">
-                ${listCategories()
+                ${categories
                   .map((c) => `<option value="${escapeHtml(c.id)}" ${c.id === "autre" ? "selected" : ""}>${escapeHtml(c.label)}</option>`)
                   .join("")}
               </select>
@@ -2121,12 +2164,12 @@ function formatMinutesLabel(minutes: number): string {
   return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
 }
 
-function renderCarnetPage(
+async function renderCarnetPage(
   entries: CarnetEntry[],
   csrfToken: string | undefined,
   saved: string | undefined,
   error: string | undefined
-): string {
+): Promise<string> {
   const banner = error
     ? `<div class="banner banner-error">L'action a échoué — voir la page <a href="/journal">Journal</a>.</div>`
     : saved
@@ -2150,7 +2193,7 @@ function renderCarnetPage(
     "carnet",
     "Carnet — semaine pilote",
     `Tout ce que le pipeline a reçu et comment l'IA l'a classé (catégorie, urgence) — avec l'accusé qu'elle aurait rédigé quand il y en a un. Rien n'est envoyé au client. Seul le rappel interne à l'équipe (délai réglable par catégorie dans Réglages) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
-    banner + analyseForm + renderCorpusPanel() + list
+    banner + analyseForm + (await renderCorpusPanel()) + list
   );
 }
 
@@ -2201,8 +2244,8 @@ function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): str
  * style generee. Une categorie sans aucune reponse capturee n'apparait pas
  * ici (rien a montrer).
  */
-function renderCorpusPanel(): string {
-  const categoryIds = listCategoriesWithCorpus();
+async function renderCorpusPanel(): Promise<string> {
+  const categoryIds = await listCategoriesWithCorpus();
   if (categoryIds.length === 0) {
     return `<div class="settings-section">
       <h2>Corpus des réponses de l'équipe</h2>
@@ -2210,13 +2253,14 @@ function renderCorpusPanel(): string {
     </div>`;
   }
 
-  const labelById = new Map(listCategories().map((c) => [c.id, c.label]));
-  const blocks = categoryIds
-    .map((id) => {
-      const label = labelById.get(id) ?? id;
-      const count = listHumanReplyCorpusByCategory(id).length;
-      const playbook = loadCategoryPlaybook(id);
-      return `<div class="category-block">
+  const labelById = new Map((await listCategories()).map((c) => [c.id, c.label]));
+  const blocks = (
+    await Promise.all(
+      categoryIds.map(async (id) => {
+        const label = labelById.get(id) ?? id;
+        const count = (await listHumanReplyCorpusByCategory(id)).length;
+        const playbook = await getCategoryPlaybook(id);
+        return `<div class="category-block">
         <div class="ledger-meta" style="padding: 10px 14px;">
           <strong>${escapeHtml(label)}</strong> — ${count} réponse(s) capturée(s)${
             playbook ? "" : ` — note de style pas encore générée (cliquez "Analyser le corpus maintenant")`
@@ -2228,8 +2272,9 @@ function renderCorpusPanel(): string {
             : ""
         }
       </div>`;
-    })
-    .join("");
+      })
+    )
+  ).join("");
 
   return `<div class="settings-section">
     <h2>Corpus des réponses de l'équipe</h2>
@@ -2351,11 +2396,9 @@ app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
   }
   const message = err instanceof Error ? err.message : String(err);
   console.error(`[erreur non geree] ${req.method} ${req.path}:`, err);
-  try {
-    recordPipelineError("web_request", null, `${req.method} ${req.path}: ${message}`);
-  } catch {
-    // Si meme la journalisation echoue, ne pas empecher la reponse d'erreur de partir.
-  }
+  // Fire-and-forget: la journalisation ne doit jamais retarder ni empecher
+  // la reponse d'erreur de partir (y compris si elle echoue elle-meme).
+  recordPipelineError("web_request", null, `${req.method} ${req.path}: ${message}`).catch(() => {});
   res.status(500);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderErrorPage());

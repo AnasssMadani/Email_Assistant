@@ -21,7 +21,7 @@ export async function processIncomingMessage(
   message: EmailMessage
 ): Promise<void> {
   if (message.isFromUs) return;
-  if (isMessageProcessed(message.id)) return;
+  if (await isMessageProcessed(message.id)) return;
 
   // Nos propres rappels internes (sendInternalNotification, relanceCheck.ts)
   // portent toujours ce prefixe exact. Quand NOTIFICATION_EMAIL n'est pas
@@ -37,13 +37,13 @@ export async function processIncomingMessage(
   // seul prefixe d'objet, qui n'importe quel expediteur peut usurper.
   const ownEmail = message.subject.startsWith("[Rappel]") ? await connector.getOwnEmailAddress() : undefined;
   if (ownEmail && message.from.email.toLowerCase() === ownEmail.toLowerCase()) {
-    markMessageProcessed(message.id, message.threadId);
+    await markMessageProcessed(message.id, message.threadId);
     return;
   }
 
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(message.threadId));
   const classification = await classifyEmail(thread, message);
-  const category = getCategory(classification.categoryId);
+  const category = await getCategory(classification.categoryId);
 
   if (category.id === "spam_newsletter") {
     // Contrairement aux autres categories "pas d'accuse necessaire", le spam
@@ -51,7 +51,7 @@ export async function processIncomingMessage(
     // — son volume noierait les vrais dossiers dans les deux registres pour
     // un interet de revue quasi nul. Le ghosting (aucun accuse) etait deja le
     // bon comportement ; seule la journalisation change ici.
-    markMessageProcessed(message.id, message.threadId);
+    await markMessageProcessed(message.id, message.threadId);
     console.log(`[skip] "${message.subject}" (spam_newsletter) — ignore, non journalise.`);
     return;
   }
@@ -68,7 +68,7 @@ export async function processIncomingMessage(
   // impossible de juger si l'IA l'a bien classifie (le but meme de la
   // semaine pilote). L'accuse, s'il y en a un, complete cette ligne plus
   // bas (voir recordAckDraft dans sendAcknowledgement).
-  recordClassification({
+  await recordClassification({
     threadId: message.threadId,
     messageId: message.id,
     categoryId: category.id,
@@ -79,7 +79,7 @@ export async function processIncomingMessage(
     receivedBody: message.bodyText,
   });
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId: message.threadId,
     subject: message.subject,
     senderEmail: message.from.email,
@@ -90,7 +90,7 @@ export async function processIncomingMessage(
     status: shouldAcknowledge ? "received" : "skipped",
     dueAt,
   });
-  markMessageProcessed(message.id, message.threadId);
+  await markMessageProcessed(message.id, message.threadId);
 
   if (!shouldAcknowledge) {
     console.log(`[skip] "${message.subject}" (${category.id}) — pas d'accuse requis.`);
@@ -123,7 +123,7 @@ export async function sendAcknowledgement(
   const ack = await draftAcknowledgement(thread, incoming, category);
 
   if (config.shadowModeEnabled) {
-    recordAckDraft({
+    await recordAckDraft({
       threadId: incoming.threadId,
       messageId: incoming.id,
       categoryId: category.id,
@@ -143,7 +143,7 @@ export async function sendAcknowledgement(
     // fil, relu, contient alors un message isFromUs de plus que ce
     // compteur) ne serait plus jamais detectee comme reponse humaine (voir
     // checkPreReplyThread dans relanceCheck.ts).
-    setThreadAckSent(incoming.threadId);
+    await setThreadAckSent(incoming.threadId);
     console.log(`[mode carnet] accuse redige (non envoye) pour ${incoming.from.email} — "${incoming.subject}"`);
     return;
   }
@@ -157,11 +157,11 @@ export async function sendAcknowledgement(
       inReplyToMessageId: incoming.rfcMessageId,
     })
   );
-  setThreadAckSent(incoming.threadId);
+  await setThreadAckSent(incoming.threadId);
   // Comptabilise cet envoi automatique: permet a checkPreReplyThread de
   // reconnaitre plus tard que ce message (retrouve dans le fil relu depuis
   // la messagerie) est notre propre accuse, pas une reponse humaine.
-  incrementAutomatedOutboundCount(incoming.threadId);
+  await incrementAutomatedOutboundCount(incoming.threadId);
   // Gmail/Graph marquent automatiquement tout le fil comme lu des qu'on y
   // envoie une reponse (l'accuse ci-dessus) — sans ce correctif, le message
   // du client disparait de la liste des non-lus alors que l'equipe ne l'a
@@ -176,6 +176,6 @@ export async function sendAcknowledgement(
   // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est
   // visible nulle part avant qu'un rebond n'arrive dans la boite, et devient
   // alors impossible a relier au dossier d'origine.
-  recordReminder(incoming.threadId, "external", `Accusé de réception envoyé à ${incoming.from.email}.`, "accuse");
+  await recordReminder(incoming.threadId, "external", `Accusé de réception envoyé à ${incoming.from.email}.`, "accuse");
   console.log(`[accuse envoye] ${incoming.from.email} — "${incoming.subject}"`);
 }

@@ -37,21 +37,21 @@ export async function discoverOutboundOnlyThreads(connector: EmailConnector): Pr
 
   for (const message of messages) {
     if (message.receivedAt.getTime() < OBSERVED_SINCE.getTime()) continue;
-    if (isMessageProcessed(message.id)) continue;
+    if (await isMessageProcessed(message.id)) continue;
 
     try {
       await registerIfNewThread(connector, message);
     } catch (err) {
       console.error(`[decouverte envois] erreur sur le message ${message.id}:`, err);
-      recordPipelineError("discover_outbound", message.threadId || null, (err as Error).message);
+      await recordPipelineError("discover_outbound", message.threadId || null, (err as Error).message);
     }
   }
 }
 
 async function registerIfNewThread(connector: EmailConnector, message: EmailMessage): Promise<void> {
-  markMessageProcessed(message.id, message.threadId);
+  await markMessageProcessed(message.id, message.threadId);
 
-  if (getThreadRow(message.threadId)) return; // deja suivi (dossier normal ou deja decouvert)
+  if (await getThreadRow(message.threadId)) return; // deja suivi (dossier normal ou deja decouvert)
 
   const recipient = message.to[0];
   if (!recipient?.email) return; // rien a relancer sans destinataire identifiable
@@ -72,13 +72,13 @@ async function registerIfNewThread(connector: EmailConnector, message: EmailMess
     categoryId = classification.categoryId;
     urgency = classification.urgency;
   } catch (err) {
-    recordPipelineError("discover_outbound", message.threadId, (err as Error).message);
+    await recordPipelineError("discover_outbound", message.threadId, (err as Error).message);
   }
 
-  const category = getCategory(categoryId);
+  const category = await getCategory(categoryId);
   const sentAt = message.receivedAt.toISOString();
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId: message.threadId,
     subject: message.subject,
     senderEmail: recipient.email,
@@ -90,6 +90,6 @@ async function registerIfNewThread(connector: EmailConnector, message: EmailMess
     dueAt: null,
     origin: "outbound",
   });
-  setThreadHumanReplied(message.threadId, sentAt, message.hasAttachments);
+  await setThreadHumanReplied(message.threadId, sentAt, message.hasAttachments);
   console.log(`[envoi suivi] ${recipient.email} — "${message.subject}" (categorie: ${category.id})`);
 }

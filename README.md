@@ -9,7 +9,7 @@ Deux connecteurs sont implémentés et interchangeables sans toucher au
 reste du code: **Gmail** (compte de test) et **Outlook / Microsoft 365**
 (messagerie de production, via Microsoft Graph). Le client connecte
 lui-même l'un ou l'autre depuis une page web — voir
-[Page de connexion](#3-page-de-connexion-le-client-branche-sa-boîte-lui-même).
+[Page de connexion](#4-page-de-connexion-le-client-branche-sa-boîte-lui-même).
 
 ## Ce que fait le pipeline
 
@@ -32,28 +32,29 @@ lui-même l'un ou l'autre depuis une page web — voir
 
 ## Où sont stockées les données
 
-Tout est journalisé dans une base **SQLite locale**, un simple fichier sur
-le disque de la machine qui fait tourner le service — pas de service
-externe. Chemin par défaut: `./data/app.db` (configurable via `DB_PATH`),
-soit concrètement `data/app.db` à la racine du projet. Utilise le module
-natif `node:sqlite` — aucune dépendance native à compiler.
+Tout est journalisé dans une base **Postgres hébergée sur Supabase**
+(`src/db.ts`, via le driver `pg`) — pas de fichier local. Chaque
+environnement (dev, production) pointe vers son **propre projet Supabase**,
+jamais partagé, configuré via la variable `DATABASE_URL`. Le schéma
+(`supabase/migrations/0001_init.sql`) est appliqué automatiquement au
+démarrage du service (`CREATE TABLE IF NOT EXISTS` — sans danger à
+rejouer). Le ton de marque et les notes de style par catégorie vivent
+également en base (tables `brand_voice`, `category_playbooks`) plutôt que
+dans des fichiers — un fichier sur le disque d'un service Render ne
+survivrait pas à un redéploiement.
 
-Dans le même dossier `data/` (exclu du dépôt via `.gitignore`):
+Un dossier `data/` (exclu du dépôt via `.gitignore`) reste utilisé pour ce
+qui doit rester local à l'instance:
 - `connection.json` — quelle messagerie est active (Gmail ou Outlook) et
   quelle adresse est connectée.
 - `gmail-token.json` / `graph-token.json` — jetons OAuth de la messagerie
   connectée.
 
-Ce fichier contient des métadonnées d'emails clients (objet, adresse,
-catégorie — pas le contenu complet des messages), à traiter comme donnée
-personnelle (RGPD): accès restreint, sauvegardes chiffrées, durée de
+La base contient des métadonnées d'emails clients (objet, adresse,
+catégorie — pas systématiquement le contenu complet des messages, sauf le
+mode test/carnet qui journalise le corps pour revue), à traiter comme
+donnée personnelle (RGPD): accès restreint, sauvegardes chiffrées, durée de
 rétention définie avec le client.
-
-**SQLite convient au pilote** (une seule instance). Pour la production à
-plus grande échelle, ou si l'hébergement choisi ne garantit pas un disque
-persistant entre redéploiements (containers éphémères, plateformes
-serverless), migrer vers une base gérée (Postgres) — voir
-[Mise en production](#mise-en-production).
 
 ## Comment le système sait qu'il y a eu une réponse
 
@@ -156,7 +157,20 @@ cp .env.example .env
 
 Ajoutez `ANTHROPIC_API_KEY` dans `.env`.
 
-### 2. Configuration agence (une fois par client)
+### 2. Base de données (Supabase)
+
+1. Créez un projet sur [supabase.com](https://supabase.com) — un projet par
+   environnement (`globallink-dev`, `globallink-prod`), jamais partagé entre
+   les deux.
+2. Dans le tableau de bord du projet: Settings → Database → Connection
+   string. Copiez-la dans `.env` sous `DATABASE_URL`.
+3. Aucune migration manuelle a lancer: `src/db.ts` applique automatiquement
+   [`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql)
+   au demarrage (`CREATE TABLE IF NOT EXISTS` — sans danger a rejouer),
+   puis amorce les categories depuis `config/categories.json` si la base
+   est vide.
+
+### 3. Configuration agence (une fois par client)
 
 Ces identifiants sont ceux de l'**agence** (l'application OAuth), pas ceux
 du client — le client, lui, ne fait qu'autoriser l'accès depuis la page de
@@ -183,7 +197,7 @@ connexion (étape 3).
    dans `.env` (`AZURE_TENANT_ID=common` si multitenant, sinon l'ID du
    tenant du client).
 
-### 3. Page de connexion (le client branche sa boîte lui-même)
+### 4. Page de connexion (le client branche sa boîte lui-même)
 
 ```bash
 npm run setup
@@ -217,7 +231,7 @@ tentatives (5 essais / 15 min / IP).
 `SETUP_PASSWORD` (mot de passe en clair) reste accepté pour compatibilité
 ascendante mais est déprécié — préférez `SETUP_PASSWORD_HASH`.
 
-### 4. Personnalisation métier
+### 5. Personnalisation métier
 
 - **Catégories et séquences de relance** (SLA par catégorie, accusé
   automatique, et la séquence d'étapes de relance de chaque catégorie —
@@ -240,7 +254,7 @@ ascendante mais est déprécié — préférez `SETUP_PASSWORD_HASH`.
   pendant combien de temps, et comment supprimer les données d'un dossier
   (bouton "Supprimer les données" sur la page de détail du dossier).
 
-### 5. Lancement
+### 6. Lancement
 
 ```bash
 npm run dev        # pipeline seul (scrutation + accusés + relances)
@@ -255,54 +269,76 @@ connexion existante, se rabat sur `EMAIL_CONNECTOR` dans `.env`.
 
 **À éviter pour ce projet: Vercel / Netlify.** Ce sont des plateformes
 serverless — chaque requête tourne dans une fonction éphémère, sans
-process persistant ni disque durable. Or le pipeline dépend d'un
-`node-cron` qui doit rester actif en continu, et la base SQLite a besoin
-d'un disque qui survit entre les requêtes. Les deux fonctionneraient sur
-Vercel/Netlify seulement après avoir réécrit le scheduling (leurs "Cron
-Jobs" déclenchent une route HTTP, pas un process qui tourne) et migré le
-stockage vers une base hébergée — un vrai chantier, pas juste un choix
+process persistant. Or le pipeline dépend d'un `node-cron` qui doit rester
+actif en continu. Les deux fonctionneraient sur Vercel/Netlify seulement
+après avoir réécrit le scheduling (leurs "Cron Jobs" déclenchent une route
+HTTP, pas un process qui tourne) — un vrai chantier, pas juste un choix
 d'hébergeur.
+
+### Deux environnements: dev et production
+
+Le projet tourne en **deux instances séparées**, chacune avec son propre
+projet Supabase — jamais la même base ni la même messagerie connectée:
+
+- **`globallink-dev`** — pour tester et corriger des bugs sans risque.
+  Connectée à sa propre messagerie de test, et tourne avec `SHADOW_MODE=true`
+  ("Mode test", bandeau rouge visible sur chaque page admin): le pipeline
+  classe et rédige normalement, mais n'envoie jamais réellement d'accusé ni
+  de relance externe. Deux garde-fous indépendants — la mauvaise
+  configuration d'un seul des deux ne suffit donc jamais à joindre un vrai
+  client.
+- **`globallink-prod`** — la messagerie réelle du client, `SHADOW_MODE`
+  désactivé.
+
+[`render.yaml`](render.yaml) décrit les deux services sous forme de
+blueprint. `globallink-prod` suit la branche `main`, `globallink-dev` suit
+une branche `dev` — promouvoir un changement de dev vers la prod se fait en
+mergeant `dev` dans `main`.
 
 ### Option recommandée: Render, sans Docker
 
 Render (comme Railway) fait tourner ce projet **tel quel**: un process
-Node persistant + un disque qui survit aux redémarrages — exactement ce
-que le pipeline attend, sans changement de code, et sans avoir besoin de
-Docker (Render détecte `package.json` et construit directement avec
-`npm install && npm run build`, puis lance `npm run start:all`).
+Node persistant — exactement ce que le pipeline attend, sans changement de
+code, et sans avoir besoin de Docker (Render détecte `package.json` et
+construit directement avec `npm install && npm run build`, puis lance
+`npm run start:all`).
 
-Le fichier [`render.yaml`](render.yaml) décrit déjà le service (build,
-démarrage, disque persistant monté sur `/var/data` pour la base SQLite et
-les jetons OAuth). Pour aller en prod:
+Pour aller en prod:
 
-1. Poussez ce projet sur un dépôt GitHub/GitLab.
-2. Sur [render.com](https://render.com) → New → Blueprint → sélectionnez le
-   dépôt. Render lit `render.yaml` et propose le service tel que configuré.
-3. **Choisissez le plan payant "Starter"** (pas le plan gratuit — celui-ci
-   se met en veille après une période d'inactivité, ce qui couperait le
-   `node-cron` et donc les accusés/relances automatiques).
-4. Renseignez les variables marquées secrètes dans le tableau de bord
-   Render (`ANTHROPIC_API_KEY`, `GOOGLE_CLIENT_ID/SECRET`,
-   `AZURE_CLIENT_ID/SECRET/TENANT_ID`, `SETUP_USERNAME/PASSWORD`, et les
-   `*_REDIRECT_URI` une fois l'URL Render connue, ex.
-   `https://votre-service.onrender.com/auth/gmail/callback`).
-5. Ajoutez ces mêmes URI de redirection dans Google Cloud Console et
+1. Poussez ce projet sur un dépôt GitHub/GitLab, avec une branche `dev`.
+2. Créez les deux projets Supabase (voir
+   [Base de données](#2-base-de-données-supabase)) — un pour dev, un pour
+   prod.
+3. Sur [render.com](https://render.com) → New → Blueprint → sélectionnez le
+   dépôt. Render lit `render.yaml` et propose les deux services tels que
+   configurés.
+4. **Choisissez le plan payant "Starter"** pour chacun (pas le plan
+   gratuit — celui-ci se met en veille après une période d'inactivité, ce
+   qui couperait le `node-cron` et donc les accusés/relances automatiques).
+5. Pour **chaque service**, renseignez les variables marquées secrètes dans
+   le tableau de bord Render — notamment `DATABASE_URL` (le projet Supabase
+   correspondant, jamais le même sur les deux services), `ANTHROPIC_API_KEY`,
+   `GOOGLE_CLIENT_ID/SECRET`, `AZURE_CLIENT_ID/SECRET/TENANT_ID`,
+   `SETUP_USERNAME/PASSWORD`, et les `*_REDIRECT_URI` une fois l'URL Render
+   connue, ex. `https://globallink-prod.onrender.com/auth/gmail/callback`.
+6. Ajoutez ces mêmes URI de redirection dans Google Cloud Console et
    Azure Portal.
-6. Render fournit HTTPS et un sous-domaine `.onrender.com` automatiquement;
+7. Render fournit HTTPS et un sous-domaine `.onrender.com` automatiquement;
    un domaine personnalisé se configure ensuite dans les réglages du service.
 
 ### Alternative: Docker (VPS, Azure Container Apps, etc.)
 
 ```bash
-cp .env.example .env   # completez avec vos vraies valeurs
+cp .env.example .env   # completez avec vos vraies valeurs, dont DATABASE_URL
 docker compose up -d --build
 ```
 
 Le `Dockerfile` compile le projet (`npm run build`) puis lance
 `node dist/main.js`, qui démarre à la fois la page de connexion/suivi et
 le pipeline dans un seul process — un seul service à surveiller.
-`docker-compose.yml` monte `./data` en volume pour que la base SQLite et
-les jetons OAuth survivent aux redémarrages du conteneur. Utile si vous
+`docker-compose.yml` monte `./data` en volume pour que `connection.json` et
+les jetons OAuth survivent aux redémarrages du conteneur (la base
+applicative, elle, vit sur Supabase — voir `DATABASE_URL`). Utile si vous
 préférez héberger vous-même (VPS) ou intégrer dans une stack Docker
 existante côté client — sans lien avec les rumeurs de lenteur de Docker,
 qui viennent surtout de Docker Desktop en développement sur Mac/Windows,
@@ -329,10 +365,8 @@ pas d'un conteneur Linux en production.
    (App Service avec "Always On" activé, VM + systemd/pm2, ou un
    orchestrateur de conteneurs), pas une fonction serverless qui s'éteint
    entre les requêtes.
-6. **Base de données** — si l'hébergement ne garantit pas un disque
-   persistant (containers éphémères redéployés, plusieurs instances),
-   migrer `src/db.ts` de SQLite vers Postgres avant d'aller au-delà du
-   pilote.
+6. **`DATABASE_URL`** — pointe vers le projet Supabase de PRODUCTION, jamais
+   celui de dev.
 7. **Scrutation → webhooks** — au-delà du pilote, remplacer le polling par
    les souscriptions Microsoft Graph / Gmail push (Pub/Sub) pour un
    traitement en quasi temps réel et moins d'appels API.
@@ -356,7 +390,7 @@ aucune modification de code ne peut les couvrir:
   confidentialité et conditions d'utilisation, puis soumettre l'app à
   vérification (obligatoire pour les scopes sensibles `gmail.send` /
   `gmail.readonly`). Ce projet publie désormais une page
-  [Confidentialité & rétention](#3-page-de-connexion-le-client-branche-sa-boîte-lui-même)
+  [Confidentialité & rétention](#4-page-de-connexion-le-client-branche-sa-boîte-lui-même)
   (`/confidentialite`) qui peut servir de base à la politique de
   confidentialité demandée par Google.
 - **Azure — image de marque de l'inscription d'application.** Dans le
@@ -392,22 +426,25 @@ tourner `typecheck` + `test` sur chaque push/PR.
 ```
 config/
   categories.json         catégories, SLA, règles de relance — amorçage initial uniquement (voir /reglages)
-  brand-voice.md           ton de marque
+  brand-voice.md           ton de marque — amorçage initial uniquement (voir /ton-de-marque)
+supabase/
+  migrations/0001_init.sql  schéma Postgres, appliqué automatiquement au démarrage (voir src/db.ts)
 src/
   connectors/               Gmail et Microsoft Graph (interface commune EmailConnector)
   web/server.ts             login + connexion messagerie + suivi des dossiers + réglages + journal
   web/auth.ts                sessions, CSRF, hash de mot de passe, limitation des tentatives
   crypto.ts                  chiffrement AES-256-GCM des jetons OAuth au repos
-  settings.ts                categories/seuils de relance, lus depuis la base (plus depuis le JSON)
+  settings.ts                categories/seuils de relance, lus depuis la base
   ai/                        classification + rédaction (Claude)
   pipeline/                  orchestration (email entrant, vérification des relances)
   scripts/                   auth Gmail en CLI (fallback), hash de mot de passe
   connectionState.ts         messagerie active (écrit par la page de connexion)
-  db.ts                      dossiers, catégories, séquences de relance (par catégorie ou par dossier), journal (SQLite local)
+  dbPool.ts                  pool de connexion Postgres partagé (injectable par les tests, voir test/_pgTestDb.ts)
+  db.ts                      dossiers, catégories, séquences de relance (par catégorie ou par dossier), journal (Postgres/Supabase)
   scheduler.ts, index.ts     pipeline seul
   main.ts                    pipeline + page web dans un seul process (prod/Docker)
-test/                      tests unitaires (node:test, exécutés via tsx)
-render.yaml                       déploiement Render (recommandé, sans Docker)
+test/                      tests unitaires (node:test, exécutés via tsx, base pg-mem isolée par fichier)
+render.yaml                       déploiement Render, deux services (dev + prod)
 Dockerfile, docker-compose.yml   déploiement Docker (alternatif)
 ```
 
@@ -433,8 +470,6 @@ sans `&` (ex. `SRA and Co`).
 - Aucune purge automatique des données anciennes: suppression uniquement
   manuelle, dossier par dossier, depuis sa page de détail (voir
   [Confidentialité & rétention](#autres-pages-de-lapplication)).
-- SQLite local convient au pilote; prévoir Postgres pour la production à
-  plus grande échelle (voir [Où sont stockées les données](#où-sont-stockées-les-données)).
 - Un seul compte connecté à la fois par instance (`data/connection.json`).
   Pour plusieurs boîtes clientes en parallèle, faire tourner une instance
   du service par boîte plutôt que de partager l'état de connexion.

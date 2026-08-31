@@ -1,420 +1,19 @@
-import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { getPool } from "./dbPool.js";
 import { config } from "./config.js";
 import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
 
-mkdirSync(path.dirname(path.resolve(config.dbPath)), { recursive: true });
-const db = new DatabaseSync(path.resolve(config.dbPath));
+const pool = getPool();
 
-/** Les 6 categories metier du mode carnet — voir ensurePiloteCarnetCategories plus bas. Declaree ici (plutot qu'a cote de cette fonction) pour etre initialisee avant son appel au chargement du module. */
-const CARNET_BUSINESS_CATEGORY_IDS = [
-  "devis",
-  "reclamation",
-  "suivi_dossier",
-  "demande_facture",
-  "disponibilite_bad",
-  "relance_paiement_soa",
-];
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SCHEMA_PATH = path.resolve(__dirname, "..", "supabase", "migrations", "0001_init.sql");
 
-/**
- * Certaines bases de production plus anciennes portent encore une colonne
- * categories.allow_external_relance (NOT NULL, sans defaut) heritee d'un
- * modele abandonne depuis (remplace par relance_steps/
- * post_reply_relance_steps) — absente du CREATE TABLE actuel, donc jamais
- * recreee sur une base neuve, mais toujours presente sur les bases deja
- * migrees, ou toute insertion qui l'omet echoue avec "NOT NULL constraint
- * failed". On la detecte a chaque insertion plutot que de tenter une
- * migration destructive (SQLite ne sait pas retirer une contrainte NOT NULL
- * sans recreer la table) — valeur figee a 0, plus lue nulle part dans le
- * code actuel.
- */
-function insertCategoryRow(params: {
-  id: string;
-  label: string;
-  slaHours: number;
-  slaMinutes: number;
-  acknowledgeAutomatically: 0 | 1;
-  sortOrder: number;
-  internalAlertsEnabled: 0 | 1;
-  internalAlertsMinUrgency: string;
-}): void {
-  const hasLegacyAllowExternalRelance = (
-    db.prepare("PRAGMA table_info(categories)").all() as unknown as { name: string }[]
-  ).some((c) => c.name === "allow_external_relance");
-
-  const columns = [
-    "id",
-    "label",
-    "sla_hours",
-    "sla_minutes",
-    "acknowledge_automatically",
-    "sort_order",
-    "internal_alerts_enabled",
-    "internal_alerts_min_urgency",
-  ];
-  const values: Array<string | number> = [
-    params.id,
-    params.label,
-    params.slaHours,
-    params.slaMinutes,
-    params.acknowledgeAutomatically,
-    params.sortOrder,
-    params.internalAlertsEnabled,
-    params.internalAlertsMinUrgency,
-  ];
-  if (hasLegacyAllowExternalRelance) {
-    columns.push("allow_external_relance");
-    values.push(0);
-  }
-
-  db.prepare(
-    `INSERT INTO categories (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`
-  ).run(...values);
-}
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS threads (
-    thread_id TEXT PRIMARY KEY,
-    subject TEXT NOT NULL,
-    sender_email TEXT NOT NULL,
-    sender_name TEXT,
-    category_id TEXT NOT NULL,
-    urgency TEXT NOT NULL,
-    sla_hours REAL NOT NULL,
-    -- SLA exprime en minutes (remplace sla_hours cote UI/logique — celle-ci
-    -- reste ecrite pour compatibilite avec les bases anterieures a la
-    -- bascule, ou la colonne est NOT NULL).
-    sla_minutes REAL,
-    status TEXT NOT NULL,
-    received_at TEXT NOT NULL,
-    ack_sent_at TEXT,
-    due_at TEXT,
-    last_relance_at TEXT,
-    relance_count INTEGER NOT NULL DEFAULT 0,
-    human_replied_at TEXT,
-    post_reply_relance_count INTEGER NOT NULL DEFAULT 0,
-    -- Vrai si la reponse de fond envoyee au client (ex: devis) contenait une
-    -- piece jointe (PDF, etc.) — permet a la relance post-reponse d'y faire
-    -- reference sans l'inventer. Renseigne automatiquement quand le
-    -- pipeline detecte la reponse (Gmail/Graph exposent l'info nativement).
-    outbound_had_attachment INTEGER NOT NULL DEFAULT 0,
-    -- Nombre de messages envoyes AUTOMATIQUEMENT par le pipeline dans ce
-    -- fil (accuse + chaque relance) — permet de detecter une vraie reponse
-    -- humaine par simple comptage: si le fil relu contient plus de messages
-    -- isFromUs que cette valeur, l'exces est forcement humain, quel que
-    -- soit son contenu ou son id. Remplace une correspondance exacte
-    -- (hash de corps, puis id de message) qui echouait encore en
-    -- production a cause d'alterations du texte au round-trip Gmail/Graph
-    -- (fins de ligne, encodage) — le comptage ne depend d'aucun des deux.
-    automated_outbound_count INTEGER NOT NULL DEFAULT 0,
-    -- 'inbound': dossier ouvert par un email CLIENT recu (received_at = heure
-    -- reelle de reception). 'outbound': dossier decouvert par
-    -- discoverOutbound.ts a partir d'un envoi a froid (devis, suivi...) —
-    -- received_at y vaut l'heure de DECOUVERTE par le pipeline, pas une
-    -- reception client, une semantique differente qui fausse les KPI de
-    -- delai de reponse si elle n'est pas distinguee (voir getClientMonthlyStats).
-    origin TEXT NOT NULL DEFAULT 'inbound',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS processed_messages (
-    message_id TEXT PRIMARY KEY,
-    thread_id TEXT NOT NULL,
-    processed_at TEXT NOT NULL
-  );
-
-  -- step_type identifie precisement QUELLE etape du cycle de vie ce rappel
-  -- represente (accuse / relance interne / relance externe avant ou apres
-  -- reponse...) — kind seul ('internal'/'external') ne suffit pas a
-  -- distinguer un accuse d'une relance externe avant reponse, les deux etant
-  -- 'external'. Sert de base fiable aux cases a cocher du dashboard client
-  -- (EXISTS ... WHERE step_type = ?) plutot que de deviner depuis le texte
-  -- de note, qui peut changer de formulation avec le temps.
-  CREATE TABLE IF NOT EXISTS reminders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    note TEXT,
-    step_type TEXT,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS categories (
-    id TEXT PRIMARY KEY,
-    label TEXT NOT NULL,
-    sla_hours REAL NOT NULL,
-    -- Idem threads.sla_minutes: source de verite cote UI/logique, sla_hours
-    -- reste ecrite pour compatibilite avec les bases anterieures.
-    sla_minutes REAL,
-    acknowledge_automatically INTEGER NOT NULL,
-    sort_order INTEGER NOT NULL,
-    -- Filtre anti-spam des rappels internes: une categorie peut nudger
-    -- l'equipe systematiquement, seulement au-dela d'une urgence donnee, ou
-    -- jamais (0 + 'high') — evite une notification pour chaque demande
-    -- banale restee sans reponse.
-    internal_alerts_enabled INTEGER NOT NULL DEFAULT 1,
-    internal_alerts_min_urgency TEXT NOT NULL DEFAULT 'normal'
-  );
-
-  CREATE TABLE IF NOT EXISTS relance_steps (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_type TEXT NOT NULL CHECK (owner_type IN ('category', 'thread')),
-    owner_id TEXT NOT NULL,
-    step_order INTEGER NOT NULL,
-    channel TEXT NOT NULL CHECK (channel IN ('internal', 'external')),
-    delay_hours REAL,
-    delay_minutes REAL,
-    UNIQUE(owner_type, owner_id, step_order)
-  );
-
-  -- Sequence distincte declenchee APRES qu'un humain a envoye une reponse de
-  -- fond (ex: le devis): on attend alors la reponse DU CLIENT a ce message,
-  -- et on le relance lui si il reste silencieux. Table separee de
-  -- relance_steps (plutot qu'une colonne "phase") pour eviter tout conflit
-  -- avec la contrainte UNIQUE existante lors de la migration en production.
-  CREATE TABLE IF NOT EXISTS post_reply_relance_steps (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_type TEXT NOT NULL CHECK (owner_type IN ('category', 'thread')),
-    owner_id TEXT NOT NULL,
-    step_order INTEGER NOT NULL,
-    channel TEXT NOT NULL CHECK (channel IN ('internal', 'external')),
-    delay_minutes REAL NOT NULL,
-    UNIQUE(owner_type, owner_id, step_order)
-  );
-
-  CREATE TABLE IF NOT EXISTS pipeline_errors (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    context TEXT NOT NULL,
-    thread_id TEXT,
-    message TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-
-  -- Un enregistrement par appel Claude (classification, accuse, relance,
-  -- brouillons) — sert au compteur de consommation/cout affiche dans
-  -- l'admin (page /consommation). call_type identifie l'appel, model le
-  -- modele utilise (permet de re-tarifer correctement si le modele change).
-  CREATE TABLE IF NOT EXISTS ai_usage_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    call_type TEXT NOT NULL,
-    thread_id TEXT,
-    model TEXT NOT NULL,
-    input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-  );
-
-  -- Mode "carnet" (semaine pilote, voir shadowModeEnabled): une ligne par
-  -- accuse REDIGE par l'IA mais jamais envoye ni depose en brouillon —
-  -- l'equivalent carnet de "accuse envoye a X" pour la page /carnet.
-  CREATE TABLE IF NOT EXISTS shadow_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    category_id TEXT NOT NULL,
-    original_subject TEXT NOT NULL,
-    sender_email TEXT NOT NULL,
-    sender_name TEXT,
-    received_body TEXT NOT NULL,
-    ack_subject TEXT NOT NULL,
-    ack_body TEXT NOT NULL,
-    reviewed_ok INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-  );
-
-  -- Corpus des vraies reponses de fond envoyees par l'equipe cette semaine,
-  -- par categorie — relu par la passe d'analyse (corpusAnalysis.ts) pour
-  -- generer une note de style par categorie (config/category-playbooks/).
-  CREATE TABLE IF NOT EXISTS human_reply_corpus (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL,
-    category_id TEXT NOT NULL,
-    reply_body TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-
-  -- Lien d'invitation a usage unique permettant au client de connecter sa
-  -- propre messagerie (OAuth) sans identifiants admin — voir
-  -- requireAuthOrInvite dans web/server.ts. used_at ET revoked_at sont
-  -- deux facons distinctes d'invalider un token (utilise avec succes, vs
-  -- retire manuellement avant usage) — l'UI admin affiche un statut different
-  -- pour chacune.
-  CREATE TABLE IF NOT EXISTS connect_invites (
-    token TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    used_at TEXT,
-    used_provider TEXT,
-    revoked_at TEXT
-  );
-
-`);
-
-ensureDelayMinutesColumn();
-ensureThreadPostReplyColumns();
-ensureThreadAttachmentColumn();
-ensureCategoryAlertColumns();
-ensureSlaMinutesColumns();
-ensureAutomatedOutboundCountColumn();
-ensureRelanceSnapshotColumns();
-ensureReminderStepTypeColumn();
-ensureShadowLogClassificationColumns();
-ensureThreadOriginColumn();
-ensureRemindersIndex();
-enableWal();
-seedIfNeeded();
-ensurePiloteCarnetCategories();
-
-/**
- * Migration additive: shadow_log ne couvrait au depart que les emails ayant
- * reellement eu un accuse redige — un email classe "pas d'accuse necessaire"
- * (categorie bruit, ou requiresAcknowledgement=false) n'apparaissait alors
- * NULLE PART avec son contenu, rendant impossible de juger si l'IA l'a bien
- * classifie. urgency + ack_drafted permettent desormais de journaliser
- * TOUTE classification (voir recordClassification dans processIncoming.ts),
- * l'accuse restant optionnel (ack_drafted=0 tant qu'aucun n'a ete redige).
- */
-function ensureShadowLogClassificationColumns(): void {
-  const columns = db.prepare("PRAGMA table_info(shadow_log)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "urgency")) {
-    db.exec("ALTER TABLE shadow_log ADD COLUMN urgency TEXT");
-  }
-  if (!columns.some((c) => c.name === "ack_drafted")) {
-    db.exec("ALTER TABLE shadow_log ADD COLUMN ack_drafted INTEGER NOT NULL DEFAULT 1");
-  }
-}
-
-/**
- * Migration additive: les deploiements anterieurs a la bascule heures->minutes
- * n'ont que delay_hours. Ajoute delay_minutes si absente (ALTER TABLE ADD
- * COLUMN, sans danger sur une table existante) et retro-remplit a partir de
- * delay_hours * 60 pour ne pas perdre les sequences deja configurees.
- */
-function ensureDelayMinutesColumn(): void {
-  const columns = db.prepare("PRAGMA table_info(relance_steps)").all() as unknown as {
-    name: string;
-  }[];
-  if (columns.some((c) => c.name === "delay_minutes")) return;
-  db.exec("ALTER TABLE relance_steps ADD COLUMN delay_minutes REAL");
-  db.exec("UPDATE relance_steps SET delay_minutes = delay_hours * 60 WHERE delay_minutes IS NULL");
-}
-
-/** Migration additive: ajoute les colonnes du cycle "post-reponse" sur threads si absentes. */
-function ensureThreadPostReplyColumns(): void {
-  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "human_replied_at")) {
-    db.exec("ALTER TABLE threads ADD COLUMN human_replied_at TEXT");
-  }
-  if (!columns.some((c) => c.name === "post_reply_relance_count")) {
-    db.exec("ALTER TABLE threads ADD COLUMN post_reply_relance_count INTEGER NOT NULL DEFAULT 0");
-  }
-}
-
-/** Migration additive: ajoute outbound_had_attachment sur threads si absente. */
-function ensureThreadAttachmentColumn(): void {
-  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "outbound_had_attachment")) {
-    db.exec("ALTER TABLE threads ADD COLUMN outbound_had_attachment INTEGER NOT NULL DEFAULT 0");
-  }
-}
-
-/** Migration additive: ajoute automated_outbound_count sur threads si absente. */
-function ensureAutomatedOutboundCountColumn(): void {
-  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "automated_outbound_count")) {
-    db.exec("ALTER TABLE threads ADD COLUMN automated_outbound_count INTEGER NOT NULL DEFAULT 0");
-  }
-}
-
-/**
- * Migration additive: colonnes de gel de la sequence de relance (voir
- * freezeRelanceStepsSnapshot ci-dessous). Nullable et vide par defaut — les
- * dossiers deja en cours au moment de cette migration se figent au premier
- * cycle de verification qui les relit, sur la base de la categorie telle
- * qu'elle est a ce moment-la.
- */
-/** Migration additive: ajoute step_type sur reminders si absente. */
-function ensureReminderStepTypeColumn(): void {
-  const columns = db.prepare("PRAGMA table_info(reminders)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "step_type")) {
-    db.exec("ALTER TABLE reminders ADD COLUMN step_type TEXT");
-  }
-}
-
-function ensureRelanceSnapshotColumns(): void {
-  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "pre_reply_relance_snapshot")) {
-    db.exec("ALTER TABLE threads ADD COLUMN pre_reply_relance_snapshot TEXT");
-  }
-  if (!columns.some((c) => c.name === "post_reply_relance_snapshot")) {
-    db.exec("ALTER TABLE threads ADD COLUMN post_reply_relance_snapshot TEXT");
-  }
-}
-
-/**
- * Migration additive: le SLA est desormais regle et affiche en minutes (plus
- * granulaire, coherent avec les etapes de relance deja en minutes) plutot
- * qu'en heures. Ajoute sla_minutes sur categories et threads si absente, et
- * retro-remplit a partir de sla_hours * 60 pour ne pas perdre les reglages
- * existants. sla_hours reste ecrite en parallele a chaque insertion/mise a
- * jour (voir toCategoryConfig/updateCategory/upsertThreadReceived) car cette
- * colonne est NOT NULL sur les bases anterieures a cette migration.
- */
-function ensureSlaMinutesColumns(): void {
-  const categoryColumns = db.prepare("PRAGMA table_info(categories)").all() as unknown as { name: string }[];
-  if (!categoryColumns.some((c) => c.name === "sla_minutes")) {
-    db.exec("ALTER TABLE categories ADD COLUMN sla_minutes REAL");
-  }
-  db.exec("UPDATE categories SET sla_minutes = sla_hours * 60 WHERE sla_minutes IS NULL");
-
-  const threadColumns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
-  if (!threadColumns.some((c) => c.name === "sla_minutes")) {
-    db.exec("ALTER TABLE threads ADD COLUMN sla_minutes REAL");
-  }
-  db.exec("UPDATE threads SET sla_minutes = sla_hours * 60 WHERE sla_minutes IS NULL");
-}
-
-/** Migration additive: ajoute les colonnes de filtre des rappels internes sur categories si absentes. */
-function ensureCategoryAlertColumns(): void {
-  const columns = db.prepare("PRAGMA table_info(categories)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "internal_alerts_enabled")) {
-    db.exec("ALTER TABLE categories ADD COLUMN internal_alerts_enabled INTEGER NOT NULL DEFAULT 1");
-  }
-  if (!columns.some((c) => c.name === "internal_alerts_min_urgency")) {
-    db.exec("ALTER TABLE categories ADD COLUMN internal_alerts_min_urgency TEXT NOT NULL DEFAULT 'normal'");
-  }
-}
-
-/** Migration additive: ajoute threads.origin ('inbound'/'outbound') si absente — voir CREATE TABLE threads. */
-function ensureThreadOriginColumn(): void {
-  const columns = db.prepare("PRAGMA table_info(threads)").all() as unknown as { name: string }[];
-  if (!columns.some((c) => c.name === "origin")) {
-    db.exec("ALTER TABLE threads ADD COLUMN origin TEXT NOT NULL DEFAULT 'inbound'");
-  }
-}
-
-/**
- * Index additif sur reminders(thread_id, step_type): la seule table qui
- * grossit sans borne et qui est reellement filtree par une requete cablee
- * (hasReminderStep, appelee plusieurs fois par vue du dashboard client).
- * Gain nul aujourd'hui (quelques milliers de lignes), mais evite un scan
- * lineaire une fois la table a plusieurs dizaines de milliers de lignes.
- */
-function ensureRemindersIndex(): void {
-  db.exec("CREATE INDEX IF NOT EXISTS idx_reminders_thread ON reminders(thread_id, step_type)");
-}
-
-/**
- * Le scheduler (ecriture) et le serveur web (lecture) partagent le meme
- * fichier DB dans le meme process — WAL permet a une lecture de ne jamais
- * attendre une ecriture en cours (et inversement), au lieu du mode DELETE
- * par defaut qui peut brievement verrouiller la base entiere.
- */
-function enableWal(): void {
-  db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;");
+async function ensureSchema(): Promise<void> {
+  const sql = readFileSync(SCHEMA_PATH, "utf-8");
+  await pool.query(sql);
 }
 
 /** Forme du fichier JSON d'amorçage historique (config/categories.json) — figee, distincte du modele runtime actuel. */
@@ -453,47 +52,58 @@ function defaultAlertSettingsFor(categoryId: string): { enabled: boolean; minUrg
   }
 }
 
-function seedIfNeeded(): void {
-  const categoryCount = db.prepare("SELECT COUNT(*) AS n FROM categories").get() as { n: number };
-  const stepOwnerCount = db
-    .prepare("SELECT COUNT(*) AS n FROM relance_steps WHERE owner_type = 'category'")
-    .get() as { n: number };
-  const postReplyStepOwnerCount = db
-    .prepare("SELECT COUNT(*) AS n FROM post_reply_relance_steps WHERE owner_type = 'category'")
-    .get() as { n: number };
-  if (categoryCount.n > 0 && stepOwnerCount.n > 0 && postReplyStepOwnerCount.n > 0) return;
+/**
+ * Amorçage initial des categories/sequences depuis config/categories.json —
+ * une seule fois, a la premiere connexion a une base vide. Editable ensuite
+ * exclusivement depuis /reglages: ce fichier n'est plus jamais relu apres
+ * ce premier amorçage.
+ */
+async function seedIfNeeded(): Promise<void> {
+  const categoryCount = await pool.query<{ n: string }>("SELECT COUNT(*) AS n FROM categories");
+  const stepOwnerCount = await pool.query<{ n: string }>(
+    "SELECT COUNT(*) AS n FROM relance_steps WHERE owner_type = 'category'"
+  );
+  const postReplyStepOwnerCount = await pool.query<{ n: string }>(
+    "SELECT COUNT(*) AS n FROM post_reply_relance_steps WHERE owner_type = 'category'"
+  );
+  const hasCategories = Number(categoryCount.rows[0].n) > 0;
+  const hasSteps = Number(stepOwnerCount.rows[0].n) > 0;
+  const hasPostReplySteps = Number(postReplyStepOwnerCount.rows[0].n) > 0;
+  if (hasCategories && hasSteps && hasPostReplySteps) return;
 
   const raw = readFileSync(path.resolve(config.categoriesConfigPath), "utf-8");
   const seed = JSON.parse(raw) as CategoriesSeedFile;
   const seedById = new Map(seed.categories.map((cat) => [cat.id, cat]));
 
-  if (categoryCount.n === 0) {
-    const insert = db.prepare(
-      `INSERT INTO categories (
-        id, label, sla_hours, sla_minutes, acknowledge_automatically, sort_order,
-        internal_alerts_enabled, internal_alerts_min_urgency
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    );
-    seed.categories.forEach((cat, index) => {
+  if (!hasCategories) {
+    for (let index = 0; index < seed.categories.length; index++) {
+      const cat = seed.categories[index];
       const alerts = defaultAlertSettingsFor(cat.id);
-      insert.run(
-        cat.id,
-        cat.label,
-        cat.slaHours,
-        cat.slaHours * 60,
-        cat.acknowledgeAutomatically ? 1 : 0,
-        index,
-        alerts.enabled ? 1 : 0,
-        alerts.minUrgency
+      await pool.query(
+        `INSERT INTO categories (
+          id, label, sla_minutes, acknowledge_automatically, sort_order,
+          internal_alerts_enabled, internal_alerts_min_urgency, is_ignored, is_fallback
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          cat.id,
+          cat.label,
+          Math.round(cat.slaHours * 60),
+          cat.acknowledgeAutomatically ? 1 : 0,
+          index,
+          alerts.enabled ? 1 : 0,
+          alerts.minUrgency,
+          cat.id === "spam_newsletter" ? 1 : 0,
+          cat.id === "autre" ? 1 : 0,
+        ]
       );
-    });
+    }
   }
 
-  const existingCategoryIds = (
-    db.prepare("SELECT id FROM categories").all() as unknown as { id: string }[]
-  ).map((r) => r.id);
+  const existingCategoryIds = (await pool.query<{ id: string }>("SELECT id FROM categories")).rows.map(
+    (r) => r.id
+  );
 
-  if (stepOwnerCount.n === 0) {
+  if (!hasSteps) {
     for (const categoryId of existingCategoryIds) {
       const fromSeed = seedById.get(categoryId);
       const steps = fromSeed
@@ -506,87 +116,46 @@ function seedIfNeeded(): void {
             },
           ]
         : [{ channel: "internal" as const, delayMinutes: 24 * 60 }];
-      writeSteps("pre_reply", "category", categoryId, steps);
+      await writeSteps("pre_reply", "category", categoryId, steps);
     }
   }
 
-  if (postReplyStepOwnerCount.n === 0) {
+  if (!hasPostReplySteps) {
     // Une fois qu'un humain a envoye une reponse de fond (devis, etc.), une
     // seule relance externe par defaut apres 3 jours si le client n'a pas
     // repondu — ajustable par categorie depuis /reglages.
     for (const categoryId of existingCategoryIds) {
-      writeSteps("post_reply", "category", categoryId, [{ channel: "external", delayMinutes: 3 * 1440 }]);
+      await writeSteps("post_reply", "category", categoryId, [{ channel: "external", delayMinutes: 3 * 1440 }]);
     }
   }
 }
 
 /**
- * Amorçage ponctuel du mode carnet (semaine pilote, transitaire): relabellise
- * les 3 categories metier deja existantes, ajoute les 3 nouvelles, et les
- * regle sur "toujours alerter l'equipe" (urgence min 'low'). Se declenche
- * une seule fois: si "disponibilite_bad" existe deja, ce bloc a deja tourne,
- * on ne reapplique rien pour ne jamais ecraser un reglage modifie depuis
- * /reglages entre temps. N'affecte pas demande_information/candidature (hors
- * perimetre metier pour ce client) ni les sequences post_reply (relances
- * apres une vraie reponse humaine — comportement existant, inchange). Le
- * delai du rappel lui-meme n'est pas fige ici — libre a /reglages de
- * l'ajuster par la suite, la sequence pre_reply de ces categories n'est plus
- * jamais reecrasee automatiquement.
+ * Amorce la ligne unique `brand_voice` depuis config/brand-voice.md, une
+ * seule fois (base vide) — modifiable ensuite exclusivement depuis
+ * /ton-de-marque, ce fichier n'est plus jamais relu apres ce premier
+ * amorçage. Absence de fichier de depart tolerée (n'empeche pas le
+ * demarrage): la ligne reste alors simplement absente jusqu'a la premiere
+ * sauvegarde depuis /ton-de-marque.
  */
-function ensurePiloteCarnetCategories(): void {
-  const already = db.prepare("SELECT 1 FROM categories WHERE id = 'disponibilite_bad'").get();
-  if (already) return;
-
-  const relabel: Array<{ id: string; label: string }> = [
-    { id: "devis", label: "Demande de devis" },
-    { id: "reclamation", label: "Réclamation" },
-    { id: "suivi_dossier", label: "Suivi de dossier" },
-  ];
-  const updateLabel = db.prepare("UPDATE categories SET label = ? WHERE id = ?");
-  for (const cat of relabel) {
-    updateLabel.run(cat.label, cat.id);
+async function seedBrandVoiceIfNeeded(): Promise<void> {
+  const existing = await pool.query("SELECT 1 FROM brand_voice WHERE id = 1");
+  if (existing.rowCount) return;
+  let content: string;
+  try {
+    content = readFileSync(path.resolve(config.brandVoicePath), "utf-8");
+  } catch {
+    return;
   }
-
-  const newCategories: Array<{ id: string; label: string; slaHours: number }> = [
-    { id: "demande_facture", label: "Demande de facture", slaHours: 24 },
-    // Souvent urgent (marchandise potentiellement bloquee, frais de
-    // stockage qui courent) — SLA plus court par defaut, ajustable ensuite.
-    { id: "disponibilite_bad", label: "Disponibilité de BAD", slaHours: 4 },
-    { id: "relance_paiement_soa", label: "Relance de paiement SOA", slaHours: 48 },
-  ];
-  const maxOrderRow = db
-    .prepare("SELECT COALESCE(MAX(sort_order), -1) AS m FROM categories")
-    .get() as { m: number };
-  newCategories.forEach((cat, index) => {
-    insertCategoryRow({
-      id: cat.id,
-      label: cat.label,
-      slaHours: cat.slaHours,
-      slaMinutes: cat.slaHours * 60,
-      acknowledgeAutomatically: 1,
-      sortOrder: maxOrderRow.m + 1 + index,
-      internalAlertsEnabled: 1,
-      internalAlertsMinUrgency: "low",
-    });
-  });
-
-  const updateAlerts = db.prepare(
-    "UPDATE categories SET internal_alerts_enabled = 1, internal_alerts_min_urgency = 'low' WHERE id = ?"
+  await pool.query(
+    "INSERT INTO brand_voice (id, content, updated_at) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING",
+    [content, new Date().toISOString()]
   );
-  for (const id of CARNET_BUSINESS_CATEGORY_IDS) {
-    updateAlerts.run(id);
-  }
-
-  // Amorce initiale unique: un seul rappel interne a 30 min pour les 6
-  // categories metier (les 3 nouvelles n'ont sinon AUCUNE etape — seedIfNeeded
-  // a deja tourne avant leur creation ci-dessus — et les 3 relabelisees
-  // gardent sinon le defaut generique de config/categories.json). Comme le
-  // reste de cette fonction, ne s'applique qu'une fois: modifiable ensuite
-  // librement depuis /reglages, plus jamais reecrasee automatiquement.
-  for (const id of CARNET_BUSINESS_CATEGORY_IDS) {
-    writeSteps("pre_reply", "category", id, [{ channel: "internal", delayMinutes: 30 }]);
-  }
 }
+
+await ensureSchema();
+await seedIfNeeded();
+await seedBrandVoiceIfNeeded();
 
 export interface ThreadRow {
   thread_id: string;
@@ -595,8 +164,7 @@ export interface ThreadRow {
   sender_name: string | null;
   category_id: string;
   urgency: string;
-  sla_hours: number;
-  sla_minutes: number | null;
+  sla_minutes: number;
   status: ThreadStatus;
   received_at: string;
   ack_sent_at: string | null;
@@ -612,20 +180,19 @@ export interface ThreadRow {
   updated_at: string;
 }
 
-export function isMessageProcessed(messageId: string): boolean {
-  const row = db
-    .prepare("SELECT 1 FROM processed_messages WHERE message_id = ?")
-    .get(messageId);
-  return row !== undefined;
+export async function isMessageProcessed(messageId: string): Promise<boolean> {
+  const result = await pool.query("SELECT 1 FROM processed_messages WHERE message_id = $1", [messageId]);
+  return (result.rowCount ?? 0) > 0;
 }
 
-export function markMessageProcessed(messageId: string, threadId: string): void {
-  db.prepare(
-    "INSERT OR IGNORE INTO processed_messages (message_id, thread_id, processed_at) VALUES (?, ?, ?)"
-  ).run(messageId, threadId, new Date().toISOString());
+export async function markMessageProcessed(messageId: string, threadId: string): Promise<void> {
+  await pool.query(
+    "INSERT INTO processed_messages (message_id, thread_id, processed_at) VALUES ($1, $2, $3) ON CONFLICT (message_id) DO NOTHING",
+    [messageId, threadId, new Date().toISOString()]
+  );
 }
 
-export function upsertThreadReceived(params: {
+export async function upsertThreadReceived(params: {
   threadId: string;
   subject: string;
   senderEmail: string;
@@ -636,18 +203,17 @@ export function upsertThreadReceived(params: {
   status: ThreadStatus;
   dueAt: string | null;
   origin?: "inbound" | "outbound";
-}): void {
+}): Promise<void> {
   const now = new Date().toISOString();
-  db.prepare(
+  await pool.query(
     `INSERT INTO threads (
       thread_id, subject, sender_email, sender_name, category_id, urgency,
-      sla_hours, sla_minutes, status, received_at, due_at, relance_count, origin, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-    ON CONFLICT(thread_id) DO UPDATE SET
+      sla_minutes, status, received_at, due_at, relance_count, origin, created_at, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12, $13)
+    ON CONFLICT (thread_id) DO UPDATE SET
       subject = excluded.subject,
       category_id = excluded.category_id,
       urgency = excluded.urgency,
-      sla_hours = excluded.sla_hours,
       sla_minutes = excluded.sla_minutes,
       -- Ne jamais retrograder un dossier deja passe en post-reponse
       -- (human_replied_at deja pose): un entrant qui arrive en retard sur un
@@ -657,44 +223,45 @@ export function upsertThreadReceived(params: {
       -- deux phases et pollue le corpus/les metriques de reponse humaine.
       status = CASE WHEN threads.human_replied_at IS NOT NULL THEN threads.status ELSE excluded.status END,
       due_at = CASE WHEN threads.human_replied_at IS NOT NULL THEN threads.due_at ELSE excluded.due_at END,
-      updated_at = excluded.updated_at`
-  ).run(
-    params.threadId,
-    params.subject,
-    params.senderEmail,
-    params.senderName,
-    params.categoryId,
-    params.urgency,
-    params.slaMinutes / 60,
-    params.slaMinutes,
-    params.status,
-    now,
-    params.dueAt,
-    params.origin ?? "inbound",
-    now,
-    now
+      updated_at = excluded.updated_at`,
+    [
+      params.threadId,
+      params.subject,
+      params.senderEmail,
+      params.senderName,
+      params.categoryId,
+      params.urgency,
+      params.slaMinutes,
+      params.status,
+      now,
+      params.dueAt,
+      params.origin ?? "inbound",
+      now,
+      now,
+    ]
   );
 }
 
-export function setThreadStatus(threadId: string, status: ThreadStatus): void {
-  db.prepare("UPDATE threads SET status = ?, updated_at = ? WHERE thread_id = ?").run(
+export async function setThreadStatus(threadId: string, status: ThreadStatus): Promise<void> {
+  await pool.query("UPDATE threads SET status = $1, updated_at = $2 WHERE thread_id = $3", [
     status,
     new Date().toISOString(),
-    threadId
-  );
+    threadId,
+  ]);
 }
 
-export function setThreadAckSent(threadId: string): void {
+export async function setThreadAckSent(threadId: string): Promise<void> {
   const now = new Date().toISOString();
-  db.prepare(
-    "UPDATE threads SET status = 'ack_sent', ack_sent_at = ?, updated_at = ? WHERE thread_id = ?"
-  ).run(now, now, threadId);
+  await pool.query("UPDATE threads SET status = 'ack_sent', ack_sent_at = $1, updated_at = $2 WHERE thread_id = $3", [
+    now,
+    now,
+    threadId,
+  ]);
 }
 
-export function getThreadRow(threadId: string): ThreadRow | undefined {
-  return db.prepare("SELECT * FROM threads WHERE thread_id = ?").get(threadId) as
-    | ThreadRow
-    | undefined;
+export async function getThreadRow(threadId: string): Promise<ThreadRow | undefined> {
+  const result = await pool.query<ThreadRow>("SELECT * FROM threads WHERE thread_id = $1", [threadId]);
+  return result.rows[0];
 }
 
 /**
@@ -715,35 +282,38 @@ export type ReminderStepType =
   | "relance_externe_pre_reponse"
   | "relance_externe_post_reponse";
 
-export function recordReminder(
+export async function recordReminder(
   threadId: string,
   kind: "internal" | "external",
   note: string,
   stepType?: ReminderStepType
-): void {
-  db.prepare(
-    "INSERT INTO reminders (thread_id, kind, note, step_type, created_at) VALUES (?, ?, ?, ?, ?)"
-  ).run(threadId, kind, note, stepType ?? null, new Date().toISOString());
+): Promise<void> {
+  await pool.query(
+    "INSERT INTO reminders (thread_id, kind, note, step_type, created_at) VALUES ($1, $2, $3, $4, $5)",
+    [threadId, kind, note, stepType ?? null, new Date().toISOString()]
+  );
 }
 
-/** Utilise par le dashboard client: cette etape a-t-elle deja eu lieu pour ce dossier ? */
-export function hasReminderStep(threadId: string, stepType: ReminderStepType): boolean {
-  const row = db
-    .prepare("SELECT 1 FROM reminders WHERE thread_id = ? AND step_type = ? LIMIT 1")
-    .get(threadId, stepType);
-  return row !== undefined;
+/** Cette etape a-t-elle deja eu lieu pour ce dossier ? */
+export async function hasReminderStep(threadId: string, stepType: ReminderStepType): Promise<boolean> {
+  const result = await pool.query("SELECT 1 FROM reminders WHERE thread_id = $1 AND step_type = $2 LIMIT 1", [
+    threadId,
+    stepType,
+  ]);
+  return (result.rowCount ?? 0) > 0;
 }
 
-export function incrementRelance(threadId: string, status: ThreadStatus): void {
+export async function incrementRelance(threadId: string, status: ThreadStatus): Promise<void> {
   const now = new Date().toISOString();
-  db.prepare(
+  await pool.query(
     `UPDATE threads SET
       relance_count = relance_count + 1,
-      last_relance_at = ?,
-      status = ?,
-      updated_at = ?
-     WHERE thread_id = ?`
-  ).run(now, status, now, threadId);
+      last_relance_at = $1,
+      status = $2,
+      updated_at = $3
+     WHERE thread_id = $4`,
+    [now, status, now, threadId]
+  );
 }
 
 /**
@@ -753,45 +323,49 @@ export function incrementRelance(threadId: string, status: ThreadStatus): void {
  * l'ancrage de la sequence post-reponse soit l'heure reelle d'envoi, pas
  * l'heure de decouverte par le pipeline.
  */
-export function setThreadHumanReplied(threadId: string, repliedAt?: string, hadAttachment = false): void {
+export async function setThreadHumanReplied(
+  threadId: string,
+  repliedAt?: string,
+  hadAttachment = false
+): Promise<void> {
   const now = new Date().toISOString();
   const humanRepliedAt = repliedAt ?? now;
-  db.prepare(
+  await pool.query(
     `UPDATE threads SET
       status = 'awaiting_client_reply',
-      human_replied_at = ?,
-      outbound_had_attachment = ?,
-      updated_at = ?
-     WHERE thread_id = ?`
-  ).run(humanRepliedAt, hadAttachment ? 1 : 0, now, threadId);
+      human_replied_at = $1,
+      outbound_had_attachment = $2,
+      updated_at = $3
+     WHERE thread_id = $4`,
+    [humanRepliedAt, hadAttachment ? 1 : 0, now, threadId]
+  );
 }
 
-export function incrementPostReplyRelance(threadId: string, status: ThreadStatus): void {
+export async function incrementPostReplyRelance(threadId: string, status: ThreadStatus): Promise<void> {
   const now = new Date().toISOString();
-  db.prepare(
+  await pool.query(
     `UPDATE threads SET
       post_reply_relance_count = post_reply_relance_count + 1,
-      last_relance_at = ?,
-      status = ?,
-      updated_at = ?
-     WHERE thread_id = ?`
-  ).run(now, status, now, threadId);
+      last_relance_at = $1,
+      status = $2,
+      updated_at = $3
+     WHERE thread_id = $4`,
+    [now, status, now, threadId]
+  );
 }
 
-export function listRecentThreads(limit = 100): ThreadRow[] {
-  return db
-    .prepare("SELECT * FROM threads ORDER BY updated_at DESC LIMIT ?")
-    .all(limit) as unknown as ThreadRow[];
+export async function listRecentThreads(limit = 100): Promise<ThreadRow[]> {
+  const result = await pool.query<ThreadRow>("SELECT * FROM threads ORDER BY updated_at DESC LIMIT $1", [limit]);
+  return result.rows;
 }
 
-export function listThreadsAwaitingReply(): ThreadRow[] {
-  return db
-    .prepare(
-      `SELECT * FROM threads
-       WHERE status IN ('ack_sent', 'drafts_ready', 'relance_sent')
-       AND due_at IS NOT NULL`
-    )
-    .all() as unknown as ThreadRow[];
+export async function listThreadsAwaitingReply(): Promise<ThreadRow[]> {
+  const result = await pool.query<ThreadRow>(
+    `SELECT * FROM threads
+     WHERE status IN ('ack_sent', 'drafts_ready', 'relance_sent')
+     AND due_at IS NOT NULL`
+  );
+  return result.rows;
 }
 
 /**
@@ -800,54 +374,56 @@ export function listThreadsAwaitingReply(): ThreadRow[] {
  * relance ou non. Sans inclure 'post_reply_relance_sent', un dossier
  * cessait d'etre reexamine des sa premiere relance post-reponse envoyee.
  */
-export function listThreadsAwaitingClientReply(): ThreadRow[] {
-  return db
-    .prepare(
-      `SELECT * FROM threads
-       WHERE status IN ('awaiting_client_reply', 'post_reply_relance_sent')
-       AND human_replied_at IS NOT NULL`
-    )
-    .all() as unknown as ThreadRow[];
+export async function listThreadsAwaitingClientReply(): Promise<ThreadRow[]> {
+  const result = await pool.query<ThreadRow>(
+    `SELECT * FROM threads
+     WHERE status IN ('awaiting_client_reply', 'post_reply_relance_sent')
+     AND human_replied_at IS NOT NULL`
+  );
+  return result.rows;
 }
 
-export function deleteThreadData(threadId: string): void {
-  db.prepare("DELETE FROM reminders WHERE thread_id = ?").run(threadId);
-  db.prepare("DELETE FROM processed_messages WHERE thread_id = ?").run(threadId);
-  db.prepare("DELETE FROM relance_steps WHERE owner_type = 'thread' AND owner_id = ?").run(threadId);
-  db.prepare("DELETE FROM post_reply_relance_steps WHERE owner_type = 'thread' AND owner_id = ?").run(threadId);
-  db.prepare("DELETE FROM threads WHERE thread_id = ?").run(threadId);
+export async function deleteThreadData(threadId: string): Promise<void> {
+  await pool.query("DELETE FROM reminders WHERE thread_id = $1", [threadId]);
+  await pool.query("DELETE FROM processed_messages WHERE thread_id = $1", [threadId]);
+  await pool.query("DELETE FROM relance_steps WHERE owner_type = 'thread' AND owner_id = $1", [threadId]);
+  await pool.query("DELETE FROM post_reply_relance_steps WHERE owner_type = 'thread' AND owner_id = $1", [
+    threadId,
+  ]);
+  await pool.query("DELETE FROM threads WHERE thread_id = $1", [threadId]);
 }
 
 interface CategoryRow {
   id: string;
   label: string;
-  sla_hours: number;
-  sla_minutes: number | null;
+  sla_minutes: number;
   acknowledge_automatically: number;
   sort_order: number;
   internal_alerts_enabled: number;
   internal_alerts_min_urgency: string;
+  description: string;
+  examples: string;
+  is_ignored: number;
+  is_fallback: number;
 }
 
 function toCategoryConfig(row: CategoryRow): CategoryConfig {
   return {
     id: row.id,
     label: row.label,
-    slaMinutes: row.sla_minutes ?? row.sla_hours * 60,
+    slaMinutes: row.sla_minutes,
     acknowledgeAutomatically: row.acknowledge_automatically === 1,
     internalAlertsEnabled: row.internal_alerts_enabled === 1,
     internalAlertsMinUrgency: (row.internal_alerts_min_urgency as UrgencyThreshold) || "normal",
   };
 }
 
-export function listCategories(): CategoryConfig[] {
-  const rows = db
-    .prepare("SELECT * FROM categories ORDER BY sort_order ASC")
-    .all() as unknown as CategoryRow[];
-  return rows.map(toCategoryConfig);
+export async function listCategories(): Promise<CategoryConfig[]> {
+  const result = await pool.query<CategoryRow>("SELECT * FROM categories ORDER BY sort_order ASC");
+  return result.rows.map(toCategoryConfig);
 }
 
-export function updateCategory(
+export async function updateCategory(
   id: string,
   patch: {
     label: string;
@@ -856,24 +432,23 @@ export function updateCategory(
     internalAlertsEnabled: boolean;
     internalAlertsMinUrgency: UrgencyThreshold;
   }
-): void {
-  db.prepare(
+): Promise<void> {
+  await pool.query(
     `UPDATE categories SET
-      label = ?,
-      sla_hours = ?,
-      sla_minutes = ?,
-      acknowledge_automatically = ?,
-      internal_alerts_enabled = ?,
-      internal_alerts_min_urgency = ?
-     WHERE id = ?`
-  ).run(
-    patch.label,
-    patch.slaMinutes / 60,
-    patch.slaMinutes,
-    patch.acknowledgeAutomatically ? 1 : 0,
-    patch.internalAlertsEnabled ? 1 : 0,
-    patch.internalAlertsMinUrgency,
-    id
+      label = $1,
+      sla_minutes = $2,
+      acknowledge_automatically = $3,
+      internal_alerts_enabled = $4,
+      internal_alerts_min_urgency = $5
+     WHERE id = $6`,
+    [
+      patch.label,
+      patch.slaMinutes,
+      patch.acknowledgeAutomatically ? 1 : 0,
+      patch.internalAlertsEnabled ? 1 : 0,
+      patch.internalAlertsMinUrgency,
+      id,
+    ]
   );
 }
 
@@ -889,10 +464,8 @@ function slugify(label: string): string {
   return base || "categorie";
 }
 
-function uniqueCategoryId(base: string): string {
-  const existing = new Set(
-    (db.prepare("SELECT id FROM categories").all() as unknown as { id: string }[]).map((r) => r.id)
-  );
+async function uniqueCategoryId(base: string): Promise<string> {
+  const existing = new Set((await pool.query<{ id: string }>("SELECT id FROM categories")).rows.map((r) => r.id));
   if (!existing.has(base)) return base;
   let n = 2;
   while (existing.has(`${base}_${n}`)) n++;
@@ -907,32 +480,36 @@ function uniqueCategoryId(base: string): string {
  * ecrite immediatement (1 rappel interne a J+1, 1 relance externe a J+3
  * apres reponse) pour que la categorie soit utilisable des sa creation.
  */
-export function createCategory(params: {
+export async function createCategory(params: {
   label: string;
   slaMinutes: number;
   acknowledgeAutomatically: boolean;
-}): CategoryConfig {
-  const id = uniqueCategoryId(slugify(params.label));
-  const maxOrderRow = db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS maxOrder FROM categories").get() as {
-    maxOrder: number;
-  };
-  insertCategoryRow({
-    id,
-    label: params.label,
-    slaHours: params.slaMinutes / 60,
-    slaMinutes: params.slaMinutes,
-    acknowledgeAutomatically: params.acknowledgeAutomatically ? 1 : 0,
-    sortOrder: maxOrderRow.maxOrder + 1,
-    internalAlertsEnabled: 1,
-    internalAlertsMinUrgency: "normal",
-  });
-
-  writeSteps("pre_reply", "category", id, [{ channel: "internal", delayMinutes: 1440 }]);
-  writeSteps("post_reply", "category", id, [{ channel: "external", delayMinutes: 3 * 1440 }]);
-
-  return toCategoryConfig(
-    db.prepare("SELECT * FROM categories WHERE id = ?").get(id) as unknown as CategoryRow
+}): Promise<CategoryConfig> {
+  const id = await uniqueCategoryId(slugify(params.label));
+  const maxOrderRow = await pool.query<{ maxorder: number }>(
+    "SELECT COALESCE(MAX(sort_order), -1) AS maxOrder FROM categories"
   );
+  await pool.query(
+    `INSERT INTO categories (
+      id, label, sla_minutes, acknowledge_automatically, sort_order,
+      internal_alerts_enabled, internal_alerts_min_urgency
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      id,
+      params.label,
+      params.slaMinutes,
+      params.acknowledgeAutomatically ? 1 : 0,
+      maxOrderRow.rows[0].maxorder + 1,
+      1,
+      "normal",
+    ]
+  );
+
+  await writeSteps("pre_reply", "category", id, [{ channel: "internal", delayMinutes: 1440 }]);
+  await writeSteps("post_reply", "category", id, [{ channel: "external", delayMinutes: 3 * 1440 }]);
+
+  const created = await pool.query<CategoryRow>("SELECT * FROM categories WHERE id = $1", [id]);
+  return toCategoryConfig(created.rows[0]);
 }
 
 // ---------- Sequences de relance (par categorie ou surcharge par dossier) ----------
@@ -959,139 +536,112 @@ interface RelanceStepRow {
   delay_minutes: number;
 }
 
-function readSteps(
-  phase: RelancePhase,
-  ownerType: "category" | "thread",
-  ownerId: string
-): RelanceStep[] {
-  const rows = db
-    .prepare(
-      `SELECT step_order, channel, delay_minutes FROM ${tableFor(phase)} WHERE owner_type = ? AND owner_id = ? ORDER BY step_order ASC`
-    )
-    .all(ownerType, ownerId) as unknown as RelanceStepRow[];
-  return rows.map((r) => ({
+async function readSteps(phase: RelancePhase, ownerType: "category" | "thread", ownerId: string): Promise<RelanceStep[]> {
+  const result = await pool.query<RelanceStepRow>(
+    `SELECT step_order, channel, delay_minutes FROM ${tableFor(phase)} WHERE owner_type = $1 AND owner_id = $2 ORDER BY step_order ASC`,
+    [ownerType, ownerId]
+  );
+  return result.rows.map((r) => ({
     order: r.step_order,
     channel: r.channel as RelanceChannel,
     delayMinutes: r.delay_minutes,
   }));
 }
 
-function writeSteps(
+async function writeSteps(
   phase: RelancePhase,
   ownerType: "category" | "thread",
   ownerId: string,
   steps: Array<{ channel: RelanceChannel; delayMinutes: number }>
-): void {
+): Promise<void> {
   const table = tableFor(phase);
-  db.prepare(`DELETE FROM ${table} WHERE owner_type = ? AND owner_id = ?`).run(ownerType, ownerId);
+  await pool.query(`DELETE FROM ${table} WHERE owner_type = $1 AND owner_id = $2`, [ownerType, ownerId]);
 
-  // `relance_steps` (pre_reply) predates delay_minutes: sur une base creee
-  // avant la bascule heures->minutes, sa colonne delay_hours est restee
-  // NOT NULL (CREATE TABLE IF NOT EXISTS ne modifie jamais une table
-  // existante). Ne jamais fournir delay_hours ici faisait donc echouer tout
-  // ajout/suppression d'etape avec "NOT NULL constraint failed:
-  // relance_steps.delay_hours" sur ces bases-la. On la renseigne toujours
-  // (calculee depuis delayMinutes), ce qui reste compatible avec les bases
-  // recentes ou la colonne est nullable. post_reply_relance_steps n'a jamais
-  // eu cette colonne, donc pas concernee.
-  if (table === "relance_steps") {
-    const insert = db.prepare(
-      `INSERT INTO relance_steps (owner_type, owner_id, step_order, channel, delay_hours, delay_minutes)
-       VALUES (?, ?, ?, ?, ?, ?)`
+  for (let index = 0; index < steps.length; index++) {
+    const step = steps[index];
+    await pool.query(
+      `INSERT INTO ${table} (owner_type, owner_id, step_order, channel, delay_minutes) VALUES ($1, $2, $3, $4, $5)`,
+      [ownerType, ownerId, index + 1, step.channel, step.delayMinutes]
     );
-    steps.forEach((step, index) => {
-      insert.run(ownerType, ownerId, index + 1, step.channel, step.delayMinutes / 60, step.delayMinutes);
-    });
-    return;
   }
-
-  const insert = db.prepare(
-    `INSERT INTO ${table} (owner_type, owner_id, step_order, channel, delay_minutes) VALUES (?, ?, ?, ?, ?)`
-  );
-  steps.forEach((step, index) => {
-    insert.run(ownerType, ownerId, index + 1, step.channel, step.delayMinutes);
-  });
 }
 
-export function getCategoryRelanceSteps(
+export async function getCategoryRelanceSteps(
   categoryId: string,
   phase: RelancePhase = "pre_reply"
-): RelanceStep[] {
+): Promise<RelanceStep[]> {
   return readSteps(phase, "category", categoryId);
 }
 
-export function addCategoryRelanceStep(
+export async function addCategoryRelanceStep(
   categoryId: string,
   step: { channel: RelanceChannel; delayMinutes: number },
   phase: RelancePhase = "pre_reply"
-): void {
-  writeSteps(phase, "category", categoryId, [...readSteps(phase, "category", categoryId), step]);
+): Promise<void> {
+  const existing = await readSteps(phase, "category", categoryId);
+  await writeSteps(phase, "category", categoryId, [...existing, step]);
 }
 
-export function deleteCategoryRelanceStep(
+export async function deleteCategoryRelanceStep(
   categoryId: string,
   order: number,
   phase: RelancePhase = "pre_reply"
-): void {
-  writeSteps(
-    phase,
-    "category",
-    categoryId,
-    readSteps(phase, "category", categoryId).filter((s) => s.order !== order)
+): Promise<void> {
+  const existing = await readSteps(phase, "category", categoryId);
+  await writeSteps(phase, "category", categoryId, existing.filter((s) => s.order !== order));
+}
+
+export async function hasThreadRelanceOverride(threadId: string, phase: RelancePhase = "pre_reply"): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1 FROM ${tableFor(phase)} WHERE owner_type = 'thread' AND owner_id = $1 LIMIT 1`,
+    [threadId]
   );
+  return (result.rowCount ?? 0) > 0;
 }
 
-export function hasThreadRelanceOverride(threadId: string, phase: RelancePhase = "pre_reply"): boolean {
-  const row = db
-    .prepare(`SELECT 1 FROM ${tableFor(phase)} WHERE owner_type = 'thread' AND owner_id = ? LIMIT 1`)
-    .get(threadId);
-  return row !== undefined;
-}
-
-export function getThreadRelanceOverride(
+export async function getThreadRelanceOverride(
   threadId: string,
   phase: RelancePhase = "pre_reply"
-): RelanceStep[] {
+): Promise<RelanceStep[]> {
   return readSteps(phase, "thread", threadId);
 }
 
-export function addThreadRelanceStep(
+export async function addThreadRelanceStep(
   threadId: string,
   step: { channel: RelanceChannel; delayMinutes: number },
   phase: RelancePhase = "pre_reply"
-): void {
-  writeSteps(phase, "thread", threadId, [...readSteps(phase, "thread", threadId), step]);
+): Promise<void> {
+  const existing = await readSteps(phase, "thread", threadId);
+  await writeSteps(phase, "thread", threadId, [...existing, step]);
 }
 
-export function deleteThreadRelanceStep(
+export async function deleteThreadRelanceStep(
   threadId: string,
   order: number,
   phase: RelancePhase = "pre_reply"
-): void {
-  writeSteps(
-    phase,
-    "thread",
-    threadId,
-    readSteps(phase, "thread", threadId).filter((s) => s.order !== order)
-  );
+): Promise<void> {
+  const existing = await readSteps(phase, "thread", threadId);
+  await writeSteps(phase, "thread", threadId, existing.filter((s) => s.order !== order));
 }
 
-export function clearThreadRelanceOverride(threadId: string, phase: RelancePhase = "pre_reply"): void {
-  db.prepare(`DELETE FROM ${tableFor(phase)} WHERE owner_type = 'thread' AND owner_id = ?`).run(threadId);
+export async function clearThreadRelanceOverride(threadId: string, phase: RelancePhase = "pre_reply"): Promise<void> {
+  await pool.query(`DELETE FROM ${tableFor(phase)} WHERE owner_type = 'thread' AND owner_id = $1`, [threadId]);
 }
 
 function snapshotColumnFor(phase: RelancePhase): "pre_reply_relance_snapshot" | "post_reply_relance_snapshot" {
   return phase === "post_reply" ? "post_reply_relance_snapshot" : "pre_reply_relance_snapshot";
 }
 
-function readRelanceStepsSnapshot(threadId: string, phase: RelancePhase): RelanceStep[] | null {
+async function readRelanceStepsSnapshot(threadId: string, phase: RelancePhase): Promise<RelanceStep[] | null> {
   const column = snapshotColumnFor(phase);
-  const row = db.prepare(`SELECT ${column} AS snapshot FROM threads WHERE thread_id = ?`).get(threadId) as
-    | { snapshot: string | null }
-    | undefined;
-  if (!row?.snapshot) return null;
+  const result = await pool.query<{ snapshot: string | null }>(
+    `SELECT ${column} AS snapshot FROM threads WHERE thread_id = $1`,
+    [threadId]
+  );
+  const snapshot = result.rows[0]?.snapshot;
+  if (!snapshot) return null;
   try {
-    return JSON.parse(row.snapshot) as RelanceStep[];
+    return JSON.parse(snapshot) as RelanceStep[];
   } catch {
     return null;
   }
@@ -1110,30 +660,36 @@ function readRelanceStepsSnapshot(threadId: string, phase: RelancePhase): Relanc
  * Idempotent (n'ecrase jamais un gel deja pris) et sans effet si le dossier
  * a deja une sequence personnalisee (owner_type='thread').
  */
-export function freezeRelanceStepsSnapshot(threadId: string, categoryId: string, phase: RelancePhase): void {
-  if (hasThreadRelanceOverride(threadId, phase)) return;
+export async function freezeRelanceStepsSnapshot(
+  threadId: string,
+  categoryId: string,
+  phase: RelancePhase
+): Promise<void> {
+  if (await hasThreadRelanceOverride(threadId, phase)) return;
   const column = snapshotColumnFor(phase);
-  const row = db.prepare(`SELECT ${column} AS snapshot FROM threads WHERE thread_id = ?`).get(threadId) as
-    | { snapshot: string | null }
-    | undefined;
+  const result = await pool.query<{ snapshot: string | null }>(
+    `SELECT ${column} AS snapshot FROM threads WHERE thread_id = $1`,
+    [threadId]
+  );
+  const row = result.rows[0];
   if (!row || row.snapshot !== null) return;
 
-  const steps = readSteps(phase, "category", categoryId);
-  db.prepare(`UPDATE threads SET ${column} = ? WHERE thread_id = ?`).run(JSON.stringify(steps), threadId);
+  const steps = await readSteps(phase, "category", categoryId);
+  await pool.query(`UPDATE threads SET ${column} = $1 WHERE thread_id = $2`, [JSON.stringify(steps), threadId]);
 }
 
-export function getEffectiveRelanceSteps(
+export async function getEffectiveRelanceSteps(
   threadId: string,
   categoryId: string,
   phase: RelancePhase = "pre_reply"
-): { steps: RelanceStep[]; isCustom: boolean } {
-  const overrideSteps = readSteps(phase, "thread", threadId);
+): Promise<{ steps: RelanceStep[]; isCustom: boolean }> {
+  const overrideSteps = await readSteps(phase, "thread", threadId);
   if (overrideSteps.length > 0) return { steps: overrideSteps, isCustom: true };
 
-  const snapshot = readRelanceStepsSnapshot(threadId, phase);
+  const snapshot = await readRelanceStepsSnapshot(threadId, phase);
   if (snapshot) return { steps: snapshot, isCustom: false };
 
-  return { steps: readSteps(phase, "category", categoryId), isCustom: false };
+  return { steps: await readSteps(phase, "category", categoryId), isCustom: false };
 }
 
 export interface ReminderRow {
@@ -1146,16 +702,16 @@ export interface ReminderRow {
   sender_email: string;
 }
 
-export function listReminders(limit = 150): ReminderRow[] {
-  return db
-    .prepare(
-      `SELECT r.id, r.thread_id, r.kind, r.note, r.created_at, t.subject, t.sender_email
-       FROM reminders r
-       JOIN threads t ON t.thread_id = r.thread_id
-       ORDER BY r.created_at DESC
-       LIMIT ?`
-    )
-    .all(limit) as unknown as ReminderRow[];
+export async function listReminders(limit = 150): Promise<ReminderRow[]> {
+  const result = await pool.query<ReminderRow>(
+    `SELECT r.id, r.thread_id, r.kind, r.note, r.created_at, t.subject, t.sender_email
+     FROM reminders r
+     JOIN threads t ON t.thread_id = r.thread_id
+     ORDER BY r.created_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows;
 }
 
 // ---------- Erreurs du pipeline (visibles depuis le Journal) ----------
@@ -1168,16 +724,20 @@ export interface PipelineErrorRow {
   created_at: string;
 }
 
-export function recordPipelineError(context: string, threadId: string | null, message: string): void {
-  db.prepare(
-    "INSERT INTO pipeline_errors (context, thread_id, message, created_at) VALUES (?, ?, ?, ?)"
-  ).run(context, threadId, message, new Date().toISOString());
+export async function recordPipelineError(context: string, threadId: string | null, message: string): Promise<void> {
+  await pool.query("INSERT INTO pipeline_errors (context, thread_id, message, created_at) VALUES ($1, $2, $3, $4)", [
+    context,
+    threadId,
+    message,
+    new Date().toISOString(),
+  ]);
 }
 
-export function listPipelineErrors(limit = 100): PipelineErrorRow[] {
-  return db
-    .prepare("SELECT * FROM pipeline_errors ORDER BY created_at DESC LIMIT ?")
-    .all(limit) as unknown as PipelineErrorRow[];
+export async function listPipelineErrors(limit = 100): Promise<PipelineErrorRow[]> {
+  const result = await pool.query<PipelineErrorRow>("SELECT * FROM pipeline_errors ORDER BY created_at DESC LIMIT $1", [
+    limit,
+  ]);
+  return result.rows;
 }
 
 // ---------- Consommation IA (tokens Claude, pour le compteur /consommation) ----------
@@ -1192,30 +752,25 @@ export interface AiUsageEventRow {
   created_at: string;
 }
 
-export function recordAiUsage(params: {
+export async function recordAiUsage(params: {
   callType: string;
   threadId: string | null;
   model: string;
   inputTokens: number;
   outputTokens: number;
-}): void {
-  db.prepare(
+}): Promise<void> {
+  await pool.query(
     `INSERT INTO ai_usage_events (call_type, thread_id, model, input_tokens, output_tokens, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(
-    params.callType,
-    params.threadId,
-    params.model,
-    params.inputTokens,
-    params.outputTokens,
-    new Date().toISOString()
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [params.callType, params.threadId, params.model, params.inputTokens, params.outputTokens, new Date().toISOString()]
   );
 }
 
-export function listRecentAiUsage(limit = 50): AiUsageEventRow[] {
-  return db
-    .prepare("SELECT * FROM ai_usage_events ORDER BY created_at DESC LIMIT ?")
-    .all(limit) as unknown as AiUsageEventRow[];
+export async function listRecentAiUsage(limit = 50): Promise<AiUsageEventRow[]> {
+  const result = await pool.query<AiUsageEventRow>("SELECT * FROM ai_usage_events ORDER BY created_at DESC LIMIT $1", [
+    limit,
+  ]);
+  return result.rows;
 }
 
 export interface AiUsageTotals {
@@ -1231,23 +786,38 @@ export interface AiUsageSummary {
 }
 
 /** Agrege la consommation depuis `sinceIso` (ex: debut du mois courant) — total et repartition par type d'appel. */
-export function getAiUsageSummarySince(sinceIso: string): AiUsageSummary {
-  const total = db
-    .prepare(
-      `SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens
-       FROM ai_usage_events WHERE created_at >= ?`
-    )
-    .get(sinceIso) as unknown as AiUsageTotals;
+export async function getAiUsageSummarySince(sinceIso: string): Promise<AiUsageSummary> {
+  const totalResult = await pool.query<{ calls: string; inputtokens: string; outputtokens: string }>(
+    `SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens
+     FROM ai_usage_events WHERE created_at >= $1`,
+    [sinceIso]
+  );
+  const totalRow = totalResult.rows[0];
+  const total: AiUsageTotals = {
+    calls: Number(totalRow.calls),
+    inputTokens: Number(totalRow.inputtokens),
+    outputTokens: Number(totalRow.outputtokens),
+  };
 
-  const byCallType = db
-    .prepare(
-      `SELECT call_type AS callType, COUNT(*) AS calls,
-              COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens
-       FROM ai_usage_events WHERE created_at >= ?
-       GROUP BY call_type
-       ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC`
-    )
-    .all(sinceIso) as unknown as Array<{ callType: string } & AiUsageTotals>;
+  const byCallTypeResult = await pool.query<{
+    calltype: string;
+    calls: string;
+    inputtokens: string;
+    outputtokens: string;
+  }>(
+    `SELECT call_type AS callType, COUNT(*) AS calls,
+            COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens
+     FROM ai_usage_events WHERE created_at >= $1
+     GROUP BY call_type
+     ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC`,
+    [sinceIso]
+  );
+  const byCallType = byCallTypeResult.rows.map((r) => ({
+    callType: r.calltype,
+    calls: Number(r.calls),
+    inputTokens: Number(r.inputtokens),
+    outputTokens: Number(r.outputtokens),
+  }));
 
   return { since: sinceIso, total, byCallType };
 }
@@ -1263,10 +833,10 @@ export function getAiUsageSummarySince(sinceIso: string): AiUsageSummary {
  * automated_outbound_count pour l'historique des deux approches qui ont
  * echoue avant celle-ci).
  */
-export function incrementAutomatedOutboundCount(threadId: string): void {
-  db.prepare(
-    "UPDATE threads SET automated_outbound_count = automated_outbound_count + 1 WHERE thread_id = ?"
-  ).run(threadId);
+export async function incrementAutomatedOutboundCount(threadId: string): Promise<void> {
+  await pool.query("UPDATE threads SET automated_outbound_count = automated_outbound_count + 1 WHERE thread_id = $1", [
+    threadId,
+  ]);
 }
 
 // ==================== Invitations de connexion ====================
@@ -1281,45 +851,48 @@ export interface ConnectInviteRow {
 }
 
 /** 256 bits — meme precedent que les tokens de session (auth.ts), hors de portee d'un brute-force. */
-export function createConnectInvite(expiresInDays: number): { token: string; expiresAt: string } {
+export async function createConnectInvite(expiresInDays: number): Promise<{ token: string; expiresAt: string }> {
   const token = randomBytes(32).toString("hex");
   const now = new Date();
   const expiresAt = new Date(now.getTime() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(
-    "INSERT INTO connect_invites (token, created_at, expires_at) VALUES (?, ?, ?)"
-  ).run(token, now.toISOString(), expiresAt);
+  await pool.query("INSERT INTO connect_invites (token, created_at, expires_at) VALUES ($1, $2, $3)", [
+    token,
+    now.toISOString(),
+    expiresAt,
+  ]);
   return { token, expiresAt };
 }
 
 /** Usage unique: un token deja consomme (used_at) ou revoque (revoked_at) n'est plus valide, meme avant expiration. */
-export function getValidConnectInvite(token: string): ConnectInviteRow | undefined {
-  return db
-    .prepare(
-      `SELECT * FROM connect_invites
-       WHERE token = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`
-    )
-    .get(token, new Date().toISOString()) as ConnectInviteRow | undefined;
+export async function getValidConnectInvite(token: string): Promise<ConnectInviteRow | undefined> {
+  const result = await pool.query<ConnectInviteRow>(
+    `SELECT * FROM connect_invites
+     WHERE token = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > $2`,
+    [token, new Date().toISOString()]
+  );
+  return result.rows[0];
 }
 
-export function consumeConnectInvite(token: string, provider: "gmail" | "graph"): void {
-  db.prepare("UPDATE connect_invites SET used_at = ?, used_provider = ? WHERE token = ?").run(
+export async function consumeConnectInvite(token: string, provider: "gmail" | "graph"): Promise<void> {
+  await pool.query("UPDATE connect_invites SET used_at = $1, used_provider = $2 WHERE token = $3", [
     new Date().toISOString(),
     provider,
-    token
-  );
+    token,
+  ]);
 }
 
-export function revokeConnectInvite(token: string): void {
-  db.prepare("UPDATE connect_invites SET revoked_at = ? WHERE token = ?").run(new Date().toISOString(), token);
+export async function revokeConnectInvite(token: string): Promise<void> {
+  await pool.query("UPDATE connect_invites SET revoked_at = $1 WHERE token = $2", [new Date().toISOString(), token]);
 }
 
-export function listConnectInvites(limit = 50): ConnectInviteRow[] {
-  return db
-    .prepare("SELECT * FROM connect_invites ORDER BY created_at DESC LIMIT ?")
-    .all(limit) as unknown as ConnectInviteRow[];
+export async function listConnectInvites(limit = 50): Promise<ConnectInviteRow[]> {
+  const result = await pool.query<ConnectInviteRow>("SELECT * FROM connect_invites ORDER BY created_at DESC LIMIT $1", [
+    limit,
+  ]);
+  return result.rows;
 }
 
-// ==================== Mode carnet (semaine pilote) ====================
+// ==================== Mode carnet / test (shadow mode) ====================
 
 export interface CarnetEntry {
   id: number;
@@ -1355,7 +928,7 @@ interface CarnetEntryRow {
   ack_body: string;
   reviewed_ok: number;
   created_at: string;
-  rappel_envoye: number;
+  rappel_envoye: boolean;
   received_at: string | null;
   human_replied_at: string | null;
 }
@@ -1383,7 +956,7 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
     ackBody: row.ack_body,
     reviewedOk: row.reviewed_ok === 1,
     createdAt: row.created_at,
-    rappelEnvoye: row.rappel_envoye === 1,
+    rappelEnvoye: row.rappel_envoye === true,
     humanReplyDelayMinutes,
   };
 }
@@ -1395,7 +968,7 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
  * rendant impossible de juger si l'IA l'a bien classifie. L'accuse, s'il y
  * en a un, est ajoute ensuite via recordAckDraft (ack_drafted passe a 1).
  */
-export function recordClassification(params: {
+export async function recordClassification(params: {
   threadId: string;
   messageId: string;
   categoryId: string;
@@ -1404,33 +977,34 @@ export function recordClassification(params: {
   senderEmail: string;
   senderName: string | null;
   receivedBody: string;
-}): void {
-  db.prepare(
+}): Promise<void> {
+  await pool.query(
     `INSERT INTO shadow_log (
       thread_id, message_id, category_id, urgency, original_subject, sender_email, sender_name,
       received_body, ack_subject, ack_body, ack_drafted, reviewed_ok, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0, 0, ?)`
-  ).run(
-    params.threadId,
-    params.messageId,
-    params.categoryId,
-    params.urgency,
-    params.originalSubject,
-    params.senderEmail,
-    params.senderName,
-    params.receivedBody,
-    new Date().toISOString()
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', '', 0, 0, $9)`,
+    [
+      params.threadId,
+      params.messageId,
+      params.categoryId,
+      params.urgency,
+      params.originalSubject,
+      params.senderEmail,
+      params.senderName,
+      params.receivedBody,
+      new Date().toISOString(),
+    ]
   );
 }
 
 /**
  * Complete la ligne de classification (voir recordClassification) une fois
- * l'accuse redige, en mode carnet. Si aucune ligne prealable n'existe (ex:
- * retraitement manuel via POST /dossiers/:threadId/traiter, qui ne repasse
- * pas par classifyEmail), insere une ligne directement plutot que de perdre
- * cet accuse.
+ * l'accuse redige, en mode carnet/test. Si aucune ligne prealable n'existe
+ * (ex: retraitement manuel via POST /dossiers/:threadId/traiter, qui ne
+ * repasse pas par classifyEmail), insere une ligne directement plutot que de
+ * perdre cet accuse.
  */
-export function recordAckDraft(params: {
+export async function recordAckDraft(params: {
   threadId: string;
   messageId: string;
   categoryId: string;
@@ -1440,53 +1014,55 @@ export function recordAckDraft(params: {
   receivedBody: string;
   ackSubject: string;
   ackBody: string;
-}): void {
-  const result = db
-    .prepare("UPDATE shadow_log SET ack_subject = ?, ack_body = ?, ack_drafted = 1 WHERE message_id = ?")
-    .run(params.ackSubject, params.ackBody, params.messageId);
-  if (Number(result.changes) === 0) {
-    db.prepare(
+}): Promise<void> {
+  const result = await pool.query(
+    "UPDATE shadow_log SET ack_subject = $1, ack_body = $2, ack_drafted = 1 WHERE message_id = $3",
+    [params.ackSubject, params.ackBody, params.messageId]
+  );
+  if (!result.rowCount) {
+    await pool.query(
       `INSERT INTO shadow_log (
         thread_id, message_id, category_id, urgency, original_subject, sender_email, sender_name,
         received_body, ack_subject, ack_body, ack_drafted, reviewed_ok, created_at
-      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, 0, ?)`
-    ).run(
-      params.threadId,
-      params.messageId,
-      params.categoryId,
-      params.originalSubject,
-      params.senderEmail,
-      params.senderName,
-      params.receivedBody,
-      params.ackSubject,
-      params.ackBody,
-      new Date().toISOString()
+      ) VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, 1, 0, $10)`,
+      [
+        params.threadId,
+        params.messageId,
+        params.categoryId,
+        params.originalSubject,
+        params.senderEmail,
+        params.senderName,
+        params.receivedBody,
+        params.ackSubject,
+        params.ackBody,
+        new Date().toISOString(),
+      ]
     );
   }
 }
 
-export function listShadowLogEntries(limit = 500): CarnetEntry[] {
-  const rows = db
-    .prepare(
-      `SELECT
-        s.id, s.thread_id, s.category_id, c.label AS category_label, s.urgency, s.original_subject,
-        s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body,
-        s.reviewed_ok, s.created_at, t.received_at, t.human_replied_at,
-        EXISTS(
-          SELECT 1 FROM reminders r WHERE r.thread_id = s.thread_id AND r.step_type = 'relance_interne'
-        ) AS rappel_envoye
-       FROM shadow_log s
-       LEFT JOIN categories c ON c.id = s.category_id
-       LEFT JOIN threads t ON t.thread_id = s.thread_id
-       ORDER BY s.created_at DESC
-       LIMIT ?`
-    )
-    .all(limit) as unknown as CarnetEntryRow[];
-  return rows.map(toCarnetEntry);
+export async function listShadowLogEntries(limit = 500): Promise<CarnetEntry[]> {
+  const result = await pool.query<CarnetEntryRow>(
+    `SELECT
+      s.id, s.thread_id, s.category_id, c.label AS category_label, s.urgency, s.original_subject,
+      s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body,
+      s.reviewed_ok, s.created_at, t.received_at, t.human_replied_at,
+      (rr.thread_id IS NOT NULL) AS rappel_envoye
+     FROM shadow_log s
+     LEFT JOIN categories c ON c.id = s.category_id
+     LEFT JOIN threads t ON t.thread_id = s.thread_id
+     LEFT JOIN (
+       SELECT DISTINCT thread_id FROM reminders WHERE step_type = 'relance_interne'
+     ) rr ON rr.thread_id = s.thread_id
+     ORDER BY s.created_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows.map(toCarnetEntry);
 }
 
-export function setShadowLogReviewed(id: number, reviewed: boolean): void {
-  db.prepare("UPDATE shadow_log SET reviewed_ok = ? WHERE id = ?").run(reviewed ? 1 : 0, id);
+export async function setShadowLogReviewed(id: number, reviewed: boolean): Promise<void> {
+  await pool.query("UPDATE shadow_log SET reviewed_ok = $1 WHERE id = $2", [reviewed ? 1 : 0, id]);
 }
 
 /**
@@ -1497,30 +1073,70 @@ export function setShadowLogReviewed(id: number, reviewed: boolean): void {
  * integral des emails (factures, RIB...) — ne pas les garder indefiniment.
  * Retourne le nombre de lignes supprimees (journalisation uniquement).
  */
-export function purgeShadowLogOlderThan(days: number): number {
+export async function purgeShadowLogOlderThan(days: number): Promise<number> {
   const cutoffIso = new Date(Date.now() - days * 86_400_000).toISOString();
-  const result = db.prepare("DELETE FROM shadow_log WHERE created_at < ?").run(cutoffIso);
-  return Number(result.changes);
+  const result = await pool.query("DELETE FROM shadow_log WHERE created_at < $1", [cutoffIso]);
+  return result.rowCount ?? 0;
 }
 
-export function recordHumanReplyCorpus(params: { threadId: string; categoryId: string; replyBody: string }): void {
-  db.prepare(
-    "INSERT INTO human_reply_corpus (thread_id, category_id, reply_body, created_at) VALUES (?, ?, ?, ?)"
-  ).run(params.threadId, params.categoryId, params.replyBody, new Date().toISOString());
+export async function recordHumanReplyCorpus(params: {
+  threadId: string;
+  categoryId: string;
+  replyBody: string;
+}): Promise<void> {
+  await pool.query(
+    "INSERT INTO human_reply_corpus (thread_id, category_id, reply_body, created_at) VALUES ($1, $2, $3, $4)",
+    [params.threadId, params.categoryId, params.replyBody, new Date().toISOString()]
+  );
 }
 
-export function listCategoriesWithCorpus(): string[] {
-  const rows = db.prepare("SELECT DISTINCT category_id FROM human_reply_corpus").all() as unknown as {
-    category_id: string;
-  }[];
-  return rows.map((r) => r.category_id);
+export async function listCategoriesWithCorpus(): Promise<string[]> {
+  const result = await pool.query<{ category_id: string }>("SELECT DISTINCT category_id FROM human_reply_corpus");
+  return result.rows.map((r) => r.category_id);
 }
 
-export function listHumanReplyCorpusByCategory(categoryId: string): string[] {
-  const rows = db
-    .prepare("SELECT reply_body FROM human_reply_corpus WHERE category_id = ? ORDER BY created_at ASC")
-    .all(categoryId) as unknown as { reply_body: string }[];
-  return rows.map((r) => r.reply_body);
+export async function listHumanReplyCorpusByCategory(categoryId: string): Promise<string[]> {
+  const result = await pool.query<{ reply_body: string }>(
+    "SELECT reply_body FROM human_reply_corpus WHERE category_id = $1 ORDER BY created_at ASC",
+    [categoryId]
+  );
+  return result.rows.map((r) => r.reply_body);
 }
 
-export default db;
+// ==================== Ton de marque & notes de style (Phase 1: en base) ====================
+
+/** Ton de marque courant — remplace loadBrandVoice() (fichier disque) de l'ancienne version SQLite. */
+export async function getBrandVoice(): Promise<string> {
+  const result = await pool.query<{ content: string }>("SELECT content FROM brand_voice WHERE id = 1");
+  return result.rows[0]?.content ?? "";
+}
+
+/** Ecrit le ton de marque depuis la page /ton-de-marque — evite d'avoir a editer un fichier ou redeployer pour ajuster le style des emails generes. */
+export async function setBrandVoice(content: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO brand_voice (id, content, updated_at) VALUES (1, $1, $2)
+     ON CONFLICT (id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
+    [content, new Date().toISOString()]
+  );
+}
+
+/**
+ * Note de style pour une categorie — remplace loadCategoryPlaybook()
+ * (fichier disque) de l'ancienne version SQLite. Chaine vide tant qu'aucune
+ * analyse de corpus n'a encore tourne pour cette categorie: absence de ligne
+ * n'est pas une erreur, juste "pas encore de note de style".
+ */
+export async function getCategoryPlaybook(categoryId: string): Promise<string> {
+  const result = await pool.query<{ content: string }>("SELECT content FROM category_playbooks WHERE category_id = $1", [
+    categoryId,
+  ]);
+  return result.rows[0]?.content ?? "";
+}
+
+export async function setCategoryPlaybook(categoryId: string, content: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO category_playbooks (category_id, content, updated_at) VALUES ($1, $2, $3)
+     ON CONFLICT (category_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
+    [categoryId, content, new Date().toISOString()]
+  );
+}

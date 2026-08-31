@@ -1,24 +1,28 @@
-import { saveCategoryPlaybook } from "../config.js";
 import { getCategory } from "../settings.js";
 import { analyzeCategoryCorpus } from "../ai/analyzeCorpus.js";
-import { listCategoriesWithCorpus, listHumanReplyCorpusByCategory, recordPipelineError } from "../db.js";
+import {
+  listCategoriesWithCorpus,
+  listHumanReplyCorpusByCategory,
+  recordPipelineError,
+  setCategoryPlaybook,
+} from "../db.js";
 
 /**
  * Relit le corpus des vraies reponses de l'equipe (voir relanceCheck.ts,
  * recordHumanReplyCorpus) categorie par categorie, et regenere la note de
- * style de chacune (config/category-playbooks/<id>.md) — relue ensuite par
+ * style de chacune (table category_playbooks) — relue ensuite par
  * draftAcknowledgement.ts. Une categorie sans corpus est simplement ignoree
  * ce cycle-ci (pas encore de vraie reponse a apprendre).
  */
 export async function runCorpusAnalysis(): Promise<void> {
-  for (const categoryId of listCategoriesWithCorpus()) {
-    const replies = listHumanReplyCorpusByCategory(categoryId);
+  for (const categoryId of await listCategoriesWithCorpus()) {
+    const replies = await listHumanReplyCorpusByCategory(categoryId);
     if (replies.length === 0) continue;
 
     try {
-      const category = getCategory(categoryId);
+      const category = await getCategory(categoryId);
       const analysis = await analyzeCategoryCorpus(category.label, replies);
-      saveCategoryPlaybook(
+      await setCategoryPlaybook(
         categoryId,
         [
           `# Style observe — ${category.label}`,
@@ -39,7 +43,7 @@ export async function runCorpusAnalysis(): Promise<void> {
       console.log(`[analyse corpus] note de style mise a jour pour "${category.label}" (${replies.length} exemples).`);
     } catch (err) {
       console.error(`[analyse corpus] erreur categorie ${categoryId}:`, err);
-      recordPipelineError("corpus_analysis", null, (err as Error).message);
+      await recordPipelineError("corpus_analysis", null, (err as Error).message);
     }
   }
 }

@@ -2,7 +2,7 @@ import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { recordUsage, withRetry } from "./structured.js";
-import { loadBrandVoice } from "../config.js";
+import { getBrandVoice } from "../db.js";
 import { formatSingleMessage, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
 
@@ -45,7 +45,7 @@ async function draftRelanceOnce(
   hadAttachment: boolean
 ): Promise<RelanceDraft> {
   const client = getClient();
-  const brandVoice = loadBrandVoice();
+  const brandVoice = await getBrandVoice();
 
   const tool: Anthropic.Tool = {
     name: "write_relance",

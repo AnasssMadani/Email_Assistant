@@ -1,27 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { freshTestDb } from "./_pgTestDb.js";
 import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
 
-// Isolated DB (its own file, its own dynamic import), rather than sharing
-// relanceCheck.test.ts's file-scoped DB — this test asserts exact send
-// counts across many dossiers in one runRelanceCheck() call, which would be
-// fragile if it had to reason about leftover state from unrelated tests.
-const dir = mkdtempSync(path.join(tmpdir(), "accuse-relance-budget-test-"));
-process.env.DB_PATH = path.join(dir, "budget.db");
-process.env.CATEGORIES_CONFIG_PATH = path.resolve("config/categories.json");
+// Isolated DB (its own pg-mem instance, its own dynamic import), rather than
+// sharing relanceCheck.test.ts's file-scoped DB — this test asserts exact
+// send counts across many dossiers in one runRelanceCheck() call, which
+// would be fragile if it had to reason about leftover state from unrelated
+// tests.
 // Ce test verifie de vrais envois (budget de relances externes) — force a
 // "false" explicitement, sans quoi un .env local avec SHADOW_MODE=true (mode
 // carnet, voir config.ts) serait charge par dotenv/config et ferait passer
 // tous les sendReply attendus a 0.
 process.env.SHADOW_MODE = "false";
 
+const { addThreadRelanceStep, getThreadRow, listPipelineErrors, setThreadAckSent, upsertThreadReceived } =
+  await freshTestDb();
 const { runRelanceCheck } = await import("../src/pipeline/relanceCheck.js");
 const { config } = await import("../src/config.js");
-const { addThreadRelanceStep, getThreadRow, listPipelineErrors, setThreadAckSent, upsertThreadReceived } =
-  await import("../src/db.js");
 
 function fakeMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
   return {
@@ -57,7 +53,7 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
     threadIds.push(threadId);
     const dueAt = new Date(Date.now() - 60_000).toISOString();
 
-    upsertThreadReceived({
+    await upsertThreadReceived({
       threadId,
       subject: `Devis ${i}`,
       senderEmail: `client${i}@example.com`,
@@ -68,9 +64,9 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
       status: "ack_sent",
       dueAt,
     });
-    setThreadAckSent(threadId);
+    await setThreadAckSent(threadId);
     // Une seule etape externe, deja due (delai 0 depuis l'echeance passee).
-    addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
+    await addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
 
     threadsById.set(threadId, {
       id: threadId,
@@ -117,10 +113,11 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
   // nothing and its relance_count stays untouched.
   assert.equal(sendReplyCalls, 0);
 
-  const attempted = listPipelineErrors(100).filter((e) => e.context === "relance_check");
+  const attempted = (await listPipelineErrors(100)).filter((e) => e.context === "relance_check");
   assert.equal(attempted.length, config.maxExternalRelancesPerCycle);
 
-  const untouchedCount = threadIds.filter((id) => getThreadRow(id)?.relance_count === 0).length;
+  const relanceCounts = await Promise.all(threadIds.map((id) => getThreadRow(id)));
+  const untouchedCount = relanceCounts.filter((row) => row?.relance_count === 0).length;
   assert.equal(untouchedCount, dossierCount);
 });
 
@@ -132,7 +129,7 @@ test("runRelanceCheck skips a dossier whose thread id doesn't match the currentl
   // relance-check cycle forever since nothing skipped the mismatched row.
   const threadId = "19faaaaaaaaaaaaa"; // Gmail-shaped (16 hex chars)
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Ancien dossier Gmail",
     senderEmail: "client@example.com",
@@ -143,8 +140,8 @@ test("runRelanceCheck skips a dossier whose thread id doesn't match the currentl
     status: "ack_sent",
     dueAt: new Date(Date.now() - 60_000).toISOString(),
   });
-  setThreadAckSent(threadId);
-  addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
+  await setThreadAckSent(threadId);
+  await addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
 
   let getThreadCalls = 0;
   const graphConnector: EmailConnector = {
@@ -174,7 +171,7 @@ test("runRelanceCheck skips a dossier whose thread id doesn't match the currentl
   await runRelanceCheck(graphConnector);
 
   assert.equal(getThreadCalls, 0);
-  const errorsForThread = listPipelineErrors(100).filter((e) => e.thread_id === threadId);
+  const errorsForThread = (await listPipelineErrors(100)).filter((e) => e.thread_id === threadId);
   assert.equal(errorsForThread.length, 0);
-  assert.equal(getThreadRow(threadId)?.relance_count, 0);
+  assert.equal((await getThreadRow(threadId))?.relance_count, 0);
 });

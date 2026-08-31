@@ -1,8 +1,8 @@
 import { listCategories } from "./db.js";
 import type { CategoryConfig } from "./types.js";
 
-export function getCategory(categoryId: string): CategoryConfig {
-  const categories = listCategories();
+export async function getCategory(categoryId: string): Promise<CategoryConfig> {
+  const categories = await listCategories();
   const found = categories.find((c) => c.id === categoryId);
   if (found) return found;
   const fallback = categories.find((c) => c.id === "autre");

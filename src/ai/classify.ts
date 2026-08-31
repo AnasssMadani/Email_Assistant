@@ -25,7 +25,7 @@ async function classifyEmailOnce(
   incoming: EmailMessage
 ): Promise<ClassificationResult> {
   const client = getClient();
-  const categories = listCategories();
+  const categories = await listCategories();
   const categoryList = categories.map((c) => `- ${c.id}: ${c.label}`).join("\n");
 
   const tool: Anthropic.Tool = {

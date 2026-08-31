@@ -1,8 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { freshTestDb } from "./_pgTestDb.js";
 import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
 
 // Regression: mode carnet ("rien ne part jamais vers le client") must cover
@@ -10,19 +8,16 @@ import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, Sen
 // "relance post-réponse" emails to real client addresses because only the
 // accusé path was guarded by shadowModeEnabled, not checkPreReplyThread/
 // checkPostReplyThread's external branches.
-const dir = mkdtempSync(path.join(tmpdir(), "shadow-mode-relance-test-"));
-process.env.DB_PATH = path.join(dir, "shadow-relance.db");
-process.env.CATEGORIES_CONFIG_PATH = path.resolve("config/categories.json");
 process.env.SHADOW_MODE = "true";
 
-const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
 const {
   addThreadRelanceStep,
   getThreadRow,
   setThreadAckSent,
   setThreadHumanReplied,
   upsertThreadReceived,
-} = await import("../src/db.js");
+} = await freshTestDb();
+const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
 
 function fakeMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
   return {
@@ -69,7 +64,7 @@ test("checkPreReplyThread never sends a real external relance when shadowModeEna
   const threadId = "t-shadow-pre-reply-external";
   let sendReplyCalls = 0;
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -80,17 +75,17 @@ test("checkPreReplyThread never sends a real external relance when shadowModeEna
     status: "ack_sent",
     dueAt: new Date(Date.now() - 60_000).toISOString(),
   });
-  setThreadAckSent(threadId);
-  addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
+  await setThreadAckSent(threadId);
+  await addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
 
   const clientMessage = fakeMessage({ id: "m-client", threadId, isFromUs: false });
   const connector = fakeConnector({ id: threadId, messages: [clientMessage] }, () => sendReplyCalls++);
 
-  const row = getThreadRow(threadId)!;
+  const row = (await getThreadRow(threadId))!;
   await checkPreReplyThread(connector, row, { order: 1, channel: "external", delayMinutes: 0 });
 
   assert.equal(sendReplyCalls, 0);
-  const after = getThreadRow(threadId);
+  const after = await getThreadRow(threadId);
   assert.equal(after?.relance_count, 1); // sequence advanced despite no real send
 });
 
@@ -98,7 +93,7 @@ test("checkPostReplyThread never sends a real external relance when shadowModeEn
   const threadId = "t-shadow-post-reply-external";
   let sendReplyCalls = 0;
 
-  upsertThreadReceived({
+  await upsertThreadReceived({
     threadId,
     subject: "Devis",
     senderEmail: "client@example.com",
@@ -109,15 +104,15 @@ test("checkPostReplyThread never sends a real external relance when shadowModeEn
     status: "ack_sent",
     dueAt: new Date(Date.now() - 60_000).toISOString(),
   });
-  setThreadHumanReplied(threadId, new Date(Date.now() - 30_000).toISOString());
+  await setThreadHumanReplied(threadId, new Date(Date.now() - 30_000).toISOString());
 
   const ourReply = fakeMessage({ id: "m-our-reply", threadId, isFromUs: true, receivedAt: new Date(Date.now() - 20_000) });
   const connector = fakeConnector({ id: threadId, messages: [ourReply] }, () => sendReplyCalls++);
 
-  const row = getThreadRow(threadId)!;
+  const row = (await getThreadRow(threadId))!;
   await checkPostReplyThread(connector, row, { order: 1, channel: "external", delayMinutes: 0 });
 
   assert.equal(sendReplyCalls, 0);
-  const after = getThreadRow(threadId);
+  const after = await getThreadRow(threadId);
   assert.equal(after?.post_reply_relance_count, 1); // sequence advanced despite no real send
 });
