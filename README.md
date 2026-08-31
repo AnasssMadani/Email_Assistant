@@ -1,9 +1,9 @@
 # Accusé de réception & relance automatisés
 
-Pipeline sur-mesure qui lit chaque email entrant, envoie un accusé de
-réception contextualisé automatiquement, prépare trois brouillons de
-réponse dans la messagerie (validation humaine avant envoi), et relance
-les dossiers restés sans réponse.
+Pipeline sur-mesure qui lit chaque email entrant, le classe par IA, envoie
+un accusé de réception contextualisé automatiquement, puis relance les
+dossiers restés sans réponse — que ce soit l'équipe qui n'a pas encore
+répondu, ou le client resté silencieux après notre réponse.
 
 Deux connecteurs sont implémentés et interchangeables sans toucher au
 reste du code: **Gmail** (compte de test) et **Outlook / Microsoft 365**
@@ -20,10 +20,10 @@ lui-même l'un ou l'autre depuis une page web — voir
 3. Si la catégorie l'exige, envoie automatiquement un accusé de réception
    personnalisé (`src/ai/draftAcknowledgement.ts`), rédigé selon le ton
    défini dans [`config/brand-voice.md`](config/brand-voice.md).
-4. Génère trois brouillons de réponse distincts (`src/ai/draftReplies.ts`)
-   et les dépose en brouillon dans la messagerie — **aucun envoi automatique
-   de réponse**, un humain choisit et envoie.
-5. Toutes les 30 minutes, vérifie chaque dossier ouvert contre sa
+4. Un humain répond de fond au client (ex: envoi d'un devis) — **le pipeline
+   ne rédige et n'envoie jamais cette réponse à sa place**, uniquement
+   l'accusé et les relances.
+5. Toutes les 2 minutes, vérifie chaque dossier ouvert contre sa
    **séquence de relance** (`src/pipeline/relanceCheck.ts`): une suite
    d'étapes ordonnées, chacune déclenchée à échéance + un délai, qui est
    soit un simple rappel interne journalisé, soit une relance externe
@@ -58,22 +58,23 @@ serverless), migrer vers une base gérée (Postgres) — voir
 ## Comment le système sait qu'il y a eu une réponse
 
 `src/pipeline/relanceCheck.ts` compare, à chaque vérification (toutes les
-30 minutes), l'horodatage de l'accusé de réception (`ack_sent_at`) à
-l'ensemble des messages du fil récupéré depuis la messagerie connectée: si
-un message envoyé par la boîte connectée existe après cet horodatage, le
-dossier passe au statut "Répondu" et la relance s'arrête.
+2 minutes par défaut), le nombre de messages envoyés automatiquement par
+le pipeline (`automated_outbound_count`) au nombre réel de messages
+envoyés par la messagerie connectée dans le fil: si ce dernier est plus
+grand, un humain a répondu, et le dossier passe au statut "Répondu" — la
+relance vers l'équipe s'arrête, et la relance vers le client (si celui-ci
+reste ensuite silencieux) prend le relais.
 
 Ce mécanisme suppose que la réponse part **de la messagerie connectée**,
-dans le **même fil** (thread Gmail / conversation Outlook) — ce qui est le
-cas normal quand un agent choisit un des 3 brouillons générés et l'envoie.
-Il a des angles morts, à connaître avant de compter dessus à 100%:
+dans le **même fil** (thread Gmail / conversation Outlook). Il a des angles
+morts, à connaître avant de compter dessus à 100%:
 
 - **Réponse envoyée depuis une autre adresse** (compte personnel d'un
   agent, autre outil) — invisible, puisque le connecteur n'a accès qu'à la
   messagerie connectée.
 - **Nouveau message au lieu d'une réponse dans le fil** — si l'agent
-  compose un email neuf plutôt que de répondre à un des brouillons
-  générés, le rattachement au fil peut se rompre (surtout si l'objet change).
+  compose un email neuf plutôt que de répondre dans le fil existant, le
+  rattachement peut se rompre (surtout si l'objet change).
 - **Résolution hors email** (téléphone, en personne) — aucune visibilité
   possible par nature.
 
@@ -84,9 +85,9 @@ Pour couvrir ces cas, une page de suivi manuel existe:
 Liste tous les dossiers avec leur statut, échéance et nombre de relances,
 et propose un bouton **"Marquer répondu"** pour clôturer manuellement un
 dossier que la détection automatique n'a pas vu passer. Règle d'usage à
-donner à l'équipe: toujours répondre en utilisant un des 3 brouillons
-générés (ou au moins en répondant dans le même fil) pour que la détection
-automatique fonctionne; le bouton manuel reste le filet de sécurité.
+donner à l'équipe: toujours répondre dans le même fil pour que la
+détection automatique fonctionne; le bouton manuel reste le filet de
+sécurité.
 
 Cliquer sur un dossier ouvre sa **page de détail**: dates, statut, séquence
 de relance appliquée (avec quelles étapes sont déjà passées), et les
@@ -154,16 +155,6 @@ cp .env.example .env
 ### 1. Clé API Claude
 
 Ajoutez `ANTHROPIC_API_KEY` dans `.env`.
-
-Vous pouvez tester la couche IA seule (classification + rédaction), sans
-aucun accès email, avec:
-
-```bash
-npm run test:pipeline
-```
-
-Ce script fait tourner le pipeline complet de rédaction sur un email
-d'exemple codé en dur et affiche le résultat dans le terminal.
 
 ### 2. Configuration agence (une fois par client)
 
@@ -385,15 +376,14 @@ aucune modification de code ne peut les couvrir:
 ```bash
 npm test          # tests unitaires (node:test), sans accès email ni clé API
 npm run typecheck
-npm run test:pipeline   # test manuel de bout en bout de la couche IA (nécessite ANTHROPIC_API_KEY)
 ```
 
 `npm test` couvre les unités isolables (utilitaires, chiffrement des jetons,
 authentification/session/CSRF, résolution des catégories, résolution des
 séquences de relance catégorie/dossier) — voir
 [`test/`](test). La logique du pipeline complet (classification + rédaction
-+ envoi réel) reste couverte par le script manuel `test:pipeline`, pas par
-des tests automatisés, car elle suppose un accès Claude/connecteur réel.
++ envoi réel) suppose un accès Claude/connecteur réel et n'est donc pas
+couverte par des tests automatisés.
 Le workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) fait
 tourner `typecheck` + `test` sur chaque push/PR.
 
@@ -411,7 +401,7 @@ src/
   settings.ts                categories/seuils de relance, lus depuis la base (plus depuis le JSON)
   ai/                        classification + rédaction (Claude)
   pipeline/                  orchestration (email entrant, vérification des relances)
-  scripts/                   auth Gmail en CLI (fallback), test de la couche IA sans email, hash de mot de passe
+  scripts/                   auth Gmail en CLI (fallback), hash de mot de passe
   connectionState.ts         messagerie active (écrit par la page de connexion)
   db.ts                      dossiers, catégories, séquences de relance (par catégorie ou par dossier), journal (SQLite local)
   scheduler.ts, index.ts     pipeline seul

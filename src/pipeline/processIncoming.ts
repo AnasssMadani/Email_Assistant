@@ -2,7 +2,6 @@ import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
-import { draftThreeReplies } from "../ai/draftReplies.js";
 import { buildReplySubject } from "../utils.js";
 import { tagSource } from "./errorTag.js";
 import {
@@ -13,8 +12,6 @@ import {
   recordAckDraft,
   recordClassification,
   setThreadAckSent,
-  setThreadStatus,
-  recordDraft,
   recordReminder,
 } from "../db.js";
 import type { CategoryConfig, EmailConnector, EmailMessage, EmailThread } from "../types.js";
@@ -70,7 +67,7 @@ export async function processIncomingMessage(
   // n'est visible nulle part avec son contenu sur /carnet, rendant
   // impossible de juger si l'IA l'a bien classifie (le but meme de la
   // semaine pilote). L'accuse, s'il y en a un, complete cette ligne plus
-  // bas (voir recordAckDraft dans sendAcknowledgementAndDrafts).
+  // bas (voir recordAckDraft dans sendAcknowledgement).
   recordClassification({
     threadId: message.threadId,
     messageId: message.id,
@@ -100,19 +97,18 @@ export async function processIncomingMessage(
     return;
   }
 
-  await sendAcknowledgementAndDrafts(connector, thread, message, category);
+  await sendAcknowledgement(connector, thread, message, category);
 }
 
 /**
- * Envoie l'accuse de reception et depose les 3 brouillons de reponse pour un
- * message donne. Extrait de processIncomingMessage pour etre reutilisable
- * depuis une intervention manuelle (voir POST /dossiers/:threadId/traiter
- * dans web/server.ts): un dossier mal classifie par erreur (ex: vrai email
- * client marque "newsletter", donc jamais accuse) peut ainsi etre traite
- * a la main avec la bonne categorie, sans devoir rejouer toute la
- * classification.
+ * Envoie l'accuse de reception pour un message donne. Extrait de
+ * processIncomingMessage pour etre reutilisable depuis une intervention
+ * manuelle (voir POST /dossiers/:threadId/traiter dans web/server.ts): un
+ * dossier mal classifie par erreur (ex: vrai email client marque
+ * "newsletter", donc jamais accuse) peut ainsi etre traite a la main avec la
+ * bonne categorie, sans devoir rejouer toute la classification.
  */
-export async function sendAcknowledgementAndDrafts(
+export async function sendAcknowledgement(
   connector: EmailConnector,
   thread: EmailThread,
   incoming: EmailMessage,
@@ -182,32 +178,4 @@ export async function sendAcknowledgementAndDrafts(
   // alors impossible a relier au dossier d'origine.
   recordReminder(incoming.threadId, "external", `Accusé de réception envoyé à ${incoming.from.email}.`, "accuse");
   console.log(`[accuse envoye] ${incoming.from.email} — "${incoming.subject}"`);
-
-  if (!config.draftRepliesEnabled) {
-    // En pause: ni appel Claude ni depot de brouillon — le dossier reste au
-    // statut "ack_sent", deja eligible aux relances/rappels normalement.
-    console.log(`[brouillons en pause] aucun brouillon genere pour ${incoming.from.email}.`);
-    return;
-  }
-
-  const replies = await draftThreeReplies(thread, incoming, category);
-  for (const reply of replies) {
-    const draft = await tagSource("Messagerie — dépôt du brouillon", () =>
-      connector.createDraftReply({
-        threadId: incoming.threadId,
-        to: incoming.from.email,
-        subject: replySubject,
-        bodyText: reply.body,
-        inReplyToMessageId: incoming.rfcMessageId,
-      })
-    );
-    recordDraft({
-      threadId: incoming.threadId,
-      connectorDraftId: draft.id,
-      variant: reply.variant,
-      label: reply.label,
-    });
-  }
-  setThreadStatus(incoming.threadId, "drafts_ready");
-  console.log(`[brouillons prets] ${replies.length} propositions pour ${incoming.from.email}`);
 }

@@ -98,10 +98,6 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
       sendReplyCalls++;
       return { id: `sent-${sendReplyCalls}` };
     },
-    async createDraftReply(_params: SendReplyParams) {
-      return { id: "draft-1" };
-    },
-    async deleteDraft() {},
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
@@ -169,10 +165,6 @@ test("runRelanceCheck skips a dossier whose thread id doesn't match the currentl
     async sendReply(_params: SendReplyParams) {
       return { id: "sent-1" };
     },
-    async createDraftReply(_params: SendReplyParams) {
-      return { id: "draft-1" };
-    },
-    async deleteDraft() {},
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },

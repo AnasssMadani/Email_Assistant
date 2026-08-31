@@ -2,7 +2,7 @@
   "name": "accuse-reception-relance",
   "version": "0.1.0",
   "private": true,
-  "description": "Accuse de reception automatique, brouillons de reponse et relances par email. Phase de test sur Gmail, cible de production Outlook / Microsoft 365.",
+  "description": "Accuse de reception automatique et relances par email, base sur une classification IA. Phase de test sur Gmail, cible de production Outlook / Microsoft 365.",
   "type": "module",
   "engines": {
     "node": ">=22.13.0"
@@ -13,7 +13,6 @@
     "start": "node dist/index.js",
     "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "gmail:auth": "node ./node_modules/tsx/dist/cli.mjs src/scripts/gmailAuthSetup.ts",
-    "test:pipeline": "node ./node_modules/tsx/dist/cli.mjs src/scripts/testPipeline.ts",
     "test": "node ./node_modules/tsx/dist/cli.mjs --test test/**/*.test.ts",
     "auth:hash-password": "node ./node_modules/tsx/dist/cli.mjs src/scripts/hashPassword.ts",
     "setup": "node ./node_modules/tsx/dist/cli.mjs src/web/server.ts",

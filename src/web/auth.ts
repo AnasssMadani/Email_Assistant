@@ -39,7 +39,7 @@ export function clearSessionCookie(res: Response): void {
 
 // ---------- Sessions (en memoire — un seul processus, single-tenant) ----------
 
-export type SessionRole = "admin" | "client";
+export type SessionRole = "admin";
 
 interface SessionData {
   csrfToken: string;
@@ -130,23 +130,6 @@ export function verifyLogin(username: string, password: string): boolean {
   return usernameOk && passwordOk;
 }
 
-// ---------- Identifiants du dashboard client (compte separe de l'admin) ----------
-
-export function clientAuthConfigured(): boolean {
-  return Boolean(config.auth.clientUsername) && Boolean(config.auth.clientPasswordHash);
-}
-
-export function verifyClientLogin(username: string, password: string): boolean {
-  const expectedHash = config.auth.clientPasswordHash;
-  if (!expectedHash || !config.auth.clientUsername) return false;
-  const [salt, expectedDerived] = expectedHash.split(":");
-  if (!salt || !expectedDerived) return false;
-  const candidateDerived = scryptSync(password, salt, SCRYPT_KEY_LENGTH).toString("hex");
-  const passwordOk = safeEqual(candidateDerived, expectedDerived);
-  const usernameOk = safeEqual(username, config.auth.clientUsername);
-  return usernameOk && passwordOk;
-}
-
 // ---------- Limitation des tentatives de connexion ----------
 
 const loginAttempts = new Map<string, { count: number; windowStart: number }>();
@@ -186,16 +169,6 @@ function warnAuthDisabledOnce(): void {
   );
 }
 
-let warnedClientAuthDisabled = false;
-function warnClientAuthDisabledOnce(): void {
-  if (warnedClientAuthDisabled) return;
-  warnedClientAuthDisabled = true;
-  console.warn(
-    "[avertissement] CLIENT_USERNAME / CLIENT_PASSWORD_HASH non definis: le dashboard client n'est pas protege. " +
-      "A ne jamais laisser ainsi en dehors de localhost."
-  );
-}
-
 /**
  * Fail-closed: hors localhost (NODE_ENV=production, voir isProductionLike),
  * une configuration d'auth manquante ne doit jamais se traduire par un
@@ -213,7 +186,6 @@ function denyMisconfigured(res: Response): void {
     );
 }
 
-/** Espace admin uniquement — un client authentifie sous le role "client" est refuse, meme s'il devine l'URL. */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (!authConfigured()) {
     if (isProductionLike()) {
@@ -234,43 +206,8 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   next();
 }
 
-/**
- * Espace client (/client/... + le flux OAuth de reconnexion messagerie,
- * partage avec l'admin) — accepte le role "client" ET "admin" (l'admin peut
- * ainsi previsualiser le dashboard client), mais jamais l'inverse: une
- * session client n'ouvre jamais une route admin (voir requireAuth ci-dessus).
- * Verrouillage cote serveur systematique, pas un simple masquage de lien
- * dans le menu — un client qui devine une URL admin est quand meme bloque.
- */
-export function requireClientAuth(req: Request, res: Response, next: NextFunction): void {
-  if (!clientAuthConfigured()) {
-    if (isProductionLike()) {
-      denyMisconfigured(res);
-      return;
-    }
-    warnClientAuthDisabledOnce();
-    next();
-    return;
-  }
-  const cookies = parseCookies(req.headers.cookie);
-  const session = getSession(cookies[SESSION_COOKIE]);
-  if (!session || (session.role !== "client" && session.role !== "admin")) {
-    res.redirect(`/client/login?next=${encodeURIComponent(req.originalUrl)}`);
-    return;
-  }
-  res.locals.csrfToken = session.csrfToken;
-  next();
-}
-
-/**
- * Decouple de authConfigured() seul (SEC-007): cette garde protege AUSSI les
- * routes du dashboard CLIENT (clientRouter s'en sert egalement). Ne
- * court-circuiter que si NI l'admin NI le client ne sont configures — sinon
- * un deploiement avec admin non configure mais client configure se
- * retrouvait avec des mutations client sans aucune protection CSRF.
- */
 export function requireCsrf(req: Request, res: Response, next: NextFunction): void {
-  if (!authConfigured() && !clientAuthConfigured()) {
+  if (!authConfigured()) {
     if (isProductionLike()) {
       denyMisconfigured(res);
       return;

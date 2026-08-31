@@ -116,12 +116,13 @@ export class GmailConnector implements EmailConnector {
     const thread = await withBackoff(() => gmail.users.threads.get({ userId: "me", id: threadId, format: "full" }));
     const messages = (thread.data.messages ?? [])
       // threads.get() renvoie AUSSI les brouillons associes au fil (label
-      // DRAFT) — nos 3 propositions de reponse en sont justement un exemple.
-      // Un brouillon est compose "depuis" notre compte (isFromUs=true) mais
-      // n'a jamais ete envoye: le laisser dans messages faisait gonfler le
-      // nombre de messages isFromUs au-dela du compteur d'envois reels
-      // (automated_outbound_count), ce qui faisait detecter a tort une
-      // "reponse humaine" des que les 3 brouillons etaient deposes.
+      // DRAFT) — qu'ils viennent de notre pipeline ou d'un employe qui a
+      // commence a composer une reponse sans encore l'envoyer. Un brouillon
+      // est compose "depuis" notre compte (isFromUs=true) mais n'a jamais
+      // ete envoye: le laisser dans messages ferait gonfler le nombre de
+      // messages isFromUs au-dela du compteur d'envois reels
+      // (automated_outbound_count), ce qui detecterait a tort une "reponse
+      // humaine" avant meme que l'employe ait clique sur Envoyer.
       .filter((m) => !m.labelIds?.includes("DRAFT"))
       .map((m) => this.toEmailMessage(m, ownEmail))
       .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
@@ -144,35 +145,6 @@ export class GmailConnector implements EmailConnector {
       requestBody: { raw, threadId: params.threadId },
     });
     return { id: res.data.id ?? "" };
-  }
-
-  async createDraftReply(params: SendReplyParams): Promise<{ id: string }> {
-    const gmail = await this.getGmail();
-    const ownEmail = await this.getOwnEmailAddress();
-    const raw = buildRawMimeMessage({
-      from: ownEmail,
-      to: params.to,
-      subject: params.subject,
-      bodyText: params.bodyText,
-      inReplyToMessageId: params.inReplyToMessageId,
-      references: params.inReplyToMessageId,
-    });
-    const res = await gmail.users.drafts.create({
-      userId: "me",
-      requestBody: { message: { raw, threadId: params.threadId } },
-    });
-    return { id: res.data.id ?? "" };
-  }
-
-  async deleteDraft(draftId: string): Promise<void> {
-    const gmail = await this.getGmail();
-    try {
-      await gmail.users.drafts.delete({ userId: "me", id: draftId });
-    } catch (err) {
-      // Deja envoye ou supprime manuellement par un agent: pas une erreur.
-      if ((err as { status?: number }).status === 404) return;
-      throw err;
-    }
   }
 
   async markMessageUnread(messageId: string): Promise<void> {

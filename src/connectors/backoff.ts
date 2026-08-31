@@ -9,7 +9,7 @@ function extractStatus(err: unknown): number | undefined {
  * Retente un appel Gmail/Graph en cas d'erreur transitoire (429 rate-limit,
  * 500/502/503) avec un backoff exponentiel + jitter. RESERVE AUX LECTURES
  * (list/get) — ne jamais l'utiliser pour un envoi (sendReply,
- * sendNotification, createDraftReply): un timeout ambigu sur un envoi peut
+ * sendNotification): un timeout ambigu sur un envoi peut
  * avoir reussi cote serveur malgre l'erreur cote client, et retenter
  * risquerait un envoi en double (contrainte permanente du projet, voir
  * CLAUDE.md). Seuls les codes explicitement transitoires sont retentes —

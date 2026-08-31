@@ -1,7 +1,6 @@
 import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { draftRelance } from "../ai/draftRelance.js";
-import { cleanupUnusedDrafts } from "./draftCleanup.js";
 import { tagSource } from "./errorTag.js";
 import { buildReplySubject, urgencyMeetsThreshold } from "../utils.js";
 import {
@@ -177,7 +176,6 @@ export async function checkPreReplyThread(
     // scheduler) apres qu'elle ait ete effectivement envoyee — sinon le
     // delai de reponse affiche au client integre cette latence d'infra.
     setThreadHumanReplied(row.thread_id, replyAfterAck.receivedAt.toISOString(), replyAfterAck.hasAttachments);
-    await cleanupUnusedDrafts(connector, row.thread_id);
     return;
   }
 

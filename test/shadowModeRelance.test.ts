@@ -58,10 +58,6 @@ function fakeConnector(thread: EmailThread, onSendReply: () => void): EmailConne
       onSendReply();
       return { id: "sent-1" };
     },
-    async createDraftReply(_params: SendReplyParams) {
-      return { id: "draft-1" };
-    },
-    async deleteDraft() {},
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },

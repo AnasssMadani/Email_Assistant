@@ -37,10 +37,6 @@ function fakeConnector(sentMessages: EmailMessage[]): EmailConnector {
     async sendReply(_params: SendReplyParams) {
       return { id: "sent-1" };
     },
-    async createDraftReply(_params: SendReplyParams) {
-      return { id: "draft-1" };
-    },
-    async deleteDraft() {},
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },

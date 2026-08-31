@@ -37,11 +37,6 @@ export const config = {
   // (quelques minutes, meme jour) fiables — reste ajustable via l'env si
   // besoin d'un intervalle different.
   relanceCheckCron: process.env.RELANCE_CHECK_CRON ?? "*/2 * * * *",
-  // En pause par defaut (a la demande): l'accuse, les relances et les
-  // notifications continuent de fonctionner normalement, seuls les 3
-  // brouillons de reponse ne sont plus generes ni deposes. Remettre a
-  // "true" pour les reactiver, sans autre changement de code.
-  draftRepliesEnabled: process.env.ENABLE_DRAFT_REPLIES === "true",
   dbPath: process.env.DB_PATH ?? "./data/app.db",
   categoriesConfigPath: process.env.CATEGORIES_CONFIG_PATH ?? "./config/categories.json",
   brandVoicePath: process.env.BRAND_VOICE_PATH ?? "./config/brand-voice.md",
@@ -82,13 +77,6 @@ export const config = {
     // Ancien mode de passe en clair, conserve uniquement pour compatibilite
     // ascendante. A migrer vers SETUP_PASSWORD_HASH.
     legacyPlaintextPassword: process.env.SETUP_PASSWORD ?? "",
-    // Identifiants separes pour le dashboard client (/client/...) — jamais
-    // le meme compte que l'admin, meme format de hash (voir
-    // npm run auth:hash-password). Si absents, le dashboard client s'ouvre
-    // sans mot de passe (meme convention que l'admin ci-dessus) — a ne
-    // jamais laisser ainsi hors localhost.
-    clientUsername: process.env.CLIENT_USERNAME ?? "",
-    clientPasswordHash: process.env.CLIENT_PASSWORD_HASH ?? "",
   },
   branding: {
     name: process.env.BRAND_NAME ?? "Accusé & Relance",

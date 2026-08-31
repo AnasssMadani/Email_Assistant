@@ -56,8 +56,6 @@ export interface EmailConnector {
   listRecentSentMessages(maxResults?: number): Promise<EmailMessage[]>;
   getThread(threadId: string): Promise<EmailThread>;
   sendReply(params: SendReplyParams): Promise<{ id: string }>;
-  createDraftReply(params: SendReplyParams): Promise<{ id: string }>;
-  deleteDraft(draftId: string): Promise<void>;
   /** Email autonome, hors fil client (pas de threadId) — utilise pour les notifications internes (rappels). */
   sendNotification(params: NotificationParams): Promise<{ id: string }>;
   /**
@@ -112,13 +110,6 @@ export interface ClassificationResult {
   urgency: "low" | "normal" | "high";
   summary: string;
   requiresAcknowledgement: boolean;
-}
-
-export interface ReplyDraft {
-  variant: "A" | "B" | "C";
-  label: string;
-  subject: string;
-  body: string;
 }
 
 export type ThreadStatus =

@@ -205,21 +205,6 @@ export class GraphConnector implements EmailConnector {
     return { id: draftId };
   }
 
-  async createDraftReply(params: SendReplyParams): Promise<{ id: string }> {
-    const draftId = await this.buildReplyDraft(params);
-    return { id: draftId };
-  }
-
-  async deleteDraft(draftId: string): Promise<void> {
-    try {
-      await graphFetch(`/me/messages/${draftId}`, { method: "DELETE" });
-    } catch (err) {
-      // Deja envoye ou supprime manuellement par un agent: pas une erreur.
-      if ((err as Error).message.includes("-> 404:")) return;
-      throw err;
-    }
-  }
-
   async markMessageUnread(messageId: string): Promise<void> {
     await graphFetch(`/me/messages/${messageId}`, {
       method: "PATCH",

@@ -7,9 +7,8 @@ import { buildGraphAuthUrl, exchangeCodeForGraphToken } from "../connectors/grap
 import { GmailConnector } from "../connectors/gmailConnector.js";
 import { GraphConnector } from "../connectors/graphConnector.js";
 import { createEmailConnector } from "../connectors/index.js";
-import { cleanupUnusedDrafts } from "../pipeline/draftCleanup.js";
 import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCheck.js";
-import { sendAcknowledgementAndDrafts } from "../pipeline/processIncoming.js";
+import { sendAcknowledgement } from "../pipeline/processIncoming.js";
 import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
 import { getCategory } from "../settings.js";
 import {
@@ -19,14 +18,11 @@ import {
   consumeConnectInvite,
   createCategory,
   createConnectInvite,
-  createEmployee,
   deleteCategoryRelanceStep,
   deleteThreadData,
   deleteThreadRelanceStep,
   getAiUsageSummarySince,
-  getCategoryPerformance,
   getCategoryRelanceSteps,
-  getEmployeePerformance,
   getEffectiveRelanceSteps,
   getThreadRelanceOverride,
   getThreadRow,
@@ -35,8 +31,6 @@ import {
   listCategories,
   listCategoriesWithCorpus,
   listConnectInvites,
-  listDraftsForThread,
-  listEmployees,
   listHumanReplyCorpusByCategory,
   listPipelineErrors,
   listRecentAiUsage,
@@ -46,9 +40,7 @@ import {
   markMessageProcessed,
   recordPipelineError,
   revokeConnectInvite,
-  setEmployeeActive,
   setShadowLogReviewed,
-  setThreadHandledBy,
   setThreadHumanReplied,
   setThreadStatus,
   updateCategory,
@@ -56,11 +48,7 @@ import {
   type AiUsageEventRow,
   type AiUsageSummary,
   type CarnetEntry,
-  type CategoryPerformanceRow,
   type ConnectInviteRow,
-  type Employee,
-  type EmployeePerformanceRow,
-  type LateBuckets,
   type PipelineErrorRow,
   type RelancePhase,
   type ReminderRow,
@@ -70,21 +58,17 @@ import type { CategoryConfig, EmailMessage, RelanceChannel, RelanceStep } from "
 import {
   authConfigured,
   clearSessionCookie,
-  clientAuthConfigured,
   createSession,
   destroySession,
   isLoginRateLimited,
   parseCookies,
   recordLoginFailure,
   requireAuth,
-  requireClientAuth,
   requireCsrf,
   resetLoginAttempts,
   setSessionCookie,
-  verifyClientLogin,
   verifyLogin,
 } from "./auth.js";
-import { clientRouter } from "./clientServer.js";
 import { csrfField, escapeHtml, formatDateTime, safeNext, sharedStyles } from "./shared.js";
 
 const app = express();
@@ -220,49 +204,11 @@ app.post("/login", (req: Request, res: Response) => {
   );
 });
 
-// ---------- Connexion (dashboard client — compte separe de l'admin) ----------
-
-app.get("/client/login", (req: Request, res: Response) => {
-  const q = query(req);
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderLoginPage({ next: q.next ?? "/client", error: q.error, action: "/client/login" }));
-});
-
-app.post("/client/login", (req: Request, res: Response) => {
-  const ip = req.ip ?? "unknown";
-  const body = req.body as Record<string, string>;
-  const next = body.next && body.next.startsWith("/client") ? body.next : "/client";
-
-  if (isLoginRateLimited(ip)) {
-    res.redirect(
-      `/client/login?next=${encodeURIComponent(next)}&error=${encodeURIComponent(
-        "Trop de tentatives. Reessayez dans quelques minutes."
-      )}`
-    );
-    return;
-  }
-
-  if (!clientAuthConfigured() || verifyClientLogin(body.username ?? "", body.password ?? "")) {
-    resetLoginAttempts(ip);
-    const { token } = createSession("client");
-    setSessionCookie(res, token, req.secure);
-    res.redirect(next);
-    return;
-  }
-
-  recordLoginFailure(ip);
-  res.redirect(
-    `/client/login?next=${encodeURIComponent(next)}&error=${encodeURIComponent(
-      "Identifiants incorrects."
-    )}`
-  );
-});
-
 app.post("/logout", (req: Request, res: Response) => {
   const cookies = parseCookies(req.headers.cookie);
   destroySession(cookies.sess);
   clearSessionCookie(res);
-  res.redirect(req.body?.fromClient === "1" ? "/client/login" : "/login");
+  res.redirect("/login");
 });
 
 /**
@@ -282,18 +228,15 @@ function setStateCookie(res: Response, name: string, value: string): void {
 }
 
 /**
- * Retour de destination apres le flux OAuth Google/Microsoft: le client peut
- * lui aussi declencher une reconnexion depuis /client/connexion (bouton
- * "Reconnecter"), donc le callback doit savoir a qui renvoyer la main. Le
- * visiteur d'un lien d'invitation (voir requireClientAuthOrInvite ci-dessous)
- * n'a acces ni au dashboard admin ni au dashboard client — il atterrit sur
- * une page de confirmation minimale, /connect/succes. Marque via un cookie
- * ephemere pose au moment du /start plutot que dans le parametre state
- * lui-meme (qui reste le nonce anti-CSRF pur, echo par le fournisseur).
+ * Retour de destination apres le flux OAuth Google/Microsoft. Le visiteur
+ * d'un lien d'invitation (voir requireAuthOrInvite ci-dessous) n'a pas de
+ * session admin — il atterrit sur une page de confirmation minimale,
+ * /connect/succes. Marque via un cookie ephemere pose au moment du /start
+ * plutot que dans le parametre state lui-meme (qui reste le nonce anti-CSRF
+ * pur, echo par le fournisseur).
  */
-function oauthReturnTarget(req: Request): "/" | "/client" | "/connect/succes" {
+function oauthReturnTarget(req: Request): "/" | "/connect/succes" {
   const cookies = parseCookies(req.headers.cookie);
-  if (cookies.oauth_from === "client") return "/client";
   if (cookies.oauth_from === "invite") return "/connect/succes";
   return "/";
 }
@@ -309,39 +252,37 @@ function inviteTokenFromRequest(req: Request): string | undefined {
 }
 
 /**
- * Gate des 4 routes OAuth: accepte une session admin/client existante
- * (requireClientAuth, inchange) OU un token d'invitation valide — sans
- * toucher a auth.ts/SessionRole, pour garder la surface de risque du
- * systeme de session existant intacte. Un token invalide/expire/deja
- * consomme retombe simplement sur requireClientAuth (donc une redirection
- * vers /client/login si aucune session non plus).
+ * Gate des 4 routes OAuth: accepte une session admin existante (requireAuth)
+ * OU un token d'invitation valide — sans toucher a auth.ts/SessionRole, pour
+ * garder la surface de risque du systeme de session existant intacte. Un
+ * token invalide/expire/deja consomme retombe simplement sur requireAuth
+ * (donc une redirection vers /login si aucune session non plus).
  */
-function requireClientAuthOrInvite(req: Request, res: Response, next: NextFunction): void {
+function requireAuthOrInvite(req: Request, res: Response, next: NextFunction): void {
   const token = inviteTokenFromRequest(req);
   if (token && getValidConnectInvite(token)) {
     next();
     return;
   }
-  requireClientAuth(req, res, next);
+  requireAuth(req, res, next);
 }
 
 // ---------- Flux OAuth de connexion messagerie ----------
-// Accessible par une session admin OU client (requireClientAuth accepte les
-// deux) OU un lien d'invitation a usage unique (requireClientAuthOrInvite,
-// voir plus haut) — reconnecter une messagerie expiree ne doit pas obliger
-// le client a attendre l'admin, et le client lui-meme ne doit pas avoir
-// besoin d'identifiants du tout via un lien d'invitation. Monte AVANT le
-// requireAuth (admin uniquement) ci-dessous: une route dont l'admin ET le
-// client ont besoin ne peut pas dependre d'un gate qui exclut l'un des deux.
+// Accessible par une session admin (requireAuth) OU un lien d'invitation a
+// usage unique (requireAuthOrInvite, voir plus haut) — reconnecter une
+// messagerie expiree ne doit pas obliger le client a attendre l'admin s'il
+// dispose d'un lien d'invitation, qui ne necessite aucun identifiant. Monte
+// AVANT le requireAuth global ci-dessous: une route accessible par invitation
+// ne peut pas dependre d'un gate qui l'exclurait.
 
-app.get("/auth/gmail/start", requireClientAuthOrInvite, (req: Request, res: Response) => {
+app.get("/auth/gmail/start", requireAuthOrInvite, (req: Request, res: Response) => {
   if (!config.google.clientId || !config.google.clientSecret) {
     res.redirect("/?error=" + encodeURIComponent("Configuration Google manquante cote agence."));
     return;
   }
   const state = randomUUID();
   setStateCookie(res, "gmail_oauth_state", state);
-  const from = query(req).from === "client" ? "client" : query(req).from === "invite" ? "invite" : "admin";
+  const from = query(req).from === "invite" ? "invite" : "admin";
   setStateCookie(res, "oauth_from", from);
   if (from === "invite" && query(req).invite) {
     setStateCookie(res, "connect_invite", query(req).invite as string);
@@ -349,7 +290,7 @@ app.get("/auth/gmail/start", requireClientAuthOrInvite, (req: Request, res: Resp
   res.redirect(buildGmailAuthUrl(state));
 });
 
-app.get("/auth/gmail/callback", requireClientAuthOrInvite, async (req: Request, res: Response) => {
+app.get("/auth/gmail/callback", requireAuthOrInvite, async (req: Request, res: Response) => {
   const target = oauthReturnTarget(req);
   try {
     const cookies = parseCookies(req.headers.cookie);
@@ -370,14 +311,14 @@ app.get("/auth/gmail/callback", requireClientAuthOrInvite, async (req: Request, 
   }
 });
 
-app.get("/auth/graph/start", requireClientAuthOrInvite, (req: Request, res: Response) => {
+app.get("/auth/graph/start", requireAuthOrInvite, (req: Request, res: Response) => {
   if (!config.azure.clientId || !config.azure.clientSecret) {
     res.redirect("/?error=" + encodeURIComponent("Configuration Microsoft manquante cote agence."));
     return;
   }
   const state = randomUUID();
   setStateCookie(res, "graph_oauth_state", state);
-  const from = query(req).from === "client" ? "client" : query(req).from === "invite" ? "invite" : "admin";
+  const from = query(req).from === "invite" ? "invite" : "admin";
   setStateCookie(res, "oauth_from", from);
   if (from === "invite" && query(req).invite) {
     setStateCookie(res, "connect_invite", query(req).invite as string);
@@ -385,7 +326,7 @@ app.get("/auth/graph/start", requireClientAuthOrInvite, (req: Request, res: Resp
   res.redirect(buildGraphAuthUrl(state));
 });
 
-app.get("/auth/graph/callback", requireClientAuthOrInvite, async (req: Request, res: Response) => {
+app.get("/auth/graph/callback", requireAuthOrInvite, async (req: Request, res: Response) => {
   const target = oauthReturnTarget(req);
   try {
     const cookies = parseCookies(req.headers.cookie);
@@ -407,11 +348,11 @@ app.get("/auth/graph/callback", requireClientAuthOrInvite, async (req: Request, 
 });
 
 // ---------- Page publique d'invitation ----------
-// AUCUNE protection requireAuth/requireClientAuth ici, par construction —
-// c'est exactement le but (le client se connecte sans identifiants). La
-// securite repose entierement sur le token (aleatoire 256 bits, usage
-// unique, expirant, revocable depuis "/") verifie explicitement ci-dessous.
-// Ne jamais monter ces deux routes apres app.use(requireAuth).
+// AUCUNE protection requireAuth ici, par construction — c'est exactement le
+// but (le client se connecte sans identifiants). La securite repose
+// entierement sur le token (aleatoire 256 bits, usage unique, expirant,
+// revocable depuis "/") verifie explicitement ci-dessous. Ne jamais monter
+// ces deux routes apres app.use(requireAuth).
 
 app.get("/connect", (req: Request, res: Response) => {
   const token = query(req).token;
@@ -424,13 +365,6 @@ app.get("/connect/succes", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderConnectSuccessPage());
 });
-
-// ---------- Dashboard client: routeur dedie, verrouille par son propre middleware ----------
-// Monte AVANT le requireAuth admin ci-dessous: une session client ne doit
-// jamais pouvoir atteindre une route admin, meme en devinant l'URL — pas un
-// simple masquage de lien dans le menu.
-
-app.use("/client", requireClientAuth, clientRouter);
 
 // ---------- Tout ce qui suit necessite une session ADMIN valide ----------
 
@@ -492,29 +426,13 @@ app.get("/dossiers/:threadId", (req: Request, res: Response) => {
 app.post("/dossiers/:threadId/cloturer", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   setThreadStatus(threadId, "closed");
-  await attemptCleanup(threadId);
   res.redirect(req.body?._redirect === "detail" ? `/dossiers/${encodeURIComponent(threadId)}` : "/dossiers");
-});
-
-app.post("/dossiers/:threadId/traite-par", requireCsrf, (req: Request, res: Response) => {
-  const threadId = req.params.threadId;
-  const body = req.body as Record<string, string>;
-  const raw = (body.employeeId ?? "").trim();
-  setThreadHandledBy(threadId, raw ? Number(raw) : null);
-  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 });
 
 app.post("/dossiers/:threadId/supprimer", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
-  await attemptCleanup(threadId);
   deleteThreadData(threadId);
   res.redirect("/dossiers");
-});
-
-app.post("/dossiers/:threadId/nettoyer-brouillons", requireCsrf, async (req: Request, res: Response) => {
-  const threadId = req.params.threadId;
-  await attemptCleanup(threadId);
-  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 });
 
 app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Request, res: Response) => {
@@ -541,15 +459,6 @@ app.post("/dossiers/:threadId/relancer-maintenant", requireCsrf, async (req: Req
   }
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
 });
-
-/** Nettoyage best-effort: une messagerie non connectee ou une erreur API ne doit jamais bloquer l'action principale de la route appelante. */
-async function attemptCleanup(threadId: string): Promise<void> {
-  try {
-    await cleanupUnusedDrafts(createEmailConnector(), threadId);
-  } catch (err) {
-    recordPipelineError("draft_cleanup", threadId, (err as Error).message);
-  }
-}
 
 /** Journalise et redirige avec une banniere d'erreur au lieu de laisser une route synchrone planter jusqu'a la page 500 generique. */
 function runOrRedirectError(res: Response, context: string, threadId: string, action: () => void): void {
@@ -615,10 +524,9 @@ app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, (req: R
 /**
  * Recuperation manuelle d'un dossier mal classifie: un vrai email client
  * marque a tort "sans suite requise" (ex: confondu avec une newsletter) n'a
- * jamais reçu d'accuse ni de brouillons. Cette route reprend le fil depuis
- * la messagerie, applique la categorie choisie par l'admin, et declenche
- * l'accuse + les 3 brouillons comme si la classification avait ete bonne
- * des le depart.
+ * jamais reçu d'accuse. Cette route reprend le fil depuis la messagerie,
+ * applique la categorie choisie par l'admin, et declenche l'accuse comme si
+ * la classification avait ete bonne des le depart.
  */
 app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
@@ -643,7 +551,7 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
         status: "received",
         dueAt,
       });
-      await sendAcknowledgementAndDrafts(connector, thread, lastInbound, category);
+      await sendAcknowledgement(connector, thread, lastInbound, category);
     } catch (err) {
       console.error(`[traitement manuel] erreur sur le dossier ${threadId}:`, err);
       recordPipelineError("manual_override", threadId, (err as Error).message);
@@ -659,7 +567,6 @@ app.get("/reglages", (req: Request, res: Response) => {
   res.send(
     renderReglagesPage(
       listCategories(),
-      listEmployees(true),
       res.locals.csrfToken as string | undefined,
       query(req).saved,
       query(req).error,
@@ -766,29 +673,6 @@ app.post("/reglages/categories/:id/relance-steps/:order/delete", requireCsrf, (r
   });
 });
 
-// ---------- Employés (tag manuel "traité par", voir /performance) ----------
-
-app.post("/reglages/employes", requireCsrf, (req: Request, res: Response) => {
-  const body = req.body as Record<string, string>;
-  runOrRedirectReglagesError(res, "employee_create", () => {
-    const name = (body.name ?? "").trim();
-    if (!name) throw new Error("Le nom de l'employé ne peut pas être vide.");
-    createEmployee(name);
-  });
-});
-
-app.post("/reglages/employes/:id/desactiver", requireCsrf, (req: Request, res: Response) => {
-  runOrRedirectReglagesError(res, "employee_deactivate", () => {
-    setEmployeeActive(Number(req.params.id), false);
-  });
-});
-
-app.post("/reglages/employes/:id/activer", requireCsrf, (req: Request, res: Response) => {
-  runOrRedirectReglagesError(res, "employee_activate", () => {
-    setEmployeeActive(Number(req.params.id), true);
-  });
-});
-
 // ---------- Journal (audit des relances) ----------
 
 app.get("/journal", (_req: Request, res: Response) => {
@@ -809,40 +693,6 @@ app.get("/consommation", (_req: Request, res: Response) => {
   const recent = listRecentAiUsage(50);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderConsommationPage(summary, recent));
-});
-
-// ---------- Performance / KPI (volume par categorie, retard vs SLA, par employe) ----------
-
-type PerformancePeriod = "today" | "7d" | "30d";
-
-const PERFORMANCE_PERIOD_LABELS: Record<PerformancePeriod, string> = {
-  today: "Aujourd'hui",
-  "7d": "7 derniers jours",
-  "30d": "30 derniers jours",
-};
-
-function parsePerformancePeriod(value: string | undefined): PerformancePeriod {
-  return value === "today" || value === "30d" ? value : "7d";
-}
-
-/** Bornes en UTC, comme currentMonthStartIso ci-dessus — la precision au fuseau pres n'est pas critique pour une fenetre de plusieurs jours. */
-function performancePeriodStartIso(period: PerformancePeriod): string {
-  const now = new Date();
-  if (period === "today") {
-    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
-  }
-  const days = period === "30d" ? 30 : 7;
-  return new Date(now.getTime() - days * 24 * 60 * 60_000).toISOString();
-}
-
-app.get("/performance", (req: Request, res: Response) => {
-  const period = parsePerformancePeriod(query(req).period);
-  const sinceIso = performancePeriodStartIso(period);
-  const untilIso = new Date().toISOString();
-  const categoryRows = getCategoryPerformance(sinceIso, untilIso);
-  const employeeRows = getEmployeePerformance(sinceIso, untilIso);
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderPerformancePage(categoryRows, employeeRows, period));
 });
 
 // ---------- Envois sans dossier (suivi manuel) ----------
@@ -982,7 +832,6 @@ type ActivePage =
   | "envois"
   | "carnet"
   | "consommation"
-  | "performance"
   | "ton-de-marque"
   | "confidentialite";
 
@@ -995,7 +844,6 @@ const NAV_ICONS: Record<ActivePage, string> = {
   envois: `<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>`,
   carnet: `<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>`,
   consommation: `<line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>`,
-  performance: `<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>`,
   "ton-de-marque": `<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>`,
   confidentialite: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>`,
 };
@@ -1007,7 +855,6 @@ const NAV_ITEMS: Array<{ key: ActivePage; href: string; label: string }> = [
   { key: "envois", href: "/envois", label: "Envois" },
   { key: "carnet", href: "/carnet", label: "Carnet" },
   { key: "consommation", href: "/consommation", label: "Consommation IA" },
-  { key: "performance", href: "/performance", label: "Performance" },
   { key: "connexion", href: "/connect", label: "Connexion messagerie" },
   { key: "ton-de-marque", href: "/ton-de-marque", label: "Ton de marque" },
   { key: "confidentialite", href: "/confidentialite", label: "Confidentialité" },
@@ -1588,7 +1435,6 @@ function renderDossierDetailPage(
   const isPostReply = isPostReplyStatus(thread.status);
   const phase: RelancePhase = isPostReply ? "post_reply" : "pre_reply";
   const { steps, isCustom } = getEffectiveRelanceSteps(thread.thread_id, thread.category_id, phase);
-  const draftCount = listDraftsForThread(thread.thread_id).length;
   const nextStep = steps[isPostReply ? thread.post_reply_relance_count : thread.relance_count];
   const anchorAt = isPostReply ? thread.human_replied_at : thread.due_at;
   const canTriggerNow =
@@ -1629,7 +1475,6 @@ function renderDossierDetailPage(
             ? `<div class="ledger-fact"><span class="fact-label">Relances (après réponse)</span><span class="fact-value">${thread.post_reply_relance_count}</span></div>`
             : ""
         }
-        <div class="ledger-fact"><span class="fact-label">Brouillons déposés</span><span class="fact-value">${draftCount}</span></div>
       </div>
       <div class="detail-actions">
         ${
@@ -1650,22 +1495,13 @@ function renderDossierDetailPage(
                </form>`
             : ""
         }
-        ${
-          draftCount > 0
-            ? `<form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/nettoyer-brouillons"
-                     onsubmit="return confirm('Supprimer les ${draftCount} brouillon(s) restants de la messagerie ?');">
-                 ${csrfField(csrfToken)}
-                 <button class="btn btn-secondary btn-sm" type="submit">Nettoyer les brouillons</button>
-               </form>`
-            : ""
-        }
         <form method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/supprimer"
-              onsubmit="return confirm('Supprimer definitivement ce dossier ET son historique (rappels, relances, delais) ? Il disparaitra aussi des tableaux de performance. Pour un dossier simplement termine, utilisez plutot « Marquer repondu » ci-dessus, qui garde l\\'historique. Cette action est irreversible.');">
+              onsubmit="return confirm('Supprimer definitivement ce dossier ET son historique (rappels, relances, delais) ? Pour un dossier simplement termine, utilisez plutot « Marquer repondu » ci-dessus, qui garde l\\'historique. Cette action est irreversible.');">
           ${csrfField(csrfToken)}
           <button class="btn btn-ghost btn-sm" type="submit">Supprimer les données (définitif)</button>
         </form>
       </div>
-      <p class="section-hint">« Marquer répondu » clôture le dossier tout en gardant son historique pour les statistiques — c'est l'action à utiliser au quotidien. « Supprimer les données » est réservé aux erreurs (mauvais fil, doublon, test) : le dossier et tout ce qu'il contient disparaissent définitivement, y compris des tableaux de performance.</p>
+      <p class="section-hint">« Marquer répondu » clôture le dossier tout en gardant son historique pour les statistiques — c'est l'action à utiliser au quotidien. « Supprimer les données » est réservé aux erreurs (mauvais fil, doublon, test) : le dossier et tout ce qu'il contient disparaissent définitivement.</p>
     </div>`;
 
   const overrideBanner = isCustom
@@ -1719,33 +1555,13 @@ function renderDossierDetailPage(
       ${addForm}
     </div>`;
 
-  const employees = listEmployees(true);
-  const handledBySection = `
-    <div class="settings-section">
-      <h2>Traité par</h2>
-      <p class="section-hint">Tag manuel — sert uniquement au tableau <a href="/performance">Performance</a> (aucune détection automatique n'est possible depuis la boîte partagée).</p>
-      <form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/traite-par">
-        ${csrfField(csrfToken)}
-        <select name="employeeId">
-          <option value="">— Non assigné —</option>
-          ${employees
-            .map(
-              (e) =>
-                `<option value="${e.id}" ${e.id === thread.handled_by_employee_id ? "selected" : ""}>${escapeHtml(e.name)}${e.active ? "" : " (désactivé)"}</option>`
-            )
-            .join("")}
-        </select>
-        <button class="btn btn-secondary btn-sm" type="submit">Enregistrer</button>
-      </form>
-    </div>`;
-
   const misclassifiedSection =
     thread.status === "skipped"
       ? `<div class="settings-section">
           <div class="banner banner-error" style="margin-bottom: 14px;">
             Classé « sans suite requise » — aucun accusé n'a été envoyé. Si c'est une erreur
             (un vrai message classé par erreur en newsletter/spam/interne), choisissez la bonne
-            catégorie ci-dessous pour envoyer l'accusé et générer les 3 brouillons maintenant.
+            catégorie ci-dessous pour envoyer l'accusé maintenant.
           </div>
           <form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/traiter">
             ${csrfField(csrfToken)}
@@ -1766,7 +1582,7 @@ function renderDossierDetailPage(
     "dossiers",
     "Dossier",
     "Détail du dossier, statut de traitement, et séquence de relance appliquée.",
-    banner + header + misclassifiedSection + handledBySection + stepsSection,
+    banner + header + misclassifiedSection + stepsSection,
     "/dossiers"
   );
 }
@@ -1860,7 +1676,6 @@ function renderCategoryStepsPanel(
 
 function renderReglagesPage(
   categories: CategoryConfig[],
-  employees: Employee[],
   csrfToken: string | undefined,
   saved: string | undefined,
   error: string | undefined,
@@ -1933,33 +1748,6 @@ function renderReglagesPage(
         <input type="number" name="slaMinutes" value="1440" min="0" step="1" title="Délai promis au client dans l'accusé de réception, en minutes (1440 = 24h)" />
         <label class="checkbox-cell"><input type="checkbox" name="acknowledgeAutomatically" checked /> Accusé auto.</label>
         <button class="btn btn-secondary btn-sm" type="submit">+ Nouvelle catégorie</button>
-      </form>
-    </div>
-    <div class="settings-section">
-      <h2>Employés</h2>
-      <p class="section-hint">Roster utilisé pour le tag « Traité par » sur chaque dossier et le tableau <a href="/performance">Performance</a>. Aucune détection automatique n'est possible (toute l'équipe répond depuis la même boîte connectée) — ce tag reste manuel.</p>
-      <div class="step-list">
-        ${
-          employees.length
-            ? employees
-                .map(
-                  (emp) => `<div class="step-item">
-                    <span class="step-delay">${escapeHtml(emp.name)}</span>
-                    ${emp.active ? "" : `<span class="stamp stamp-late">Désactivé</span>`}
-                    <form method="POST" action="/reglages/employes/${emp.id}/${emp.active ? "desactiver" : "activer"}">
-                      ${csrfField(csrfToken)}
-                      <button class="btn btn-ghost btn-sm" type="submit">${emp.active ? "Désactiver" : "Réactiver"}</button>
-                    </form>
-                  </div>`
-                )
-                .join("")
-            : `<div class="step-empty">Aucun employé enregistré pour l'instant.</div>`
-        }
-      </div>
-      <form class="new-category-form" method="POST" action="/reglages/employes">
-        ${csrfField(csrfToken)}
-        <input type="text" name="name" placeholder="Nom de l'employé" required />
-        <button class="btn btn-secondary btn-sm" type="submit">+ Nouvel employé</button>
       </form>
     </div>
     <script>
@@ -2088,7 +1876,6 @@ function renderJournalPage(reminders: ReminderRow[], errors: PipelineErrorRow[])
 const AI_CALL_TYPE_LABELS: Record<string, string> = {
   classification: "Classification de l'email",
   accuse_reception: "Rédaction de l'accusé de réception",
-  brouillons_reponse: "Rédaction des 3 brouillons de réponse",
   relance_pre_reponse: "Rédaction d'une relance (avant notre réponse)",
   relance_post_reponse: "Rédaction d'une relance (après notre réponse)",
   analyse_corpus: "Analyse du corpus de réponses (mode carnet)",
@@ -2176,7 +1963,7 @@ function renderConsommationPage(summary: AiUsageSummary, recent: AiUsageEventRow
     ${metrics}
     <div class="settings-section">
       <h2>Répartition par type d'appel (ce mois-ci)</h2>
-      <p class="section-hint">Chaque email traité déclenche plusieurs appels Claude distincts (classification, accusé, 3 brouillons, puis une relance si nécessaire) — cette répartition montre lesquels pèsent le plus.</p>
+      <p class="section-hint">Chaque email traité déclenche plusieurs appels Claude distincts (classification, accusé, puis une relance si nécessaire) — cette répartition montre lesquels pèsent le plus.</p>
       ${breakdown}
     </div>
     <div class="settings-section">
@@ -2200,103 +1987,9 @@ function renderConsommationPage(summary: AiUsageSummary, recent: AiUsageEventRow
   );
 }
 
-function formatMinutesPlain(minutes: number): string {
-  if (minutes < 60) return `${trimNumber(minutes)} min`;
-  if (minutes < 1440) return `${trimNumber(minutes / 60)} h`;
-  return `${trimNumber(minutes / 1440)} j`;
-}
-
-function renderLateBucketsCell(buckets: LateBuckets): string {
-  const parts: string[] = [];
-  if (buckets.under30) parts.push(`${buckets.under30}×0-30min`);
-  if (buckets.under60) parts.push(`${buckets.under60}×30-60min`);
-  if (buckets.under240) parts.push(`${buckets.under240}×1-4h`);
-  if (buckets.over240) parts.push(`${buckets.over240}×4h+`);
-  return parts.length ? parts.join(", ") : "—";
-}
-
-function renderPerformancePage(
-  categoryRows: CategoryPerformanceRow[],
-  employeeRows: EmployeePerformanceRow[],
-  period: PerformancePeriod
-): string {
-  const periodTabs = `<div class="filter-tabs">
-    ${(Object.keys(PERFORMANCE_PERIOD_LABELS) as PerformancePeriod[])
-      .map(
-        (p) =>
-          `<a href="/performance?period=${p}" class="${p === period ? "active" : ""}">${escapeHtml(PERFORMANCE_PERIOD_LABELS[p])}</a>`
-      )
-      .join("")}
-  </div>`;
-
-  const totalReceived = categoryRows.reduce((sum, r) => sum + r.received, 0);
-  const totalLate = categoryRows.reduce((sum, r) => sum + r.late, 0);
-  const totalEscalations = categoryRows.reduce((sum, r) => sum + r.escalations, 0);
-
-  const summary = `<div class="metric-grid">
-    <div class="metric"><div class="metric-label">Dossiers reçus</div><div class="metric-value">${totalReceived}</div></div>
-    <div class="metric ${totalLate > 0 ? "metric-warn" : ""}"><div class="metric-label">En retard (vs SLA)</div><div class="metric-value">${totalLate}</div></div>
-    <div class="metric"><div class="metric-label">Escalades (rappel interne envoyé)</div><div class="metric-value">${totalEscalations}</div></div>
-  </div>`;
-
-  const categoryTableRows = categoryRows
-    .map(
-      (row) => `<div class="ledger-row">
-        <div class="ledger-main"><span class="subject-static">${escapeHtml(row.categoryLabel)}</span></div>
-        <div class="ledger-facts">
-          <div class="ledger-fact"><span class="fact-label">Reçus</span><span class="fact-value">${row.received}</span></div>
-          <div class="ledger-fact"><span class="fact-label">À l'heure</span><span class="fact-value">${row.onTime}</span></div>
-          <div class="ledger-fact"><span class="fact-label">En retard</span><span class="stamp ${row.late > 0 ? "stamp-late" : ""}">${row.late}</span></div>
-          <div class="ledger-fact"><span class="fact-label">Détail retards</span><span class="fact-value">${renderLateBucketsCell(row.lateBuckets)}</span></div>
-          <div class="ledger-fact"><span class="fact-label">Escalades</span><span class="fact-value">${row.escalations}</span></div>
-          <div class="ledger-fact"><span class="fact-label">Délai moyen de réponse</span><span class="fact-value">${row.avgResponseMinutes !== null ? formatMinutesPlain(row.avgResponseMinutes) : "—"}</span></div>
-        </div>
-      </div>`
-    )
-    .join("");
-  const categoryTable = categoryRows.length
-    ? `<div class="ledger"><div class="ledger-head"><span>Catégorie</span></div>${categoryTableRows}</div>`
-    : `<div class="ledger"><div class="empty">Aucun dossier reçu sur cette période.</div></div>`;
-
-  const employeeTableRows = employeeRows
-    .map(
-      (row) => `<div class="ledger-row">
-        <div class="ledger-main"><span class="subject-static">${escapeHtml(row.employeeName)}</span></div>
-        <div class="ledger-facts">
-          <div class="ledger-fact"><span class="fact-label">Traités</span><span class="fact-value">${row.handled}</span></div>
-          <div class="ledger-fact"><span class="fact-label">À l'heure</span><span class="fact-value">${row.onTime}</span></div>
-          <div class="ledger-fact"><span class="fact-label">En retard</span><span class="stamp ${row.late > 0 ? "stamp-late" : ""}">${row.late}</span></div>
-          <div class="ledger-fact"><span class="fact-label">Détail retards</span><span class="fact-value">${renderLateBucketsCell(row.lateBuckets)}</span></div>
-          <div class="ledger-fact"><span class="fact-label">Délai moyen de réponse</span><span class="fact-value">${row.avgResponseMinutes !== null ? formatMinutesPlain(row.avgResponseMinutes) : "—"}</span></div>
-        </div>
-      </div>`
-    )
-    .join("");
-  const employeeTable = employeeRows.length
-    ? `<div class="ledger"><div class="ledger-head"><span>Employé</span></div>${employeeTableRows}</div>`
-    : `<div class="ledger"><div class="empty">Aucun dossier tagué « Traité par » sur cette période — ajoutez des employés depuis Réglages, puis taguez un dossier depuis sa page de détail.</div></div>`;
-
-  const body = `
-    ${periodTabs}
-    ${summary}
-    <div class="settings-section">
-      <h2>Par catégorie</h2>
-      <p class="section-hint">« En retard » se compte contre l'échéance SLA de la catégorie, jamais contre le délai de réponse brut. « Escalades » = dossiers ayant nécessité au moins un vrai rappel interne avant réponse — un signe qu'un dossier a été oublié plutôt que traité dans les temps.</p>
-      ${categoryTable}
-    </div>
-    <div class="settings-section">
-      <h2>Par employé</h2>
-      <p class="section-hint">Basé uniquement sur le tag manuel « Traité par » (page de détail d'un dossier) — aucune détection automatique n'est possible depuis la boîte partagée.</p>
-      ${employeeTable}
-    </div>`;
-
-  return pageShell("performance", "Performance", "Volume traité, respect des délais SLA, et charge par employé.", body);
-}
-
 const PIPELINE_ERROR_CONTEXT_LABELS: Record<string, string> = {
   process_incoming: "Traitement d'un email entrant",
   relance_check: "Vérification des relances",
-  draft_cleanup: "Nettoyage des brouillons",
   manual_override: "Traitement manuel d'un dossier",
   discover_outbound: "Détection d'un envoi sans dossier",
   web_request: "Action dans l'application",
