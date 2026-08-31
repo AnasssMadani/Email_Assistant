@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { config } from "../config.js";
+import { config, isProductionLike } from "../config.js";
 import { decryptJson, encryptJson, looksEncrypted } from "../crypto.js";
 
 let warnedPlaintextTokens = false;
@@ -60,10 +60,23 @@ export function saveGraphToken(tokens: GraphTokenSet): void {
   mkdirSync(path.dirname(tokenPath()), { recursive: true });
   if (config.encryptionKey) {
     writeFileSync(tokenPath(), encryptJson(tokens, config.encryptionKey), "utf-8");
-  } else {
-    warnPlaintextTokensOnce();
-    writeFileSync(tokenPath(), JSON.stringify(tokens, null, 2), "utf-8");
+    return;
   }
+  // Fail-closed (SEC-002): meme raisonnement que gmailAuth.ts saveToken — un
+  // refresh_token Microsoft donne acces complet (lecture + envoi) a la boite
+  // du client. Cette fonction est appelee depuis exchangeCodeForGraphToken
+  // (connexion initiale, deja dans un contexte try/catch cote route HTTP) et
+  // depuis getValidGraphAccessToken (rafraichissement), lui-meme toujours
+  // invoque via un appel connecteur enveloppe par tagSource — l'exception
+  // remonte proprement en pipeline_errors, sans crasher le process.
+  if (isProductionLike()) {
+    throw new Error(
+      "ENCRYPTION_KEY obligatoire pour stocker un jeton OAuth Microsoft en production. " +
+        "Generez-la avec: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+    );
+  }
+  warnPlaintextTokensOnce();
+  writeFileSync(tokenPath(), JSON.stringify(tokens, null, 2), "utf-8");
 }
 
 export function loadGraphToken(): GraphTokenSet | null {

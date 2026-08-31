@@ -14,6 +14,7 @@ const {
   listCategoriesWithCorpus,
   listHumanReplyCorpusByCategory,
   listShadowLogEntries,
+  purgeShadowLogOlderThan,
   recordAckDraft,
   recordClassification,
   recordHumanReplyCorpus,
@@ -60,6 +61,32 @@ test("the 6 business categories always alert the team (min urgency 'low') with a
     assert.equal(steps[0].channel, "internal");
     assert.equal(steps[0].delayMinutes, 30);
   }
+});
+
+test("SEC-003: purgeShadowLogOlderThan removes rows past retention but not recent ones", () => {
+  recordClassification({
+    threadId: "t-purge",
+    messageId: "m-purge",
+    categoryId: "devis",
+    urgency: "normal",
+    originalSubject: "A purger un jour",
+    senderEmail: "purge@example.com",
+    senderName: null,
+    receivedBody: "Corps du message a purger.",
+  });
+  const beforeIds = listShadowLogEntries().map((e) => e.threadId);
+  assert.ok(beforeIds.includes("t-purge"));
+
+  // Fenetre de 90 jours: cette entree, creee a l'instant, ne doit pas etre purgee.
+  const deletedTooEarly = purgeShadowLogOlderThan(90);
+  assert.equal(deletedTooEarly, 0);
+  assert.ok(listShadowLogEntries().map((e) => e.threadId).includes("t-purge"));
+
+  // Fenetre de 0 jour: le seuil (maintenant) est posterieur au created_at de
+  // l'entree, elle doit donc bien passer a la purge.
+  const deletedNow = purgeShadowLogOlderThan(0);
+  assert.ok(deletedNow >= 1);
+  assert.ok(!listShadowLogEntries().map((e) => e.threadId).includes("t-purge"));
 });
 
 test("recordClassification alone shows up with ackDrafted=false (no accusé judged necessary)", () => {

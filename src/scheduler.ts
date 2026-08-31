@@ -5,7 +5,7 @@ import { discoverOutboundOnlyThreads } from "./pipeline/discoverOutbound.js";
 import { processIncomingMessage } from "./pipeline/processIncoming.js";
 import { runRelanceCheck } from "./pipeline/relanceCheck.js";
 import { runCorpusAnalysis } from "./pipeline/corpusAnalysis.js";
-import { recordPipelineError } from "./db.js";
+import { purgeShadowLogOlderThan, recordPipelineError } from "./db.js";
 
 // Un traitement d'email (classification + accuse + 3 brouillons, plusieurs
 // appels Claude) peut prendre plus de temps que l'intervalle de scrutation.
@@ -86,6 +86,24 @@ async function runDailyCorpusAnalysis(): Promise<void> {
   }
 }
 
+/**
+ * Purge shadow_log (corps complet des emails, voir db.ts) au-dela de
+ * config.shadowLogRetentionDays — condition pour que la page
+ * /confidentialite dise vrai (voir SEC-003 de l'audit securite). Desactivee
+ * si shadowLogRetentionDays <= 0.
+ */
+function runShadowLogPurge(): void {
+  if (config.shadowLogRetentionDays <= 0) return;
+  try {
+    const deleted = purgeShadowLogOlderThan(config.shadowLogRetentionDays);
+    if (deleted > 0) {
+      console.log(`[purge carnet] ${deleted} entree(s) shadow_log de plus de ${config.shadowLogRetentionDays}j supprimee(s).`);
+    }
+  } catch (err) {
+    console.error("[purge carnet] erreur:", err);
+  }
+}
+
 export function startScheduler(): void {
   console.log(`Connecteur actif au demarrage: ${createEmailConnector().name}`);
   console.log(`Scrutation boite: ${config.pollIntervalCron}`);
@@ -103,4 +121,5 @@ export function startScheduler(): void {
   // maintenant" de /carnet couvre le besoin de la lancer avant l'horaire
   // planifie.
   cron.schedule(config.dailyAnalysisCron, () => void runDailyCorpusAnalysis());
+  cron.schedule(config.dailyAnalysisCron, runShadowLogPurge);
 }

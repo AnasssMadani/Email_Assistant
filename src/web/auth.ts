@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { config } from "../config.js";
+import { config, isProductionLike } from "../config.js";
 
 const SESSION_COOKIE = "sess";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -196,9 +196,30 @@ function warnClientAuthDisabledOnce(): void {
   );
 }
 
+/**
+ * Fail-closed: hors localhost (NODE_ENV=production, voir isProductionLike),
+ * une configuration d'auth manquante ne doit jamais se traduire par un
+ * next() qui laisse passer tout le monde — seulement un console.warn que
+ * personne ne lit en production. On bloque la route (503) plutot que de
+ * l'ouvrir. En local/CI (NODE_ENV non "production"), le comportement
+ * precedent (ouvert + avertissement) est conserve pour ne pas gener le
+ * developpement sans identifiants configures.
+ */
+function denyMisconfigured(res: Response): void {
+  res
+    .status(503)
+    .send(
+      "Configuration de securite incomplete (identifiants manquants). Acces refuse par securite — contactez l'administrateur."
+    );
+}
+
 /** Espace admin uniquement — un client authentifie sous le role "client" est refuse, meme s'il devine l'URL. */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (!authConfigured()) {
+    if (isProductionLike()) {
+      denyMisconfigured(res);
+      return;
+    }
     warnAuthDisabledOnce();
     next();
     return;
@@ -223,6 +244,10 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
  */
 export function requireClientAuth(req: Request, res: Response, next: NextFunction): void {
   if (!clientAuthConfigured()) {
+    if (isProductionLike()) {
+      denyMisconfigured(res);
+      return;
+    }
     warnClientAuthDisabledOnce();
     next();
     return;
@@ -237,8 +262,19 @@ export function requireClientAuth(req: Request, res: Response, next: NextFunctio
   next();
 }
 
+/**
+ * Decouple de authConfigured() seul (SEC-007): cette garde protege AUSSI les
+ * routes du dashboard CLIENT (clientRouter s'en sert egalement). Ne
+ * court-circuiter que si NI l'admin NI le client ne sont configures — sinon
+ * un deploiement avec admin non configure mais client configure se
+ * retrouvait avec des mutations client sans aucune protection CSRF.
+ */
 export function requireCsrf(req: Request, res: Response, next: NextFunction): void {
-  if (!authConfigured()) {
+  if (!authConfigured() && !clientAuthConfigured()) {
+    if (isProductionLike()) {
+      denyMisconfigured(res);
+      return;
+    }
     next();
     return;
   }

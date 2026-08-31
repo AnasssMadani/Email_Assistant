@@ -75,6 +75,28 @@ test("a self-addressed internal rappel is never treated as a new client email, e
   assert.equal(isMessageProcessed(message.id), true);
 });
 
+test("a genuine third-party email whose subject starts with our exact [Rappel] prefix is still processed (BUG-003)", async () => {
+  // Regression: the guard used to match on subject prefix alone, so any
+  // sender (client, partner) sending an email starting with "[Rappel]" (an
+  // ordinary invoice-reminder wording) was silently swallowed and never
+  // acknowledged. The filter must only fire for our own self-addressed echo.
+  let getThreadCalls = 0;
+  const connector = fakeConnector(async () => {
+    getThreadCalls++;
+    return { id: "thread-third-party-rappel", messages: [] };
+  });
+
+  const message = fakeIncomingMessage({
+    id: "msg-third-party-1",
+    threadId: "thread-third-party-rappel",
+    from: { email: "client@example.com" },
+    subject: "[Rappel] Facture 2024-0012 impayée",
+  });
+
+  await assert.rejects(() => processIncomingMessage(connector, message));
+  assert.equal(getThreadCalls, 1);
+});
+
 test("a real client email with 'rappel' elsewhere in the subject is not affected (only our exact [Rappel] prefix is filtered)", async () => {
   let getThreadCalls = 0;
   const connector = fakeConnector(async () => {

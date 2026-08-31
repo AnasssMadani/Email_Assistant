@@ -88,6 +88,7 @@ async function registerIfNewThread(connector: EmailConnector, message: EmailMess
     slaMinutes: category.slaMinutes,
     status: "awaiting_client_reply",
     dueAt: null,
+    origin: "outbound",
   });
   setThreadHumanReplied(message.threadId, sentAt, message.hasAttachments);
   console.log(`[envoi suivi] ${recipient.email} — "${message.subject}" (categorie: ${category.id})`);

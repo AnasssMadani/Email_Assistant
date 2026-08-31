@@ -1,6 +1,8 @@
 import { google, type gmail_v1 } from "googleapis";
 import { getAuthorizedClient } from "./gmailAuth.js";
 import { extractPlainText, getHeader, hasAttachmentParts, parseAddress, buildRawMimeMessage } from "./mime.js";
+import { isMessageProcessed } from "../db.js";
+import { withBackoff } from "./backoff.js";
 import type {
   EmailConnector,
   EmailMessage,
@@ -32,7 +34,7 @@ export class GmailConnector implements EmailConnector {
   async getOwnEmailAddress(): Promise<string> {
     if (this.ownEmailCache) return this.ownEmailCache;
     const gmail = await this.getGmail();
-    const profile = await gmail.users.getProfile({ userId: "me" });
+    const profile = await withBackoff(() => gmail.users.getProfile({ userId: "me" }));
     this.ownEmailCache = profile.data.emailAddress ?? "";
     return this.ownEmailCache;
   }
@@ -65,23 +67,39 @@ export class GmailConnector implements EmailConnector {
     };
   }
 
+  /**
+   * En regime permanent, la quasi-totalite des 25 ids les plus recents ont
+   * deja ete traites lors d'un cycle precedent (le cycle tourne toutes les
+   * ~2 min) — sans ce filtre, chaque cycle re-telechargeait le corps complet
+   * des 25 messages (26 appels Gmail: 1 list + 25 get), meme deja traites,
+   * avant que la dedup (isMessageProcessed) n'intervienne plus loin dans le
+   * pipeline (OPT-001). Filtrer ici ramene le cout a ~1-2 appels/cycle des
+   * qu'il n'y a rien de nouveau. Sans danger pour le retry: un message dont
+   * le traitement a echoue reste !isMessageProcessed (marque en fin de
+   * pipeline, jamais avant) et sera donc retelecharge au prochain cycle,
+   * exactement comme avant ce changement.
+   */
   private async listByLabel(label: "INBOX" | "SENT", maxResults: number): Promise<EmailMessage[]> {
     const gmail = await this.getGmail();
     const ownEmail = await this.getOwnEmailAddress();
-    const list = await gmail.users.messages.list({
-      userId: "me",
-      labelIds: [label],
-      maxResults,
-    });
+    const list = await withBackoff(() =>
+      gmail.users.messages.list({
+        userId: "me",
+        labelIds: [label],
+        maxResults,
+      })
+    );
 
-    const ids = list.data.messages ?? [];
-    const messages: EmailMessage[] = [];
-    for (const { id } of ids) {
-      if (!id) continue;
-      const full = await gmail.users.messages.get({ userId: "me", id, format: "full" });
-      messages.push(this.toEmailMessage(full.data, ownEmail));
-    }
-    return messages.sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
+    const ids = (list.data.messages ?? [])
+      .map((m) => m.id)
+      .filter((id): id is string => !!id && !isMessageProcessed(id));
+
+    const fulls = await Promise.all(
+      ids.map((id) => withBackoff(() => gmail.users.messages.get({ userId: "me", id, format: "full" })))
+    );
+    return fulls
+      .map((full) => this.toEmailMessage(full.data, ownEmail))
+      .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
   }
 
   async listRecentInboxMessages(maxResults = 25): Promise<EmailMessage[]> {
@@ -95,7 +113,7 @@ export class GmailConnector implements EmailConnector {
   async getThread(threadId: string): Promise<EmailThread> {
     const gmail = await this.getGmail();
     const ownEmail = await this.getOwnEmailAddress();
-    const thread = await gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
+    const thread = await withBackoff(() => gmail.users.threads.get({ userId: "me", id: threadId, format: "full" }));
     const messages = (thread.data.messages ?? [])
       // threads.get() renvoie AUSSI les brouillons associes au fil (label
       // DRAFT) — nos 3 propositions de reponse en sont justement un exemple.

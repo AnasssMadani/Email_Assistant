@@ -1,4 +1,5 @@
 import { getValidGraphAccessToken } from "./graphAuth.js";
+import { withBackoff } from "./backoff.js";
 import type {
   EmailConnector,
   EmailMessage,
@@ -27,7 +28,13 @@ interface GraphMessage {
   isDraft?: boolean;
 }
 
-async function graphFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+class GraphHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+async function graphFetchOnce<T>(path: string, init: RequestInit): Promise<T> {
   const token = await getValidGraphAccessToken();
   const res = await fetch(`${GRAPH_BASE}${path}`, {
     ...init,
@@ -39,12 +46,23 @@ async function graphFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
     },
   });
   if (!res.ok) {
-    throw new Error(`Microsoft Graph ${path} -> ${res.status}: ${await res.text()}`);
+    throw new GraphHttpError(`Microsoft Graph ${path} -> ${res.status}: ${await res.text()}`, res.status);
   }
   if (res.status === 202 || res.status === 204) {
     return undefined as T;
   }
   return (await res.json()) as T;
+}
+
+/**
+ * Le backoff (OPT-008) n'est applique qu'aux LECTURES (GET, la valeur par
+ * defaut de RequestInit.method) — jamais a un POST/PATCH/DELETE (envoi,
+ * creation/suppression de brouillon, marquage lu/non lu), ou un timeout
+ * ambigu retente pourrait dupliquer une action deja effectuee cote serveur.
+ */
+async function graphFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const isRead = !init.method || init.method === "GET";
+  return isRead ? withBackoff(() => graphFetchOnce<T>(path, init)) : graphFetchOnce<T>(path, init);
 }
 
 function escapeODataString(value: string): string {

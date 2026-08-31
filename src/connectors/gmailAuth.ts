@@ -1,7 +1,7 @@
 import { OAuth2Client } from "google-auth-library";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { config } from "../config.js";
+import { config, isProductionLike } from "../config.js";
 import { decryptJson, encryptJson, looksEncrypted } from "../crypto.js";
 
 let warnedPlaintextTokens = false;
@@ -55,10 +55,21 @@ export function saveToken(tokens: unknown): void {
   mkdirSync(path.dirname(tokenPath), { recursive: true });
   if (config.encryptionKey) {
     writeFileSync(tokenPath, encryptJson(tokens, config.encryptionKey), "utf-8");
-  } else {
-    warnPlaintextTokensOnce();
-    writeFileSync(tokenPath, JSON.stringify(tokens, null, 2), "utf-8");
+    return;
   }
+  // Fail-closed (SEC-002): un jeton Gmail donne acces en LECTURE ET ENVOI a
+  // la boite du client — jamais l'ecrire en clair sur le disque d'un
+  // deploiement reellement expose. En local/CI (NODE_ENV != "production"),
+  // le comportement historique (ecriture en clair + avertissement) reste
+  // pour ne pas bloquer le developpement sans ENCRYPTION_KEY generee.
+  if (isProductionLike()) {
+    throw new Error(
+      "ENCRYPTION_KEY obligatoire pour stocker un jeton OAuth Gmail en production. " +
+        "Generez-la avec: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+    );
+  }
+  warnPlaintextTokensOnce();
+  writeFileSync(tokenPath, JSON.stringify(tokens, null, 2), "utf-8");
 }
 
 function readToken(tokenPath: string): Record<string, unknown> {
@@ -82,7 +93,18 @@ export async function getAuthorizedClient(): Promise<OAuth2Client> {
   client.setCredentials(tokens);
 
   client.on("tokens", (newTokens) => {
-    saveToken({ ...tokens, ...newTokens });
+    // Best-effort: ce listener tourne en dehors de toute chaine de promesses
+    // suivie par un appelant (google-auth-library l'emet en interne lors
+    // d'un rafraichissement automatique) — une exception non rattrapee ici
+    // remonterait comme une erreur non geree et pourrait interrompre tout le
+    // process. Si l'ecriture echoue (ex: ENCRYPTION_KEY absente en
+    // production, voir saveToken), le jeton rafraichi reste valide en
+    // memoire pour ce process; seul le prochain redemarrage en patira.
+    try {
+      saveToken({ ...tokens, ...newTokens });
+    } catch (err) {
+      console.error("[gmailAuth] echec de sauvegarde du jeton rafraichi:", (err as Error).message);
+    }
   });
 
   return client;
