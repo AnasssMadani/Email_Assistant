@@ -118,6 +118,8 @@ export type ThreadStatus =
   | "ack_sent"
   | "drafts_ready"
   | "responded"
+  /** La classification ou la redaction de l'accuse a echoue (ex: solde de jetons Claude epuise, panne API) — le dossier reste visible dans le registre au lieu de disparaitre silencieusement, avec un bouton "Réessayer" sur sa page de detail. */
+  | "ai_error"
   /** Relance PRE-reponse envoyee (personne chez nous n'a encore repondu de fond). Distinct de post_reply_relance_sent: les deux phases ne doivent jamais partager la meme valeur de statut, sinon l'UI ne peut plus savoir laquelle des deux sequences afficher. */
   | "relance_sent"
   /** Un humain a envoye une reponse de fond (ex: le devis) — on attend maintenant la reponse DU CLIENT a ce message, aucune relance post-reponse envoyee pour l'instant. */

@@ -11,8 +11,10 @@ import {
   upsertThreadReceived,
   recordAckDraft,
   recordClassification,
-  setThreadAckSent,
+  recordPipelineError,
   recordReminder,
+  setThreadAckSent,
+  setThreadStatus,
 } from "../db.js";
 import type { CategoryConfig, EmailConnector, EmailMessage, EmailThread } from "../types.js";
 
@@ -42,7 +44,39 @@ export async function processIncomingMessage(
   }
 
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(message.threadId));
-  const classification = await classifyEmail(thread, message);
+
+  let classification: Awaited<ReturnType<typeof classifyEmail>>;
+  try {
+    classification = await classifyEmail(thread, message);
+  } catch (err) {
+    // La classification a echoue (ex: solde de jetons Claude epuise, panne
+    // API) — plutot que de laisser ce message invisible et retente
+    // indefiniment en silence (isMessageProcessed reste faux tant qu'on
+    // n'appelle pas markMessageProcessed), on cree quand meme un dossier
+    // visible dans le registre, avec le message d'erreur reel en clair sur
+    // sa page de detail. Categorie "autre" a titre provisoire: des que la
+    // classification reussira (prochain cycle, message non marque traite),
+    // upsertThreadReceived la remplacera par la vraie categorie.
+    await recordPipelineError("process_incoming", message.threadId, (err as Error).message);
+    await upsertThreadReceived({
+      threadId: message.threadId,
+      subject: message.subject,
+      senderEmail: message.from.email,
+      senderName: message.from.name ?? null,
+      categoryId: "autre",
+      urgency: "normal",
+      slaMinutes: 0,
+      status: "ai_error",
+      dueAt: null,
+    });
+    await recordReminder(
+      message.threadId,
+      "internal",
+      `[Erreur IA] La classification de cet email a échoué : ${(err as Error).message}`
+    );
+    return;
+  }
+
   const category = await getCategory(classification.categoryId);
 
   if (category.id === "spam_newsletter") {
@@ -97,7 +131,24 @@ export async function processIncomingMessage(
     return;
   }
 
-  await sendAcknowledgement(connector, thread, message, category);
+  try {
+    await sendAcknowledgement(connector, thread, message, category);
+  } catch (err) {
+    // La classification a deja reussi (message marque traite ci-dessus, pas
+    // de reessai automatique au prochain cycle) — mais la redaction ou
+    // l'envoi de l'accuse a echoue (ex: solde de jetons Claude epuise entre
+    // temps). Rendre le dossier visible avec l'erreur, plutot qu'un dossier
+    // bloque a "received" sans aucune explication ni action possible: voir
+    // le bouton "Réessayer l'accusé" sur sa page de detail (web/server.ts).
+    console.error(`[accusé] erreur sur le dossier ${message.threadId}:`, err);
+    await recordPipelineError("process_incoming", message.threadId, (err as Error).message);
+    await setThreadStatus(message.threadId, "ai_error");
+    await recordReminder(
+      message.threadId,
+      "internal",
+      `[Erreur IA] La rédaction/l'envoi de l'accusé a échoué : ${(err as Error).message}`
+    );
+  }
 }
 
 /**

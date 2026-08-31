@@ -42,6 +42,7 @@ import {
   listShadowLogEntries,
   markMessageProcessed,
   recordPipelineError,
+  recordReminder,
   revokeConnectInvite,
   setBrandVoice,
   setShadowLogReviewed,
@@ -579,6 +580,17 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
     } catch (err) {
       console.error(`[traitement manuel] erreur sur le dossier ${threadId}:`, err);
       await recordPipelineError("manual_override", threadId, (err as Error).message);
+      // Le nouvel essai a echoue a nouveau (ex: solde de jetons toujours
+      // epuise) — remet le dossier en erreur visible plutot que de le
+      // laisser bloque a "received" sans bouton pour reessayer une seconde
+      // fois (voir misclassifiedSection ci-dessous, qui ne s'affiche que
+      // pour skipped/ai_error).
+      await setThreadStatus(threadId, "ai_error");
+      await recordReminder(
+        threadId,
+        "internal",
+        `[Erreur IA] Nouvel essai échoué : ${(err as Error).message}`
+      );
     }
   }
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
@@ -1385,6 +1397,7 @@ const STATUS_LABELS: Record<string, { label: string; stampClass: string }> = {
   awaiting_client_reply: { label: "En attente du client", stampClass: "stamp-internal" },
   post_reply_relance_sent: { label: "Client relancé (suivi)", stampClass: "stamp-internal" },
   closed: { label: "Clôturé", stampClass: "stamp-done" },
+  ai_error: { label: "Erreur IA — à réessayer", stampClass: "stamp-late" },
 };
 
 const URGENCY_LABELS: Record<string, { label: string; stampClass: string; hint: string }> = {
@@ -1603,12 +1616,16 @@ async function renderDossierDetailPage(
     </div>`;
 
   const misclassifiedSection =
-    thread.status === "skipped"
+    thread.status === "skipped" || thread.status === "ai_error"
       ? `<div class="settings-section">
           <div class="banner banner-error" style="margin-bottom: 14px;">
-            Classé « sans suite requise » — aucun accusé n'a été envoyé. Si c'est une erreur
+            ${
+              thread.status === "ai_error"
+                ? `L'IA n'a pas pu traiter cet email (voir le détail de l'erreur ci-dessous, dans « Rappels &amp; relances ») — souvent un solde de jetons Claude épuisé ou une panne passagère. Choisissez la catégorie ci-dessous pour réessayer maintenant.`
+                : `Classé « sans suite requise » — aucun accusé n'a été envoyé. Si c'est une erreur
             (un vrai message classé par erreur en newsletter/spam/interne), choisissez la bonne
-            catégorie ci-dessous pour envoyer l'accusé maintenant.
+            catégorie ci-dessous pour envoyer l'accusé maintenant.`
+            }
           </div>
           <form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(thread.thread_id)}/traiter">
             ${csrfField(csrfToken)}
@@ -1620,7 +1637,7 @@ async function renderDossierDetailPage(
                 )
                 .join("")}
             </select>
-            <button class="btn btn-primary btn-sm" type="submit">Traiter ce dossier</button>
+            <button class="btn btn-primary btn-sm" type="submit">${thread.status === "ai_error" ? "Réessayer" : "Traiter ce dossier"}</button>
           </form>
         </div>`
       : "";

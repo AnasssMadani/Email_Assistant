@@ -83,7 +83,11 @@ test("a genuine third-party email whose subject starts with our exact [Rappel] p
     subject: "[Rappel] Facture 2024-0012 impayée",
   });
 
-  await assert.rejects(() => processIncomingMessage(connector, message));
+  // La classification echoue sans ANTHROPIC_API_KEY dans cet environnement
+  // de test — processIncomingMessage rattrape desormais cette erreur au lieu
+  // de la laisser remonter (voir "un dossier ai_error visible" ci-dessous),
+  // donc l'appel resout normalement plutot que de rejeter.
+  await processIncomingMessage(connector, message);
   assert.equal(getThreadCalls, 1);
 });
 
@@ -104,6 +108,25 @@ test("a real client email with 'rappel' elsewhere in the subject is not affected
   // La classification echoue sans ANTHROPIC_API_KEY dans cet environnement de
   // test — le signal utile ici est que le garde-fou NE bloque PAS ce message
   // avant meme d'atteindre la lecture du fil (getThread est bien appele).
-  await assert.rejects(() => processIncomingMessage(connector, message));
+  await processIncomingMessage(connector, message);
   assert.equal(getThreadCalls, 1);
+});
+
+test("a classification failure creates a visible ai_error dossier instead of vanishing silently", async () => {
+  const connector = fakeConnector(async () => ({ id: "thread-ai-error", messages: [] }));
+  const message = fakeIncomingMessage({
+    id: "msg-ai-error-1",
+    threadId: "thread-ai-error",
+    from: { email: "client@example.com" },
+    subject: "Demande de devis",
+  });
+
+  await processIncomingMessage(connector, message);
+
+  const row = await getThreadRow("thread-ai-error");
+  assert.equal(row?.status, "ai_error");
+  assert.equal(row?.subject, "Demande de devis");
+  // Pas marque traite: un email en erreur doit etre retente au prochain
+  // cycle de scrutation, pas abandonne definitivement.
+  assert.equal(await isMessageProcessed(message.id), false);
 });

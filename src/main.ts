@@ -1,3 +1,4 @@
+import "./crashSafety.js";
 import "./web/server.js";
 import { startScheduler } from "./scheduler.js";
 
