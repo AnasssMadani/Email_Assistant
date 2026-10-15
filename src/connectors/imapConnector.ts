@@ -32,6 +32,8 @@ export interface ImapSmtpSettings {
     password: string;
     /** Adresse partagee surveillee, si differente de user (mode boite copie). Vide = smtp.fromAddress puis user. */
     mailboxAddress?: string;
+    /** Domaines dont tout expediteur compte comme "nous". Vide = domaine de mailboxAddress s'il est renseigne. */
+    ownDomains?: string[];
     inboxFolder: string;
     sentFolder: string;
     threadLookbackDays: number;
@@ -116,6 +118,22 @@ export class ImapSmtpConnector implements EmailConnector {
    */
   async getOwnEmailAddress(): Promise<string> {
     return (this.settings.imap.mailboxAddress || this.settings.smtp.fromAddress || this.settings.imap.user).trim();
+  }
+
+  /**
+   * Expediteur "de chez nous": l'adresse partagee elle-meme, ou une adresse
+   * d'un de nos domaines (l'equipe repond depuis prenom@domaine, copie en Cci
+   * dans la boite surveillee). Hors mode boite copie sans IMAP_OWN_DOMAINS,
+   * seule l'adresse exacte compte, comme avant.
+   */
+  private isOwnSender(email: string | undefined, ownEmail: string): boolean {
+    if (!email) return false;
+    const sender = email.toLowerCase();
+    if (sender === ownEmail.toLowerCase()) return true;
+    const explicit = this.settings.imap.ownDomains ?? [];
+    const domains = explicit.length > 0 ? explicit : this.settings.imap.mailboxAddress ? [ownEmail.split("@")[1]?.toLowerCase() ?? ""] : [];
+    const senderDomain = sender.split("@")[1];
+    return !!senderDomain && domains.filter(Boolean).includes(senderDomain);
   }
 
   // ---------- Session IMAP (une connexion, operations serialisees) ----------
@@ -253,7 +271,7 @@ export class ImapSmtpConnector implements EmailConnector {
       subject: parsed.subject ?? "(sans objet)",
       bodyText,
       receivedAt: parsed.date ?? (msg.internalDate ? new Date(msg.internalDate) : new Date()),
-      isFromUs: !!from.email && from.email.toLowerCase() === ownEmail.toLowerCase(),
+      isFromUs: this.isOwnSender(from.email, ownEmail),
       hasAttachments: hasAttachmentNode(msg.bodyStructure),
     };
     const chain = [...parseReferences(parsed.references), normalizeMessageId(parsed.inReplyTo), rfcMessageId].filter(

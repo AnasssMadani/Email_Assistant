@@ -66,6 +66,15 @@ export const config = {
     // partagee (ex: contact@domaine) pour reconnaitre les reponses de
     // l'equipe (recues en Cci). Vide = SMTP_FROM, puis IMAP_USER.
     mailboxAddress: process.env.IMAP_MAILBOX_ADDRESS ?? "",
+    // Domaines dont tout expediteur est "de chez nous" (separes par des
+    // virgules). Les reponses de l'equipe partent souvent d'adresses
+    // personnelles (prenom@domaine) et non de l'adresse partagee: sans cela,
+    // leur copie en Cci serait prise pour un email client. Vide = domaine de
+    // IMAP_MAILBOX_ADDRESS (mode boite copie uniquement).
+    ownDomains: (process.env.IMAP_OWN_DOMAINS ?? "")
+      .split(",")
+      .map((d) => d.trim().toLowerCase().replace(/^@/, ""))
+      .filter(Boolean),
     inboxFolder: process.env.IMAP_INBOX_FOLDER ?? "INBOX",
     // Vide = detection automatique via LIST (attribut special-use \Sent),
     // avec repli sur les noms usuels cPanel/Dovecot ("INBOX.Sent", "Sent").

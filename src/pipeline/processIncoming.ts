@@ -5,9 +5,11 @@ import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
 import { buildReplySubject, isInternalNotificationSubject } from "../utils.js";
 import { tagSource } from "./errorTag.js";
+import { stripQuotedHistory } from "./emailText.js";
 import {
   incrementAutomatedOutboundCount,
   isMessageProcessed,
+  isRfcMessageProcessed,
   markMessageProcessed,
   upsertThreadReceived,
   recordAckDraft,
@@ -27,6 +29,15 @@ export async function processIncomingMessage(
   if (message.isFromUs) return;
   if (await isMessageProcessed(message.id)) return;
 
+  // Meme email recu en plusieurs exemplaires (envoye a info@ ET import@ ET
+  // finance@, tous redirigees vers la boite copie): un seul est traite, sinon
+  // le client recevrait autant d'accuses que d'adresses en destinataire.
+  if (message.rfcMessageId && (await isRfcMessageProcessed(message.rfcMessageId))) {
+    await markMessageProcessed(message.id, message.threadId, message.rfcMessageId);
+    console.log(`[doublon] "${message.subject}" — exemplaire deja traite (meme Message-ID), ignore.`);
+    return;
+  }
+
   // Nos propres rappels internes (sendInternalNotification, relanceCheck.ts)
   // portent toujours ce prefixe exact. Quand NOTIFICATION_EMAIL n'est pas
   // definie, ce rappel part vers la messagerie connectee elle-meme — et sur
@@ -42,7 +53,7 @@ export async function processIncomingMessage(
   // Meme regle pour le rapport du matin ("[Rapport]", voir morningReport.ts).
   const ownEmail = isInternalNotificationSubject(message.subject) ? await connector.getOwnEmailAddress() : undefined;
   if (ownEmail && message.from.email.toLowerCase() === ownEmail.toLowerCase()) {
-    await markMessageProcessed(message.id, message.threadId);
+    await markMessageProcessed(message.id, message.threadId, message.rfcMessageId);
     return;
   }
 
@@ -99,7 +110,7 @@ export async function processIncomingMessage(
     // — son volume noierait les vrais dossiers dans les deux registres pour
     // un interet de revue quasi nul. Le ghosting (aucun accuse) etait deja le
     // bon comportement ; seule la journalisation change ici.
-    await markMessageProcessed(message.id, message.threadId);
+    await markMessageProcessed(message.id, message.threadId, message.rfcMessageId);
     console.log(`[skip] "${message.subject}" (spam_newsletter) — ignore, non journalise.`);
     return;
   }
@@ -124,7 +135,7 @@ export async function processIncomingMessage(
     originalSubject: message.subject,
     senderEmail: message.from.email,
     senderName: message.from.name ?? null,
-    receivedBody: message.bodyText,
+    receivedBody: stripQuotedHistory(message.bodyText),
   });
 
   await upsertThreadReceived({
@@ -138,7 +149,7 @@ export async function processIncomingMessage(
     status: shouldAcknowledge ? "received" : "skipped",
     dueAt,
   });
-  await markMessageProcessed(message.id, message.threadId);
+  await markMessageProcessed(message.id, message.threadId, message.rfcMessageId);
 
   if (classification.createdCategory) {
     await recordReminder(
@@ -204,7 +215,7 @@ export async function sendAcknowledgement(
       originalSubject: incoming.subject,
       senderEmail: incoming.from.email,
       senderName: incoming.from.name ?? null,
-      receivedBody: incoming.bodyText,
+      receivedBody: stripQuotedHistory(incoming.bodyText),
       ackSubject: replySubject,
       ackBody: ack.body,
     });
