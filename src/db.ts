@@ -206,11 +206,22 @@ export async function isMessageProcessed(messageId: string): Promise<boolean> {
   return (result.rowCount ?? 0) > 0;
 }
 
-export async function markMessageProcessed(messageId: string, threadId: string): Promise<void> {
+export async function markMessageProcessed(messageId: string, threadId: string, rfcMessageId?: string): Promise<void> {
   await pool.query(
-    "INSERT INTO processed_messages (message_id, thread_id, processed_at) VALUES ($1, $2, $3) ON CONFLICT (message_id) DO NOTHING",
-    [messageId, threadId, new Date().toISOString()]
+    "INSERT INTO processed_messages (message_id, thread_id, processed_at, rfc_message_id) VALUES ($1, $2, $3, $4) ON CONFLICT (message_id) DO NOTHING",
+    [messageId, threadId, new Date().toISOString(), rfcMessageId ?? null]
   );
+}
+
+/**
+ * Un meme email recu par plusieurs adresses (info@, import@, finance@...)
+ * arrive en plusieurs exemplaires dans la boite copie: autant d'identifiants
+ * techniques (UID) differents, mais le meme Message-ID. Sert a ne traiter
+ * (classer, accuser) qu'un seul exemplaire.
+ */
+export async function isRfcMessageProcessed(rfcMessageId: string): Promise<boolean> {
+  const result = await pool.query("SELECT 1 FROM processed_messages WHERE rfc_message_id = $1 LIMIT 1", [rfcMessageId]);
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function upsertThreadReceived(params: {

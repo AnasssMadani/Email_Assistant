@@ -93,6 +93,7 @@ import {
   verifyLogin,
 } from "./auth.js";
 import { csrfField, escapeHtml, formatDateTime, safeNext, sharedStyles } from "./shared.js";
+import { stripQuotedHistory } from "../pipeline/emailText.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -2479,7 +2480,7 @@ function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): str
       <span class="subject-static">${escapeHtml(entry.originalSubject)}</span>
       <div class="ledger-meta">${escapeHtml(senderLabel)} — reçu le ${escapeHtml(formatDateTime(entry.createdAt))}</div>
       <div class="ledger-facts">
-        <div class="ledger-fact"><span class="fact-label">Email reçu</span><span class="fact-value">${escapeHtml(entry.receivedBody).replace(/\n/g, "<br />")}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Email reçu</span><span class="fact-value">${escapeHtml(stripQuotedHistory(entry.receivedBody)).replace(/\n/g, "<br />")}</span></div>
         ${ackFact}
         <div class="ledger-fact"><span class="fact-label">Rappel personnel</span><span class="fact-value">${entry.rappelEnvoye ? '<span class="stamp stamp-done">Envoyé</span>' : entry.rappelSimule ? '<span class="stamp stamp-internal">Simulé — non envoyé</span>' : '<span class="stamp stamp-wait">Pas encore</span>'}</span></div>
         <div class="ledger-fact"><span class="fact-label">Délai avant réponse humaine</span><span class="fact-value">${entry.humanReplyDelayMinutes === null ? "— pas encore répondu" : formatMinutesLabel(entry.humanReplyDelayMinutes)}</span></div>
