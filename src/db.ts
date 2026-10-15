@@ -1068,6 +1068,8 @@ export interface CarnetEntry {
   ackDrafted: boolean;
   ackSubject: string;
   ackBody: string;
+  /** Raison de l'absence d'accuse: ia | categorie | equipe | sensible. null = accuse redige, ou pas encore traite. */
+  ackSkipReason: string | null;
   reviewedOk: boolean;
   createdAt: string;
   rappelEnvoye: boolean;
@@ -1089,6 +1091,7 @@ interface CarnetEntryRow {
   ack_drafted: number;
   ack_subject: string;
   ack_body: string;
+  ack_skip_reason: string | null;
   reviewed_ok: number;
   created_at: string;
   rappel_envoye: boolean;
@@ -1118,6 +1121,7 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
     ackDrafted: row.ack_drafted === 1,
     ackSubject: row.ack_subject,
     ackBody: row.ack_body,
+    ackSkipReason: row.ack_skip_reason,
     reviewedOk: row.reviewed_ok === 1,
     createdAt: row.created_at,
     rappelEnvoye: row.rappel_envoye === true,
@@ -1206,11 +1210,16 @@ export async function recordAckDraft(params: {
   }
 }
 
+/** Memorise pourquoi aucun accuse n'a ete redige pour ce message (affiche dans le carnet). */
+export async function recordAckSkipped(messageId: string, reason: "ia" | "categorie" | "equipe" | "sensible"): Promise<void> {
+  await pool.query("UPDATE shadow_log SET ack_skip_reason = $1 WHERE message_id = $2", [reason, messageId]);
+}
+
 export async function listShadowLogEntries(limit = 500): Promise<CarnetEntry[]> {
   const result = await pool.query<CarnetEntryRow>(
     `SELECT
       s.id, s.thread_id, s.category_id, c.label AS category_label, s.urgency, s.original_subject,
-      s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body,
+      s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body, s.ack_skip_reason,
       s.reviewed_ok, s.created_at, t.received_at, t.human_replied_at,
       (rr.thread_id IS NOT NULL) AS rappel_envoye,
       (rs.thread_id IS NOT NULL) AS rappel_simule

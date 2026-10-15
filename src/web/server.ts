@@ -1111,7 +1111,12 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
         <div class="conn-line"><span class="conn-dot"></span>${connection.provider === "gmail" ? "Gmail" : "Outlook / M365"} connecté</div>
         <div class="conn-sub">${escapeHtml(connection.email)}</div>
       </div>`
-    : `<div class="conn-card">
+    : config.emailConnector === "imap"
+      ? `<div class="conn-card">
+        <div class="conn-line"><span class="conn-dot"></span>Boîte IMAP (lecture seule)</div>
+        <div class="conn-sub">${escapeHtml(config.imap.mailboxAddress || config.imap.user || "non configurée")}</div>
+      </div>`
+      : `<div class="conn-card">
         <div class="conn-line"><span class="conn-dot off"></span>Messagerie non connectée</div>
         <div class="conn-sub"><a href="/connect">Connecter une boîte →</a></div>
       </div>`;
@@ -2454,13 +2459,21 @@ async function renderCarnetPage(
 
 const CARNET_URGENCY_LABELS: Record<string, string> = { low: "Faible", normal: "Normale", high: "Haute" };
 
+const CARNET_NO_ACK_REASONS: Record<string, string> = {
+  ia: "Aucun — l'IA a jugé qu'aucun accusé n'était nécessaire pour cet email (information, notification...).",
+  categorie: "Aucun — cette catégorie n'envoie pas d'accusé automatique (voir Réglages).",
+  equipe: "Aucun — l'équipe a déjà répondu dans cette conversation.",
+  sensible: "Aucun — sujet sensible (paiement, litige, réclamation) : une personne doit répondre.",
+  "": "Aucun accusé rédigé pour l'instant (rédaction en cours, ou erreur — voir le Journal).",
+};
+
 function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): string {
   const senderLabel = entry.senderName ? `${entry.senderName} <${entry.senderEmail}>` : entry.senderEmail;
   const urgencyLabel = entry.urgency ? (CARNET_URGENCY_LABELS[entry.urgency] ?? entry.urgency) : "—";
 
   const ackFact = entry.ackDrafted
     ? `<div class="ledger-fact"><span class="fact-label">Accusé rédigé par l'IA</span><span class="fact-value">${escapeHtml(entry.ackBody).replace(/\n/g, "<br />")}</span></div>`
-    : `<div class="ledger-fact"><span class="fact-label">Accusé</span><span class="fact-value">Aucun — l'IA a jugé qu'aucun accusé n'était nécessaire pour cet email.</span></div>`;
+    : `<div class="ledger-fact"><span class="fact-label">Accusé</span><span class="fact-value">${escapeHtml(CARNET_NO_ACK_REASONS[entry.ackSkipReason ?? ""] ?? CARNET_NO_ACK_REASONS[""])}</span></div>`;
 
   const reviewAction = entry.ackDrafted
     ? `<form method="POST" action="/carnet/${entry.id}/revue">

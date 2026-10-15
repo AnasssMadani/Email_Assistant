@@ -21,6 +21,7 @@ const classificationSchema = z.object({
   urgency: z.enum(["low", "normal", "high"]),
   summary: z.string().min(1),
   requiresAcknowledgement: z.boolean(),
+  needsHumanReply: z.boolean().optional(),
   newCategoryLabel: z.string().optional(),
   newCategoryDescription: z.string().optional(),
 });
@@ -91,6 +92,11 @@ async function classifyEmailOnce(thread: EmailThread, incoming: EmailMessage): P
         requiresAcknowledgement: {
           type: "boolean",
           description: "Faux pour le spam, les newsletters, ou les communications internes.",
+        },
+        needsHumanReply: {
+          type: "boolean",
+          description:
+            "Vrai pour une relance de paiement ou de facture, un litige, une reclamation, une menace de frais ou de procedure: un accuse automatique serait inapproprie, une personne doit repondre. Faux sinon.",
         },
         ...(canCreateCategory
           ? {
