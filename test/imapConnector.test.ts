@@ -141,11 +141,19 @@ after(async () => {
 
 let uidValiditySeed = 1000;
 
-async function setup() {
+async function setup(options: { user?: string; mailboxAddress?: string; copyMailbox?: boolean } = {}) {
   // UIDVALIDITY distinct par test: les ids de message (dossier + UIDVALIDITY
   // + UID) restent uniques alors que la base de test est partagee par tout
   // le fichier (processed_messages, smtp_sent_messages).
   const mailboxes = fixtureMailboxes();
+  if (options.copyMailbox) {
+    // Boite copie: tout arrive dans sa boite de reception (redirection cPanel
+    // pour les emails recus, Cci Roundcube pour les reponses de l'equipe),
+    // et son propre dossier Envoyes reste vide.
+    const sent = mailboxes["INBOX.Sent"].messages;
+    mailboxes.INBOX.messages.push(...sent.filter((m) => !m.flags?.includes("\\Draft")).map((m) => ({ ...m, uid: m.uid + 200, flags: [] })));
+    mailboxes["INBOX.Sent"].messages = [];
+  }
   for (const mb of Object.values(mailboxes)) mb.uidValidity = ++uidValiditySeed;
   const server = await startFakeImapServer(mailboxes);
   servers.push(server);
@@ -156,8 +164,9 @@ async function setup() {
         host: "127.0.0.1",
         port: server.port,
         secure: false,
-        user: OWN,
+        user: options.user ?? OWN,
         password: "test-password",
+        mailboxAddress: options.mailboxAddress ?? "",
         inboxFolder: "INBOX",
         sentFolder: "",
         threadLookbackDays: 60,
@@ -311,7 +320,6 @@ test("reading inbox, sent folder and a thread issues only EXAMINE / UID SEARCH /
   const inbox = await connector.listRecentInboxMessages(25);
   const sentFolder = await connector.listRecentSentMessages(25);
   const thread = await connector.getThread(inbox[0].threadId);
-  await connector.markMessageUnread(inbox[0].id);
   await connector.close();
 
   assert.equal(inbox.length, 3);
@@ -366,6 +374,25 @@ test("already-processed messages are not downloaded again", async () => {
   );
   const contentFetch = server.commands.find((c) => c.command === "UID FETCH");
   assert.ok(contentFetch && !/\b101\b/.test(contentFetch.line.split(" ").slice(0, 4).join(" ")));
+});
+
+test("copy-mailbox mode: logged in as a dedicated box, the team's Bcc'd reply still counts as ours", async () => {
+  const { connector, server } = await setup({ user: "assistant@globallink.ma", mailboxAddress: OWN, copyMailbox: true });
+  assert.equal(await connector.getOwnEmailAddress(), OWN);
+  const inbox = await connector.listRecentInboxMessages(25);
+  const thread = await connector.getThread(inbox[0].threadId);
+  await connector.close();
+
+  assert.equal(inbox.filter((m) => m.isFromUs).length, 1, "la reponse de l'equipe, recue en Cci, est reconnue comme la notre");
+  assert.deepEqual(
+    thread.messages.map((m) => [m.rfcMessageId, m.isFromUs]),
+    [
+      ["<root-1@shipper.cn>", false],
+      ["<team-1@globallink.ma>", true],
+      ["<reply-2@shipper.cn>", false],
+    ]
+  );
+  assertOnlyReadOnlyCommands(server);
 });
 
 test("getThread gathers inbox + sent messages of the conversation, skipping drafts", async () => {

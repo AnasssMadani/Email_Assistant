@@ -57,6 +57,32 @@ services:
         sync: false
       - key: ENCRYPTION_KEY
         sync: false
+      # Boite Roundcube/cPanel de Global Link (lecture seule, voir
+      # imapConnector.ts). Mode recommande: "boite copie" — IMAP_USER /
+      # IMAP_PASSWORD d'une boite dediee qui recoit une copie de tout le
+      # courrier, IMAP_MAILBOX_ADDRESS = l'adresse partagee copiee.
+      - key: EMAIL_CONNECTOR
+        value: imap
+      - key: IMAP_HOST
+        sync: false
+      - key: IMAP_USER
+        sync: false
+      - key: IMAP_PASSWORD
+        sync: false
+      - key: IMAP_MAILBOX_ADDRESS
+        sync: false
+      # Verrou d'etape: tant qu'il vaut 0, rien ne part, quoi qu'on choisisse
+      # dans /etape. A passer a "1" ici, par un commit, le jour de l'etape 1
+      # (apres validation ecrite de la direction de Global Link).
+      - key: MAX_STAGE
+        value: "0"
+      # Vides a l'etape 0: sans SMTP_HOST, aucun envoi n'est possible.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
       - key: BRAND_NAME
         value: Accusé & Relance
       - key: BRAND_PRIMARY_COLOR

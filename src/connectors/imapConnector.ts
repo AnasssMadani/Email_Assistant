@@ -30,6 +30,8 @@ export interface ImapSmtpSettings {
     secure: boolean;
     user: string;
     password: string;
+    /** Adresse partagee surveillee, si differente de user (mode boite copie). Vide = smtp.fromAddress puis user. */
+    mailboxAddress?: string;
     inboxFolder: string;
     sentFolder: string;
     threadLookbackDays: number;
@@ -88,8 +90,6 @@ function settingsFromConfig(): ImapSmtpSettings {
  *   dans "Envoyes": ce serait un APPEND). Ils sont donc memorises en base
  *   (smtp_sent_messages) et reinjectes dans getThread(), pour que le
  *   comptage automated_outbound_count fonctionne comme avec Gmail/Graph.
- * - markMessageUnread est un no-op: rien ne marque jamais un message comme
- *   lu de notre cote (ni la lecture, ni l'envoi SMTP).
  */
 export class ImapSmtpConnector implements EmailConnector {
   readonly name = "imap" as const;
@@ -106,8 +106,16 @@ export class ImapSmtpConnector implements EmailConnector {
     this.createTransport = options.createTransport ?? (() => this.defaultTransport());
   }
 
+  /**
+   * Adresse de la boite partagee surveillee (comparee pour isFromUs, et
+   * "From" des envois). En mode "boite copie" (IMAP_USER = une boite dediee
+   * qui recoit une copie de tout le courrier de l'adresse partagee via une
+   * redirection cPanel), IMAP_MAILBOX_ADDRESS donne l'adresse partagee: les
+   * reponses de l'equipe, recues en Cci dans la boite copie, sont alors bien
+   * reconnues comme les notres.
+   */
   async getOwnEmailAddress(): Promise<string> {
-    return (this.settings.smtp.fromAddress || this.settings.imap.user).trim();
+    return (this.settings.imap.mailboxAddress || this.settings.smtp.fromAddress || this.settings.imap.user).trim();
   }
 
   // ---------- Session IMAP (une connexion, operations serialisees) ----------
@@ -469,13 +477,6 @@ export class ImapSmtpConnector implements EmailConnector {
     await this.send({ from: ownEmail, to: params.to, subject: params.subject, text: params.bodyText, messageId });
     return { id: messageId };
   }
-
-  /**
-   * No-op volontaire: la lecture (EXAMINE + BODY.PEEK) et l'envoi SMTP ne
-   * marquent jamais rien comme lu — il n'y a donc rien a "remettre" non lu,
-   * et poser un drapeau serait une ecriture dans la boite (regle n°1).
-   */
-  async markMessageUnread(_messageId: string): Promise<void> {}
 }
 
 interface FetchedMessage {

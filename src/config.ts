@@ -59,6 +59,13 @@ export const config = {
     secure: (process.env.IMAP_SECURE ?? "true") !== "false",
     user: process.env.IMAP_USER ?? "",
     password: process.env.IMAP_PASSWORD ?? "",
+    // Mode "boite copie": IMAP_USER/IMAP_PASSWORD sont ceux d'une boite
+    // dediee (ex: assistant@domaine) qui recoit, par une redirection cPanel,
+    // une copie de chaque email arrivant sur l'adresse partagee. On ne se
+    // connecte alors jamais a la boite du client. Renseigner ici l'adresse
+    // partagee (ex: contact@domaine) pour reconnaitre les reponses de
+    // l'equipe (recues en Cci). Vide = SMTP_FROM, puis IMAP_USER.
+    mailboxAddress: process.env.IMAP_MAILBOX_ADDRESS ?? "",
     inboxFolder: process.env.IMAP_INBOX_FOLDER ?? "INBOX",
     // Vide = detection automatique via LIST (attribut special-use \Sent),
     // avec repli sur les noms usuels cPanel/Dovecot ("INBOX.Sent", "Sent").
