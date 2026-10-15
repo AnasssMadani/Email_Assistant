@@ -929,7 +929,7 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
   // impossible a manquer, pas un simple badge discret dans un coin.
   const shadowModeBanner = config.shadowModeEnabled
     ? `<div class="banner banner-error" style="margin-bottom: 16px; font-weight: 600;">
-        🧪 Mode test actif — aucun accusé ni relance n'est réellement envoyé au client, tout est journalisé sans être expédié.
+        🧪 Mode test actif — aucun accusé, relance ni rappel interne n'est réellement envoyé, tout est journalisé sans être expédié.
       </div>`
     : "";
 
@@ -2276,7 +2276,7 @@ function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): str
       <div class="ledger-facts">
         <div class="ledger-fact"><span class="fact-label">Email reçu</span><span class="fact-value">${escapeHtml(entry.receivedBody).replace(/\n/g, "<br />")}</span></div>
         ${ackFact}
-        <div class="ledger-fact"><span class="fact-label">Rappel personnel</span><span class="fact-value">${entry.rappelEnvoye ? '<span class="stamp stamp-done">Envoyé</span>' : '<span class="stamp stamp-wait">Pas encore</span>'}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Rappel personnel</span><span class="fact-value">${entry.rappelEnvoye ? '<span class="stamp stamp-done">Envoyé</span>' : entry.rappelSimule ? '<span class="stamp stamp-internal">Simulé — non envoyé</span>' : '<span class="stamp stamp-wait">Pas encore</span>'}</span></div>
         <div class="ledger-fact"><span class="fact-label">Délai avant réponse humaine</span><span class="fact-value">${entry.humanReplyDelayMinutes === null ? "— pas encore répondu" : formatMinutesLabel(entry.humanReplyDelayMinutes)}</span></div>
       </div>
     </div>

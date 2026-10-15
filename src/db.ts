@@ -272,6 +272,9 @@ export async function getThreadRow(threadId: string): Promise<ThreadRow | undefi
  * (urgence sous le seuil configure) — la sequence avance sans notifier
  * personne. Distinct de "relance_interne" expres: le client ne doit jamais
  * voir "equipe alertee" pour une alerte qui n'a en realite pas ete envoyee.
+ * "relance_interne_test": rappel interne qui AURAIT ete envoye a l'equipe,
+ * mais ne l'a pas ete car le mode silencieux est actif. Jamais compte comme
+ * un envoi reel.
  * "relance_externe_pre_reponse" / "relance_externe_post_reponse": relance
  * envoyee au client, avant ou apres notre reponse de fond.
  */
@@ -279,6 +282,7 @@ export type ReminderStepType =
   | "accuse"
   | "relance_interne"
   | "relance_interne_filtree"
+  | "relance_interne_test"
   | "relance_externe_pre_reponse"
   | "relance_externe_post_reponse";
 
@@ -929,6 +933,8 @@ export interface CarnetEntry {
   reviewedOk: boolean;
   createdAt: string;
   rappelEnvoye: boolean;
+  /** Rappel interne simule en mode silencieux (aurait ete envoye, ne l'a pas ete). */
+  rappelSimule: boolean;
   humanReplyDelayMinutes: number | null;
 }
 
@@ -948,6 +954,7 @@ interface CarnetEntryRow {
   reviewed_ok: number;
   created_at: string;
   rappel_envoye: boolean;
+  rappel_simule: boolean;
   received_at: string | null;
   human_replied_at: string | null;
 }
@@ -976,6 +983,7 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
     reviewedOk: row.reviewed_ok === 1,
     createdAt: row.created_at,
     rappelEnvoye: row.rappel_envoye === true,
+    rappelSimule: row.rappel_simule === true,
     humanReplyDelayMinutes,
   };
 }
@@ -1066,13 +1074,17 @@ export async function listShadowLogEntries(limit = 500): Promise<CarnetEntry[]> 
       s.id, s.thread_id, s.category_id, c.label AS category_label, s.urgency, s.original_subject,
       s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body,
       s.reviewed_ok, s.created_at, t.received_at, t.human_replied_at,
-      (rr.thread_id IS NOT NULL) AS rappel_envoye
+      (rr.thread_id IS NOT NULL) AS rappel_envoye,
+      (rs.thread_id IS NOT NULL) AS rappel_simule
      FROM shadow_log s
      LEFT JOIN categories c ON c.id = s.category_id
      LEFT JOIN threads t ON t.thread_id = s.thread_id
      LEFT JOIN (
        SELECT DISTINCT thread_id FROM reminders WHERE step_type = 'relance_interne'
      ) rr ON rr.thread_id = s.thread_id
+     LEFT JOIN (
+       SELECT DISTINCT thread_id FROM reminders WHERE step_type = 'relance_interne_test'
+     ) rs ON rs.thread_id = s.thread_id
      ORDER BY s.created_at DESC
      LIMIT $1`,
     [limit]

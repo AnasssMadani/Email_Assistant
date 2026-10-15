@@ -56,11 +56,12 @@ export const config = {
   // notification part alors vers la messagerie connectee elle-meme, comme
   // un pense-bete dans sa propre boite plutot que dans le vide.
   notificationEmail: process.env.NOTIFICATION_EMAIL ?? "",
-  // Mode "carnet" (semaine pilote): le pipeline classe et redige normalement,
-  // mais aucun accuse/brouillon n'est reellement envoye ni depose — tout est
-  // journalise dans shadow_log a la place (voir processIncoming.ts). Seul le
-  // rappel interne personnel reste un envoi reel. Permanent tant que
-  // desactive manuellement (pas de bascule automatique, pas de date de fin).
+  // Mode silencieux (etape 0): le pipeline classe et redige normalement,
+  // mais RIEN n'est envoye — ni accuse, ni relance client, ni rappel
+  // interne a l'equipe. Tout est journalise a la place (shadow_log pour les
+  // accuses, reminders pour les relances et rappels — voir processIncoming.ts
+  // et relanceCheck.ts). Permanent tant que desactive manuellement (pas de
+  // bascule automatique, pas de date de fin).
   shadowModeEnabled: process.env.SHADOW_MODE === "true",
   // Dossier des notes de style par categorie, generees a partir du corpus des
   // vraies reponses de l'equipe (voir src/pipeline/corpusAnalysis.ts) et

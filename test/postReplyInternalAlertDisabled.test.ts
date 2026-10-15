@@ -55,7 +55,6 @@ function fakeConnector(thread: EmailThread, onSendNotification: () => void): Ema
       onSendNotification();
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 }
 

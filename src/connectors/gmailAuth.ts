@@ -14,10 +14,15 @@ function warnPlaintextTokensOnce(): void {
   );
 }
 
+// Lecture + envoi uniquement (regle "lecture seule" de la boite). Jamais
+// gmail.modify / gmail.compose / mail.google.com: ils permettraient de
+// changer les libelles (lu/non lu), de deposer des brouillons ou de
+// supprimer. Un jeton deja emis avec gmail.compose le garde jusqu'a la
+// prochaine reconnexion — le code n'appelle de toute facon plus rien qui
+// l'utilise.
 export const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.send",
-  "https://www.googleapis.com/auth/gmail.compose",
 ];
 
 export function createOAuthClient(): OAuth2Client {

@@ -97,7 +97,6 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 
   await runRelanceCheck(connector);
@@ -165,7 +164,6 @@ test("runRelanceCheck skips a dossier whose thread id doesn't match the currentl
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 
   await runRelanceCheck(graphConnector);

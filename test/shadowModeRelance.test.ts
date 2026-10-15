@@ -73,7 +73,6 @@ function fakeConnector(thread: EmailThread, onSendReply: () => void): EmailConne
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 }
 

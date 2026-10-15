@@ -13,11 +13,15 @@ function warnPlaintextTokensOnce(): void {
   );
 }
 
+// Lecture + envoi uniquement (regle "lecture seule" de la boite). Pas de
+// Mail.ReadWrite: sans lui, le jeton ne peut ni marquer, ni deplacer, ni
+// supprimer, ni creer de brouillon. Un jeton deja emis avec Mail.ReadWrite
+// est reduit a ces scopes au prochain rafraichissement (le scope demande au
+// refresh ci-dessous fait foi).
 export const GRAPH_SCOPES = [
   "offline_access",
   "https://graph.microsoft.com/Mail.Read",
   "https://graph.microsoft.com/Mail.Send",
-  "https://graph.microsoft.com/Mail.ReadWrite",
   "https://graph.microsoft.com/User.Read",
 ].join(" ");
 

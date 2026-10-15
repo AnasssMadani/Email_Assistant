@@ -56,9 +56,8 @@ async function graphFetchOnce<T>(path: string, init: RequestInit): Promise<T> {
 
 /**
  * Le backoff (OPT-008) n'est applique qu'aux LECTURES (GET, la valeur par
- * defaut de RequestInit.method) — jamais a un POST/PATCH/DELETE (envoi,
- * creation/suppression de brouillon, marquage lu/non lu), ou un timeout
- * ambigu retente pourrait dupliquer une action deja effectuee cote serveur.
+ * defaut de RequestInit.method) — jamais a un POST (envoi, reponse), ou un
+ * timeout ambigu retente pourrait dupliquer une action deja effectuee cote serveur.
  */
 async function graphFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const isRead = !init.method || init.method === "GET";
@@ -75,9 +74,10 @@ const MESSAGE_SELECT =
 /**
  * Connecteur Microsoft Graph (Outlook / Microsoft 365).
  *
- * Utilise les permissions delegees (Mail.Read, Mail.Send, Mail.ReadWrite,
- * User.Read) obtenues via le flux OAuth de la page de connexion
- * (src/web/server.ts -> /auth/graph/*), donc toujours au nom du compte qui
+ * Utilise les permissions delegees (Mail.Read, Mail.Send, User.Read) —
+ * volontairement PAS Mail.ReadWrite: la boite est en lecture seule, le
+ * jeton ne doit meme pas permettre de modifier un message. Obtenues via le
+ * flux OAuth de la page de connexion (src/web/server.ts -> /auth/graph/*), donc toujours au nom du compte qui
  * s'est connecte — jamais un acces applicatif a l'ensemble du tenant.
  *
  * "threadId" correspond a conversationId cote Graph (il n'y a pas de notion
@@ -182,34 +182,27 @@ export class GraphConnector implements EmailConnector {
     return latest.id;
   }
 
-  private async buildReplyDraft(params: SendReplyParams): Promise<string> {
+  async sendReply(params: SendReplyParams): Promise<{ id: string }> {
     const originalId = await this.findLatestMessageId(params.threadId);
-    const draft = await graphFetch<{ id: string }>(`/me/messages/${originalId}/createReply`, {
+    // Action "reply" en un seul appel: Graph envoie directement et range la
+    // copie dans "Elements envoyes". Remplace l'ancien enchainement
+    // createReply -> PATCH -> send, qui deposait d'abord un brouillon dans
+    // la boite du client (et l'y laissait orphelin si l'envoi echouait) —
+    // contraire a la regle "lecture seule" et inutile depuis que le corps
+    // remplace entierement la citation. Ne demande que Mail.Send. Repond
+    // 202 Accepted sans corps: l'id du message envoye n'est pas connu (aucun
+    // appelant ne s'en sert).
+    await graphFetch(`/me/messages/${originalId}/reply`, {
       method: "POST",
-      body: JSON.stringify({}),
-    });
-    await graphFetch(`/me/messages/${draft.id}`, {
-      method: "PATCH",
       body: JSON.stringify({
-        subject: params.subject,
-        body: { contentType: "Text", content: params.bodyText },
-        toRecipients: [{ emailAddress: { address: params.to } }],
+        message: {
+          subject: params.subject,
+          body: { contentType: "Text", content: params.bodyText },
+          toRecipients: [{ emailAddress: { address: params.to } }],
+        },
       }),
     });
-    return draft.id;
-  }
-
-  async sendReply(params: SendReplyParams): Promise<{ id: string }> {
-    const draftId = await this.buildReplyDraft(params);
-    await graphFetch(`/me/messages/${draftId}/send`, { method: "POST" });
-    return { id: draftId };
-  }
-
-  async markMessageUnread(messageId: string): Promise<void> {
-    await graphFetch(`/me/messages/${messageId}`, {
-      method: "PATCH",
-      body: JSON.stringify({ isRead: false }),
-    });
+    return { id: "" };
   }
 
   async sendNotification(params: NotificationParams): Promise<{ id: string }> {
