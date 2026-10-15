@@ -102,6 +102,12 @@ export const config = {
   // Ancien SHADOW_MODE=true toujours honore (= MAX_STAGE=0) pour ne pas
   // lever le verrou d'un deploiement existant a la mise a jour.
   maxStage: parseMaxStage(process.env.MAX_STAGE, process.env.SHADOW_MODE),
+  // Delai minimal entre deux tentatives de classification d'un meme email
+  // quand l'IA echoue (cle invalide, solde epuise, panne API). Sans lui, un
+  // email non classe est retente a CHAQUE cycle de scrutation et ajoute des
+  // lignes d'erreur a chaque fois. La reprise reste automatique des que l'IA
+  // repond de nouveau, avec ce delai au plus. 0 desactive la pause.
+  aiRetryBackoffMinutes: Math.max(0, Number(process.env.AI_RETRY_BACKOFF_MINUTES ?? 15) || 0),
   // Plafond de categories creees automatiquement par la classification sur
   // 24h glissantes (voir createCategoryFromAi dans db.ts) — au-dela, l'email
   // tombe dans la categorie de repli. 0 desactive la creation automatique.

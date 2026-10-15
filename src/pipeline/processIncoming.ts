@@ -1,3 +1,4 @@
+import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { isSendAllowed } from "../stage.js";
 import { classifyEmail } from "../ai/classify.js";
@@ -12,6 +13,7 @@ import {
   recordAckDraft,
   recordClassification,
   recordPipelineError,
+  getThreadRow,
   recordReminder,
   setThreadAckSent,
   setThreadStatus,
@@ -44,6 +46,13 @@ export async function processIncomingMessage(
     return;
   }
 
+  // Dossier deja en "Erreur IA" et reessaye il y a peu: on laisse passer le
+  // delai (AI_RETRY_BACKOFF_MINUTES) avant de rappeler l'IA. Le message n'est
+  // PAS marque traite, donc il sera retente ensuite.
+  const existing = await getThreadRow(message.threadId);
+  const alreadyFlagged = existing?.status === "ai_error";
+  if (alreadyFlagged && Date.now() - Date.parse(existing.updated_at) < config.aiRetryBackoffMinutes * 60_000) return;
+
   const thread = await tagSource("Messagerie — lecture du fil", () => connector.getThread(message.threadId));
 
   let classification: Awaited<ReturnType<typeof classifyEmail>>;
@@ -58,7 +67,9 @@ export async function processIncomingMessage(
     // sa page de detail. Categorie "autre" a titre provisoire: des que la
     // classification reussira (prochain cycle, message non marque traite),
     // upsertThreadReceived la remplacera par la vraie categorie.
-    await recordPipelineError("process_incoming", message.threadId, (err as Error).message);
+    // Une seule trace par email en erreur (pas une par cycle): les essais
+    // suivants remettent seulement updated_at a jour, ce qui relance le delai.
+    if (!alreadyFlagged) await recordPipelineError("process_incoming", message.threadId, (err as Error).message);
     await upsertThreadReceived({
       threadId: message.threadId,
       subject: message.subject,
@@ -70,11 +81,13 @@ export async function processIncomingMessage(
       status: "ai_error",
       dueAt: null,
     });
-    await recordReminder(
-      message.threadId,
-      "internal",
-      `[Erreur IA] La classification de cet email a échoué : ${(err as Error).message}`
-    );
+    if (!alreadyFlagged) {
+      await recordReminder(
+        message.threadId,
+        "internal",
+        `[Erreur IA] La classification de cet email a échoué : ${(err as Error).message}`
+      );
+    }
     return;
   }
 
