@@ -54,7 +54,15 @@ function looksLikeGmailThreadId(id: string): boolean {
   return /^[0-9a-f]{10,20}$/i.test(id);
 }
 
-function threadIdMatchesConnector(threadId: string, connectorName: "gmail" | "graph"): boolean {
+/** Id IMAP: toujours prefixe "imap." (voir imapIds.ts) — jamais hexadecimal pur, ni un conversationId Graph. */
+function looksLikeImapThreadId(id: string): boolean {
+  return id.startsWith("imap.");
+}
+
+/** Exportee pour les tests. */
+export function threadIdMatchesConnector(threadId: string, connectorName: "gmail" | "graph" | "imap"): boolean {
+  if (looksLikeImapThreadId(threadId)) return connectorName === "imap";
+  if (connectorName === "imap") return false;
   const gmailShaped = looksLikeGmailThreadId(threadId);
   return connectorName === "gmail" ? gmailShaped : !gmailShaped;
 }

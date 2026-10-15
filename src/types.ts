@@ -49,7 +49,7 @@ export interface NotificationParams {
 }
 
 export interface EmailConnector {
-  readonly name: "gmail" | "graph";
+  readonly name: "gmail" | "graph" | "imap";
   getOwnEmailAddress(): Promise<string>;
   listRecentInboxMessages(maxResults?: number): Promise<EmailMessage[]>;
   /** Messages envoyes par nous, y compris ceux qui n'ont jamais recu de message entrant (devis envoye a froid, etc.). */
