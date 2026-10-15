@@ -1068,6 +1068,8 @@ export interface CarnetEntry {
   ackDrafted: boolean;
   ackSubject: string;
   ackBody: string;
+  /** Raison de l'absence d'accuse: ia | categorie | equipe | sensible. null = accuse redige, ou pas encore traite. */
+  ackSkipReason: string | null;
   reviewedOk: boolean;
   createdAt: string;
   rappelEnvoye: boolean;
@@ -1089,6 +1091,7 @@ interface CarnetEntryRow {
   ack_drafted: number;
   ack_subject: string;
   ack_body: string;
+  ack_skip_reason: string | null;
   reviewed_ok: number;
   created_at: string;
   rappel_envoye: boolean;
@@ -1118,6 +1121,7 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
     ackDrafted: row.ack_drafted === 1,
     ackSubject: row.ack_subject,
     ackBody: row.ack_body,
+    ackSkipReason: row.ack_skip_reason,
     reviewedOk: row.reviewed_ok === 1,
     createdAt: row.created_at,
     rappelEnvoye: row.rappel_envoye === true,
@@ -1206,11 +1210,16 @@ export async function recordAckDraft(params: {
   }
 }
 
+/** Memorise pourquoi aucun accuse n'a ete redige pour ce message (affiche dans le carnet). */
+export async function recordAckSkipped(messageId: string, reason: "ia" | "categorie" | "equipe" | "sensible"): Promise<void> {
+  await pool.query("UPDATE shadow_log SET ack_skip_reason = $1 WHERE message_id = $2", [reason, messageId]);
+}
+
 export async function listShadowLogEntries(limit = 500): Promise<CarnetEntry[]> {
   const result = await pool.query<CarnetEntryRow>(
     `SELECT
       s.id, s.thread_id, s.category_id, c.label AS category_label, s.urgency, s.original_subject,
-      s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body,
+      s.sender_email, s.sender_name, s.received_body, s.ack_drafted, s.ack_subject, s.ack_body, s.ack_skip_reason,
       s.reviewed_ok, s.created_at, t.received_at, t.human_replied_at,
       (rr.thread_id IS NOT NULL) AS rappel_envoye,
       (rs.thread_id IS NOT NULL) AS rappel_simule
@@ -1252,11 +1261,126 @@ export async function recordHumanReplyCorpus(params: {
   threadId: string;
   categoryId: string;
   replyBody: string;
+  /** "auto" = capte dans la boite (defaut), "manuel" = colle par l'admin. */
+  source?: "auto" | "manuel";
+  /** Lot d'import manuel: permet de l'annuler en bloc. */
+  batchId?: string;
+  /** Demande du client a laquelle cette reponse repondait (import manuel). */
+  clientAsk?: string;
 }): Promise<void> {
   await pool.query(
-    "INSERT INTO human_reply_corpus (thread_id, category_id, reply_body, created_at) VALUES ($1, $2, $3, $4)",
-    [params.threadId, params.categoryId, params.replyBody, new Date().toISOString()]
+    `INSERT INTO human_reply_corpus (thread_id, category_id, reply_body, created_at, source, batch_id, client_ask)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      params.threadId,
+      params.categoryId,
+      params.replyBody,
+      new Date().toISOString(),
+      params.source ?? "auto",
+      params.batchId ?? null,
+      params.clientAsk ?? null,
+    ]
   );
+}
+
+export interface CorpusCategoryStats {
+  categoryId: string;
+  total: number;
+  manual: number;
+  lastAt: string | null;
+}
+
+/** Nombre d'exemples appris par categorie (auto + manuel), pour la page Apprentissage. */
+export async function listCorpusStats(): Promise<CorpusCategoryStats[]> {
+  const result = await pool.query<{ category_id: string; total: string; manual: string; last_at: string | null }>(
+    `SELECT category_id, COUNT(*) AS total,
+            SUM(CASE WHEN source = 'manuel' THEN 1 ELSE 0 END) AS manual,
+            MAX(created_at) AS last_at
+     FROM human_reply_corpus GROUP BY category_id`
+  );
+  return result.rows.map((r) => ({
+    categoryId: r.category_id,
+    total: Number(r.total),
+    manual: Number(r.manual ?? 0),
+    lastAt: r.last_at,
+  }));
+}
+
+export interface CorpusExample {
+  id: number;
+  categoryId: string;
+  replyBody: string;
+  clientAsk: string | null;
+  source: string;
+  batchId: string | null;
+  createdAt: string;
+}
+
+export async function listRecentCorpusExamples(limit = 8): Promise<CorpusExample[]> {
+  const result = await pool.query<{
+    id: string;
+    category_id: string;
+    reply_body: string;
+    client_ask: string | null;
+    source: string | null;
+    batch_id: string | null;
+    created_at: string;
+  }>("SELECT * FROM human_reply_corpus ORDER BY created_at DESC, id DESC LIMIT $1", [limit]);
+  return result.rows.map((r) => ({
+    id: Number(r.id),
+    categoryId: r.category_id,
+    replyBody: r.reply_body,
+    clientAsk: r.client_ask,
+    source: r.source ?? "auto",
+    batchId: r.batch_id,
+    createdAt: r.created_at,
+  }));
+}
+
+/** Retire un exemple; retourne sa categorie (sa note de style est a refaire). */
+export async function deleteCorpusExample(id: number): Promise<string | undefined> {
+  const found = await pool.query<{ category_id: string }>("SELECT category_id FROM human_reply_corpus WHERE id = $1", [id]);
+  await pool.query("DELETE FROM human_reply_corpus WHERE id = $1", [id]);
+  return found.rows[0]?.category_id;
+}
+
+/** Annule un import manuel complet. Retourne les categories touchees (leur note de style est a regenerer). */
+export async function deleteCorpusBatch(batchId: string): Promise<string[]> {
+  const touched = await pool.query<{ category_id: string }>(
+    "SELECT DISTINCT category_id FROM human_reply_corpus WHERE batch_id = $1",
+    [batchId]
+  );
+  await pool.query("DELETE FROM human_reply_corpus WHERE batch_id = $1", [batchId]);
+  return touched.rows.map((r) => r.category_id);
+}
+
+export async function corpusHasReply(categoryId: string, replyBody: string): Promise<boolean> {
+  const result = await pool.query("SELECT 1 FROM human_reply_corpus WHERE category_id = $1 AND reply_body = $2 LIMIT 1", [
+    categoryId,
+    replyBody,
+  ]);
+  return (result.rowCount ?? 0) > 0;
+}
+
+export async function deleteCategoryPlaybook(categoryId: string): Promise<void> {
+  await pool.query("DELETE FROM category_playbooks WHERE category_id = $1", [categoryId]);
+}
+
+/** Date de derniere generation de la note de style, par categorie. */
+export async function listPlaybookDates(): Promise<Map<string, string>> {
+  const result = await pool.query<{ category_id: string; updated_at: string }>(
+    "SELECT category_id, updated_at FROM category_playbooks"
+  );
+  return new Map(result.rows.map((r) => [r.category_id, r.updated_at]));
+}
+
+/** Combien d'accuses rediges ont ete relus, et combien jugés "partirait tel quel" (indicateur de la page Apprentissage). */
+export async function getAckReviewStats(): Promise<{ drafted: number; reviewedOk: number }> {
+  const result = await pool.query<{ drafted: string; ok: string }>(
+    `SELECT COUNT(*) AS drafted, SUM(CASE WHEN reviewed_ok = 1 THEN 1 ELSE 0 END) AS ok
+     FROM shadow_log WHERE ack_drafted = 1`
+  );
+  return { drafted: Number(result.rows[0]?.drafted ?? 0), reviewedOk: Number(result.rows[0]?.ok ?? 0) };
 }
 
 export async function listCategoriesWithCorpus(): Promise<string[]> {

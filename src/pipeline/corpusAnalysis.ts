@@ -15,9 +15,16 @@ import {
  * ce cycle-ci (pas encore de vraie reponse a apprendre).
  */
 export async function runCorpusAnalysis(): Promise<void> {
-  for (const categoryId of await listCategoriesWithCorpus()) {
-    const replies = await listHumanReplyCorpusByCategory(categoryId);
-    if (replies.length === 0) continue;
+  await runCorpusAnalysisFor(await listCategoriesWithCorpus());
+}
+
+/** Même analyse, limitée aux catégories données (import manuel: seules celles touchées sont refaites). */
+export async function runCorpusAnalysisFor(categoryIds: string[]): Promise<void> {
+  for (const categoryId of categoryIds) {
+    const allReplies = await listHumanReplyCorpusByCategory(categoryId);
+    if (allReplies.length === 0) continue;
+    // Les 30 plus recentes suffisent a une note de style, et bornent le cout.
+    const replies = allReplies.slice(-30);
 
     try {
       const category = await getCategory(categoryId);
@@ -27,7 +34,7 @@ export async function runCorpusAnalysis(): Promise<void> {
         [
           `# Style observe — ${category.label}`,
           "",
-          `_Genere automatiquement a partir de ${replies.length} reponse(s) reelle(s) de l'equipe.`,
+          `_Genere automatiquement a partir de ${replies.length} reponse(s) reelle(s) de l'equipe (sur ${allReplies.length} apprises).`,
           `Pas un "fine-tuning" — un resume d'exemples curates, relu par le prompt de redaction._`,
           "",
           "## Ton",

@@ -13,6 +13,7 @@ import {
   markMessageProcessed,
   upsertThreadReceived,
   recordAckDraft,
+  recordAckSkipped,
   recordClassification,
   recordPipelineError,
   getThreadRow,
@@ -160,7 +161,21 @@ export async function processIncomingMessage(
   }
 
   if (!shouldAcknowledge) {
+    await recordAckSkipped(message.id, category.acknowledgeAutomatically ? "ia" : "categorie");
     console.log(`[skip] "${message.subject}" (${category.id}) — pas d'accuse requis.`);
+    return;
+  }
+
+  // Garde-fous de prudence: certains emails meritent un suivi (rappel a
+  // l'equipe) mais JAMAIS un accuse automatique. Le dossier suit alors le meme
+  // chemin qu'apres un accuse (ack_sent, sans incrementer le compteur
+  // d'envois automatiques): l'equipe est relancee, le client ne l'est pas.
+  const suppression = ackSuppression(classification, thread, message, existing?.automated_outbound_count ?? 0);
+  if (suppression) {
+    await recordAckSkipped(message.id, suppression.code);
+    await setThreadAckSent(message.threadId);
+    await recordReminder(message.threadId, "internal", `[Accusé non envoyé] ${suppression.note}`);
+    console.log(`[accuse supprime] "${message.subject}" — ${suppression.note}`);
     return;
   }
 
@@ -182,6 +197,30 @@ export async function processIncomingMessage(
       `[Erreur IA] La rédaction/l'envoi de l'accusé a échoué : ${(err as Error).message}`
     );
   }
+}
+
+/**
+ * Cas ou l'accuse est volontairement supprime. "equipe": un humain a deja
+ * repondu dans la conversation (nos messages dans le fil depassent le nombre
+ * d'envois automatiques comptabilises), un accuse en plein echange serait du
+ * bruit. "sensible": paiement, litige, reclamation — decision de l'IA.
+ */
+export function ackSuppression(
+  classification: { needsHumanReply?: boolean },
+  thread: EmailThread,
+  incoming: EmailMessage,
+  automatedOutboundCount: number
+): { code: "equipe" | "sensible"; note: string } | undefined {
+  const ourEarlier = thread.messages.filter(
+    (m) => m.isFromUs && m.id !== incoming.id && m.receivedAt.getTime() <= incoming.receivedAt.getTime()
+  ).length;
+  if (ourEarlier > automatedOutboundCount) {
+    return { code: "equipe", note: "l'équipe a déjà répondu dans cette conversation, pas d'accusé automatique." };
+  }
+  if (classification.needsHumanReply) {
+    return { code: "sensible", note: "sujet sensible (paiement, litige ou réclamation), une personne doit répondre." };
+  }
+  return undefined;
 }
 
 /**
@@ -230,6 +269,12 @@ export async function sendAcknowledgement(
     await setThreadAckSent(incoming.threadId);
     console.log(`[silencieux] accuse redige (non envoye) pour ${incoming.from.email} — "${incoming.subject}"`);
     return;
+  }
+
+  // Dernier garde-fou avant un VRAI envoi: un champ du Ton de marque jamais
+  // rempli (ex: "[coordonnees / site web]") partirait tel quel chez le client.
+  if (/\[(coordonn|nom du client|coller ici)[^\]]*\]/i.test(ack.body)) {
+    throw new Error("Ton de marque incomplet: l'accusé contient encore un champ à remplir entre crochets. Complétez « Ton de marque ».");
   }
 
   await tagSource("Messagerie — envoi de l'accusé", () =>

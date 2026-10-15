@@ -111,6 +111,8 @@ export interface ClassificationResult {
   urgency: "low" | "normal" | "high";
   summary: string;
   requiresAcknowledgement: boolean;
+  /** Sujet sensible (paiement, litige, reclamation...): un humain doit repondre, pas d'accuse automatique. */
+  needsHumanReply?: boolean;
   /** Renseigne quand la classification vient de creer cette categorie (aucune existante ne convenait). */
   createdCategory?: { id: string; label: string };
 }

@@ -10,6 +10,8 @@ import { createEmailConnector } from "../connectors/index.js";
 import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCheck.js";
 import { sendAcknowledgement } from "../pipeline/processIncoming.js";
 import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
+import { learnFromPastedThreads, refreshPlaybooks, undoLearningBatch } from "../pipeline/learning.js";
+import { renderLearningBody } from "./learningView.js";
 import {
   computeLiveMorningReport,
   formatReportDay,
@@ -25,6 +27,11 @@ import {
 import { getCategory } from "../settings.js";
 import { STAGES, changeStage, getLastKnownStage, getStage, isStage, minimumStageFor } from "../stage.js";
 import {
+  deleteCorpusExample,
+  getAckReviewStats,
+  listCorpusStats,
+  listPlaybookDates,
+  listRecentCorpusExamples,
   addCategoryRelanceStep,
   addThreadRelanceStep,
   clearThreadRelanceOverride,
@@ -97,7 +104,8 @@ import { stripQuotedHistory } from "../pipeline/emailText.js";
 
 const app = express();
 app.set("trust proxy", 1);
-app.use(express.urlencoded({ extended: false }));
+// 700 ko: la page Apprentissage reçoit des fils d'emails collés à la main (jusqu'à ~120 000 caractères).
+app.use(express.urlencoded({ extended: false, limit: "700kb" }));
 
 function query(req: Request): Record<string, string> {
   return req.query as unknown as Record<string, string>;
@@ -908,7 +916,15 @@ app.post("/envois/suivre", requireCsrf, async (req: Request, res: Response) => {
 app.get("/carnet", async (req: Request, res: Response) => {
   const entries = await listShadowLogEntries();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(await renderCarnetPage(entries, res.locals.csrfToken as string | undefined, query(req).saved, query(req).error));
+  res.send(
+    await renderCarnetPage(
+      entries,
+      res.locals.csrfToken as string | undefined,
+      query(req).saved,
+      query(req).error,
+      query(req).tout === "1"
+    )
+  );
 });
 
 async function runOrRedirectCarnetError(
@@ -945,6 +961,110 @@ app.post("/carnet/analyser", requireCsrf, async (req: Request, res: Response) =>
     return;
   }
   res.redirect("/carnet?saved=1");
+});
+
+// ---------- Apprentissage (maturité par catégorie + import manuel de fils) ----------
+
+app.get("/apprentissage", async (req: Request, res: Response) => {
+  const q = query(req);
+  const categories = await listCategories();
+  const stats = new Map((await listCorpusStats()).map((s) => [s.categoryId, s]));
+  const playbookDates = await listPlaybookDates();
+  const views = await Promise.all(
+    categories.map(async (c) => ({
+      id: c.id,
+      label: c.label,
+      concerned: c.acknowledgeAutomatically,
+      stats: stats.get(c.id),
+      playbook: await getCategoryPlaybook(c.id),
+      playbookDate: playbookDates.get(c.id),
+    }))
+  );
+  const learned = Number(q.learned);
+  const importResult =
+    q.learned !== undefined && Number.isFinite(learned)
+      ? { learned, seen: Number(q.seen) || 0, duplicates: Number(q.dup) || 0, batchId: /^[0-9a-f-]{36}$/.test(q.batch ?? "") ? q.batch : undefined }
+      : undefined;
+  const banner = q.error
+    ? `<div class="banner banner-error">L'action a échoué — voir la page <a href="/journal">Journal</a>.</div>`
+    : q.saved
+      ? `<div class="banner banner-ok">Enregistré.</div>`
+      : "";
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    pageShell(
+      "apprentissage",
+      "Apprentissage",
+      "Ce que l'IA a appris de la façon dont votre équipe répond, et ce qu'il lui manque encore pour être fiable.",
+      banner +
+        renderLearningBody(
+          {
+            categories: views,
+            recent: await listRecentCorpusExamples(8),
+            ackReview: await getAckReviewStats(),
+            importResult,
+          },
+          res.locals.csrfToken as string | undefined
+        )
+    )
+  );
+});
+
+app.post("/apprentissage/importer", requireCsrf, async (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  const text = (body.text ?? "").trim();
+  if (text.length < 40) {
+    res.redirect("/apprentissage?error=1");
+    return;
+  }
+  try {
+    const result = await learnFromPastedThreads(text, body.teamHint ?? "");
+    const params = new URLSearchParams({
+      learned: String(result.repliesLearned),
+      seen: String(result.threadsSeen),
+      dup: String(result.duplicatesSkipped),
+    });
+    if (result.batchId) params.set("batch", result.batchId);
+    res.redirect(`/apprentissage?${params.toString()}`);
+  } catch (err) {
+    console.error("[apprentissage_import] erreur:", err);
+    await recordPipelineError("apprentissage_import", null, (err as Error).message);
+    res.redirect("/apprentissage?error=1");
+  }
+});
+
+app.post("/apprentissage/annuler/:batchId", requireCsrf, async (req: Request, res: Response) => {
+  try {
+    await undoLearningBatch(String(req.params.batchId));
+    res.redirect("/apprentissage?saved=1");
+  } catch (err) {
+    console.error("[apprentissage_annuler] erreur:", err);
+    await recordPipelineError("apprentissage_annuler", null, (err as Error).message);
+    res.redirect("/apprentissage?error=1");
+  }
+});
+
+app.post("/apprentissage/exemple/:id/supprimer", requireCsrf, async (req: Request, res: Response) => {
+  try {
+    const categoryId = await deleteCorpusExample(Number(req.params.id));
+    if (categoryId) await refreshPlaybooks([categoryId]);
+    res.redirect("/apprentissage?saved=1");
+  } catch (err) {
+    console.error("[apprentissage_supprimer] erreur:", err);
+    await recordPipelineError("apprentissage_supprimer", null, (err as Error).message);
+    res.redirect("/apprentissage?error=1");
+  }
+});
+
+app.post("/apprentissage/analyser", requireCsrf, async (_req: Request, res: Response) => {
+  try {
+    await runCorpusAnalysis();
+    res.redirect("/apprentissage?saved=1");
+  } catch (err) {
+    console.error("[apprentissage_analyser] erreur:", err);
+    await recordPipelineError("apprentissage_analyser", null, (err as Error).message);
+    res.redirect("/apprentissage?error=1");
+  }
 });
 
 // ---------- Ton de marque (gabarit lu par l'IA avant chaque redaction) ----------
@@ -1065,6 +1185,7 @@ type ActivePage =
   | "journal"
   | "envois"
   | "carnet"
+  | "apprentissage"
   | "consommation"
   | "rapport"
   | "ton-de-marque"
@@ -1079,6 +1200,7 @@ const NAV_ICONS: Record<ActivePage, string> = {
   journal: `<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>`,
   envois: `<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>`,
   carnet: `<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>`,
+  apprentissage: `<path d="M22 10 12 5 2 10l10 5 10-5z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/>`,
   rapport: `<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>`,
   consommation: `<line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>`,
   "ton-de-marque": `<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>`,
@@ -1092,6 +1214,7 @@ const NAV_ITEMS: Array<{ key: ActivePage; href: string; label: string }> = [
   { key: "reglages", href: "/reglages", label: "Réglages" },
   { key: "journal", href: "/journal", label: "Journal" },
   { key: "envois", href: "/envois", label: "Envois" },
+  { key: "apprentissage", href: "/apprentissage", label: "Apprentissage" },
   { key: "carnet", href: "/carnet", label: "Carnet" },
   { key: "consommation", href: "/consommation", label: "Consommation IA" },
   { key: "connexion", href: "/connect", label: "Connexion messagerie" },
@@ -1111,7 +1234,12 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
         <div class="conn-line"><span class="conn-dot"></span>${connection.provider === "gmail" ? "Gmail" : "Outlook / M365"} connecté</div>
         <div class="conn-sub">${escapeHtml(connection.email)}</div>
       </div>`
-    : `<div class="conn-card">
+    : config.emailConnector === "imap"
+      ? `<div class="conn-card">
+        <div class="conn-line"><span class="conn-dot"></span>Boîte IMAP (lecture seule)</div>
+        <div class="conn-sub">${escapeHtml(config.imap.mailboxAddress || config.imap.user || "non configurée")}</div>
+      </div>`
+      : `<div class="conn-card">
         <div class="conn-line"><span class="conn-dot off"></span>Messagerie non connectée</div>
         <div class="conn-sub"><a href="/connect">Connecter une boîte →</a></div>
       </div>`;
@@ -2175,6 +2303,7 @@ const AI_CALL_TYPE_LABELS: Record<string, string> = {
   relance_pre_reponse: "Rédaction d'une relance (avant notre réponse)",
   relance_post_reponse: "Rédaction d'une relance (après notre réponse)",
   analyse_corpus: "Analyse du corpus de réponses (mode carnet)",
+  import_apprentissage: "Lecture de fils collés (page Apprentissage)",
 };
 
 function aiCallTypeLabel(callType: string): string {
@@ -2419,11 +2548,14 @@ function formatMinutesLabel(minutes: number): string {
   return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
 }
 
+const CARNET_PAGE_SIZE = 20;
+
 async function renderCarnetPage(
   entries: CarnetEntry[],
   csrfToken: string | undefined,
   saved: string | undefined,
-  error: string | undefined
+  error: string | undefined,
+  showAll = false
 ): Promise<string> {
   const banner = error
     ? `<div class="banner banner-error">L'action a échoué — voir la page <a href="/journal">Journal</a>.</div>`
@@ -2431,28 +2563,79 @@ async function renderCarnetPage(
       ? `<div class="banner banner-ok">Enregistré.</div>`
       : "";
 
-  const analyseForm = `<form method="POST" action="/carnet/analyser" style="margin-bottom:16px;">
-    ${csrfField(csrfToken)}
-    <button class="btn btn-primary btn-sm" type="submit">Analyser le corpus maintenant</button>
-    <span class="ledger-meta">Relit les vraies réponses de l'équipe reçues jusqu'ici et met à jour la note de style par catégorie.</span>
-  </form>`;
+  // Ce qui mérite d'être relu: les emails pour lesquels l'IA a rédigé un
+  // accusé. Les autres (aucun accusé) n'ont rien à relire: simple liste
+  // compacte repliée, avec la raison.
+  const withAck = entries.filter((e) => e.ackDrafted);
+  const withoutAck = entries.filter((e) => !e.ackDrafted);
+  const shown = showAll ? withAck : withAck.slice(0, CARNET_PAGE_SIZE);
 
-  const list = entries.length
+  const reasonCounts = new Map<string, number>();
+  for (const e of withoutAck) {
+    const key = CARNET_NO_ACK_SHORT[e.ackSkipReason ?? ""] ?? CARNET_NO_ACK_SHORT[""];
+    reasonCounts.set(key, (reasonCounts.get(key) ?? 0) + 1);
+  }
+  const summary = `<p class="section-hint"><strong>${entries.length}</strong> email(s) reçu(s) — <strong>${withAck.length}</strong> avec un accusé à relire, <strong>${withoutAck.length}</strong> sans accusé${
+    withoutAck.length ? ` (${[...reasonCounts.entries()].map(([k, n]) => `${n} ${escapeHtml(k)}`).join(", ")})` : ""
+  }. L'apprentissage de la façon de répondre se suit sur la page <a href="/apprentissage">Apprentissage</a>.</p>`;
+
+  const list = withAck.length
     ? `<div class="ledger">
-        <div class="ledger-head"><span>Email reçu</span></div>
-        ${entries.map((e) => renderCarnetRow(e, csrfToken)).join("")}
-      </div>`
-    : `<div class="ledger"><div class="empty">Aucun accusé rédigé pour l'instant cette semaine.</div></div>`;
+        <div class="ledger-head"><span>Accusés à relire</span></div>
+        ${shown.map((e) => renderCarnetRow(e, csrfToken)).join("")}
+      </div>${
+        !showAll && withAck.length > shown.length
+          ? `<p class="section-hint" style="margin-top:12px;"><a href="/carnet?tout=1">Voir les ${withAck.length - shown.length} accusé(s) plus ancien(s)</a></p>`
+          : ""
+      }`
+    : `<div class="ledger"><div class="empty">Aucun accusé rédigé pour l'instant.</div></div>`;
+
+  const noAckList = withoutAck.length
+    ? `<details style="margin-top:22px;"><summary style="cursor:pointer;font-weight:600;">${withoutAck.length} email(s) sans accusé</summary>
+        <div class="compact-list" style="margin-top:10px;">${withoutAck
+          .slice(0, 100)
+          .map(
+            (e) => `<div class="compact-row">
+          <span><span class="stamp stamp-external">${escapeHtml(e.categoryLabel)}</span></span>
+          <span>${escapeHtml(e.originalSubject)}<div class="ledger-meta">${escapeHtml(e.senderName ?? e.senderEmail)} — ${escapeHtml(formatDateTime(e.createdAt))}</div></span>
+          <span class="ledger-meta">${escapeHtml(CARNET_NO_ACK_REASONS[e.ackSkipReason ?? ""] ?? CARNET_NO_ACK_REASONS[""])}</span>
+        </div>`
+          )
+          .join("")}</div></details>`
+    : "";
 
   return pageShell(
     "carnet",
     "Carnet — semaine pilote",
-    `Tout ce que le pipeline a reçu et comment l'IA l'a classé (catégorie, urgence) — avec l'accusé qu'elle aurait rédigé quand il y en a un. Rien n'est envoyé au client. Seul le rappel interne à l'équipe (délai réglable par catégorie dans Réglages) part réellement. Cochez « aurait pu partir tel quel » en relisant avant la réunion.`,
-    banner + analyseForm + (await renderCorpusPanel()) + list
+    `Les accusés que l'IA a rédigés sans les envoyer, à relire avant la réunion. Rien n'est envoyé au client. Seul le rappel interne à l'équipe (délai réglable par catégorie dans Réglages) part réellement. Cochez « aurait pu partir tel quel » quand l'accusé vous convient.`,
+    banner + summary + list + noAckList
   );
 }
 
+const CARNET_NO_ACK_SHORT: Record<string, string> = {
+  ia: "jugés inutiles par l'IA",
+  categorie: "catégorie sans accusé",
+  equipe: "équipe déjà intervenue",
+  sensible: "sujet sensible",
+  "": "en cours ou en erreur",
+};
+
 const CARNET_URGENCY_LABELS: Record<string, string> = { low: "Faible", normal: "Normale", high: "Haute" };
+
+const CARNET_NO_ACK_REASONS: Record<string, string> = {
+  ia: "Aucun — l'IA a jugé qu'aucun accusé n'était nécessaire pour cet email (information, notification...).",
+  categorie: "Aucun — cette catégorie n'envoie pas d'accusé automatique (voir Réglages).",
+  equipe: "Aucun — l'équipe a déjà répondu dans cette conversation.",
+  sensible: "Aucun — sujet sensible (paiement, litige, réclamation) : une personne doit répondre.",
+  "": "Aucun accusé rédigé pour l'instant (rédaction en cours, ou erreur — voir le Journal).",
+};
+
+/** Texte long replié: les 500 premiers caractères, le reste derrière « Voir tout ». */
+function collapsibleText(text: string, max: number): string {
+  const html = (t: string) => escapeHtml(t).replace(/\n/g, "<br />");
+  if (text.length <= max) return html(text);
+  return `${html(text.slice(0, max).trimEnd())}… <details style="display:inline;"><summary style="cursor:pointer;display:inline;color:var(--accent-800);">Voir tout</summary>${html(text)}</details>`;
+}
 
 function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): string {
   const senderLabel = entry.senderName ? `${entry.senderName} <${entry.senderEmail}>` : entry.senderEmail;
@@ -2460,7 +2643,7 @@ function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): str
 
   const ackFact = entry.ackDrafted
     ? `<div class="ledger-fact"><span class="fact-label">Accusé rédigé par l'IA</span><span class="fact-value">${escapeHtml(entry.ackBody).replace(/\n/g, "<br />")}</span></div>`
-    : `<div class="ledger-fact"><span class="fact-label">Accusé</span><span class="fact-value">Aucun — l'IA a jugé qu'aucun accusé n'était nécessaire pour cet email.</span></div>`;
+    : `<div class="ledger-fact"><span class="fact-label">Accusé</span><span class="fact-value">${escapeHtml(CARNET_NO_ACK_REASONS[entry.ackSkipReason ?? ""] ?? CARNET_NO_ACK_REASONS[""])}</span></div>`;
 
   const reviewAction = entry.ackDrafted
     ? `<form method="POST" action="/carnet/${entry.id}/revue">
@@ -2480,7 +2663,7 @@ function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): str
       <span class="subject-static">${escapeHtml(entry.originalSubject)}</span>
       <div class="ledger-meta">${escapeHtml(senderLabel)} — reçu le ${escapeHtml(formatDateTime(entry.createdAt))}</div>
       <div class="ledger-facts">
-        <div class="ledger-fact"><span class="fact-label">Email reçu</span><span class="fact-value">${escapeHtml(stripQuotedHistory(entry.receivedBody)).replace(/\n/g, "<br />")}</span></div>
+        <div class="ledger-fact"><span class="fact-label">Email reçu</span><span class="fact-value">${collapsibleText(stripQuotedHistory(entry.receivedBody), 500)}</span></div>
         ${ackFact}
         <div class="ledger-fact"><span class="fact-label">Rappel personnel</span><span class="fact-value">${entry.rappelEnvoye ? '<span class="stamp stamp-done">Envoyé</span>' : entry.rappelSimule ? '<span class="stamp stamp-internal">Simulé — non envoyé</span>' : '<span class="stamp stamp-wait">Pas encore</span>'}</span></div>
         <div class="ledger-fact"><span class="fact-label">Délai avant réponse humaine</span><span class="fact-value">${entry.humanReplyDelayMinutes === null ? "— pas encore répondu" : formatMinutesLabel(entry.humanReplyDelayMinutes)}</span></div>
@@ -2489,52 +2672,6 @@ function renderCarnetRow(entry: CarnetEntry, csrfToken: string | undefined): str
     <div class="ledger-actions">
       ${reviewAction}
     </div>
-  </div>`;
-}
-
-/**
- * Rend visible ce que la passe d'analyse (corpusAnalysis.ts) a produit
- * jusqu'ici — sans ca, "l'IA a appris de vos reponses" reste une affirmation
- * invisible: aucune autre page n'affiche le contenu du corpus ni la note de
- * style generee. Une categorie sans aucune reponse capturee n'apparait pas
- * ici (rien a montrer).
- */
-async function renderCorpusPanel(): Promise<string> {
-  const categoryIds = await listCategoriesWithCorpus();
-  if (categoryIds.length === 0) {
-    return `<div class="settings-section">
-      <h2>Corpus des réponses de l'équipe</h2>
-      <p class="section-hint">Aucune réponse humaine capturée pour l'instant cette semaine.</p>
-    </div>`;
-  }
-
-  const labelById = new Map((await listCategories()).map((c) => [c.id, c.label]));
-  const blocks = (
-    await Promise.all(
-      categoryIds.map(async (id) => {
-        const label = labelById.get(id) ?? id;
-        const count = (await listHumanReplyCorpusByCategory(id)).length;
-        const playbook = await getCategoryPlaybook(id);
-        return `<div class="category-block">
-        <div class="ledger-meta" style="padding: 10px 14px;">
-          <strong>${escapeHtml(label)}</strong> — ${count} réponse(s) capturée(s)${
-            playbook ? "" : ` — note de style pas encore générée (cliquez "Analyser le corpus maintenant")`
-          }
-        </div>
-        ${
-          playbook
-            ? `<pre style="white-space: pre-wrap; padding: 12px 14px; margin: 0; font-size: 12.5px; border-top: 1px solid var(--rule); font-family: var(--font-mono);">${escapeHtml(playbook)}</pre>`
-            : ""
-        }
-      </div>`;
-      })
-    )
-  ).join("");
-
-  return `<div class="settings-section">
-    <h2>Corpus des réponses de l'équipe</h2>
-    <p class="section-hint">Ce que l'IA a appris jusqu'ici, catégorie par catégorie — mis à jour uniquement en cliquant "Analyser le corpus maintenant" ci-dessus (ou au cycle quotidien automatique), relu ensuite par le prompt de rédaction de l'accusé.</p>
-    ${blocks}
   </div>`;
 }
 

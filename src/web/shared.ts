@@ -203,6 +203,27 @@ export function sharedStyles(primaryColor: string): string {
   .settings-section { margin-bottom: 34px; }
   .settings-section h2 { font-family: var(--font-display); font-size: 17px; margin: 0 0 4px; font-weight: 600; }
   .settings-section .section-hint { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 14px; }
+  .learn-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 30px; }
+  .learn-tile { border: 1px solid var(--rule); padding: 14px 16px; }
+  .learn-tile-value { font-family: var(--font-display); font-size: 26px; font-weight: 600; color: var(--accent-800); line-height: 1.15; }
+  .learn-tile-label { font-size: 13px; font-weight: 600; margin-top: 4px; }
+  .learn-tile-sub { font-size: 12px; color: var(--ink-soft); margin-top: 2px; }
+  .learn-list { border: 1px solid var(--rule); }
+  .learn-row { display: grid; grid-template-columns: minmax(180px, 1.4fr) minmax(120px, 1fr) 60px 2fr; gap: 8px 14px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--rule); }
+  .learn-row:last-child { border-bottom: 0; }
+  .learn-row-main { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .learn-bar { height: 8px; background: var(--accent-100); overflow: hidden; }
+  .learn-bar span { display: block; height: 100%; background: var(--accent-800); }
+  .learn-count { font-size: 12.5px; color: var(--ink-soft); text-align: right; }
+  .learn-hint { font-size: 12.5px; color: var(--ink-soft); }
+  .learn-note { grid-column: 1 / -1; }
+  .learn-note summary { cursor: pointer; font-size: 12.5px; color: var(--accent-800); }
+  .learn-note pre { white-space: pre-wrap; font-size: 12.5px; font-family: var(--font-mono); margin: 8px 0 0; padding: 10px 12px; border: 1px solid var(--rule); }
+  .learn-example { padding: 12px 0; border-bottom: 1px solid var(--rule); font-size: 13.5px; }
+  .compact-list { border: 1px solid var(--rule); font-size: 13px; }
+  .compact-row { display: grid; grid-template-columns: minmax(130px, 1fr) 2fr 1.6fr; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--rule); align-items: baseline; }
+  .compact-row:last-child { border-bottom: 0; }
+  @media (max-width: 760px) { .learn-row, .compact-row { grid-template-columns: 1fr; } .learn-count { text-align: left; } }
   .category-block { border: 1px solid var(--rule); border-radius: 0; background: transparent; margin-bottom: 14px; overflow: hidden; }
   .category-head-form {
     display: grid; grid-template-columns: 1.8fr .8fr 1fr 1.5fr auto; gap: 12px; align-items: center;
