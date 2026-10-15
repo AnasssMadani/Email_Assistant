@@ -1,3 +1,4 @@
+import { stripQuotedHistory } from "./emailText.js";
 import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { isSendAllowed } from "../stage.js";
@@ -173,7 +174,7 @@ export async function checkPreReplyThread(
     await recordHumanReplyCorpus({
       threadId: row.thread_id,
       categoryId: row.category_id,
-      replyBody: replyAfterAck.bodyText,
+      replyBody: stripQuotedHistory(replyAfterAck.bodyText),
     });
     // Un humain vient de repondre de fond: ce n'est plus "notre equipe est
     // en retard", c'est desormais "on attend le client" — nouvelle phase.
