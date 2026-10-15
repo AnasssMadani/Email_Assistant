@@ -1,6 +1,7 @@
 import { getCategory } from "../settings.js";
 import { classifyEmail } from "../ai/classify.js";
 import { tagSource } from "./errorTag.js";
+import { isInternalNotificationSubject } from "../utils.js";
 import {
   getThreadRow,
   isMessageProcessed,
@@ -50,6 +51,13 @@ export async function discoverOutboundOnlyThreads(connector: EmailConnector): Pr
 
 async function registerIfNewThread(connector: EmailConnector, message: EmailMessage): Promise<void> {
   await markMessageProcessed(message.id, message.threadId);
+
+  // Nos propres emails internes (rappel equipe, rapport du matin) ne sont pas
+  // des envois a froid a relancer. Le marquage "deja traite" fait a l'envoi
+  // ne suffit pas toujours: Graph (sendMail) ne renvoie pas l'id du message
+  // envoye, donc sa copie "Envoyes" arrive ici avec un id jamais vu. Sans
+  // risque d'usurpation: ce message sort de notre propre boite.
+  if (isInternalNotificationSubject(message.subject)) return;
 
   if (await getThreadRow(message.threadId)) return; // deja suivi (dossier normal ou deja decouvert)
 

@@ -190,12 +190,44 @@ connexion (étape 3).
 3. Dans "Redirect URIs" (type **Web**), ajoutez la valeur de
    `AZURE_REDIRECT_URI` (`http://localhost:4300/auth/graph/callback` par défaut).
 4. API permissions → Microsoft Graph → **Delegated permissions**:
-   `Mail.Read`, `Mail.Send`, `Mail.ReadWrite`, `User.Read`, `offline_access`.
+   `Mail.Read`, `Mail.Send`, `User.Read`, `offline_access`.
+   Pas de `Mail.ReadWrite` : la boîte reste en lecture seule (rien n'est
+   marqué lu/non lu, déplacé, supprimé ni déposé en brouillon).
    Ne demandez jamais de permissions applicatives tenant-wide pour ce projet.
 5. Certificates & secrets → créez un client secret.
 6. Renseignez `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_TENANT_ID`
    dans `.env` (`AZURE_TENANT_ID=common` si multitenant, sinon l'ID du
    tenant du client).
+
+**IMAP / SMTP (Roundcube, cPanel, toute boîte classique)** — pas d'OAuth ni
+de page de connexion: renseignez `EMAIL_CONNECTOR=imap` et les variables
+`IMAP_*` / `SMTP_*` dans `.env` (voir `.env.example`). Ce choix prime sur
+une éventuelle connexion Gmail/Outlook enregistrée.
+
+**Mode « boîte copie » (recommandé, sans le mot de passe de la boîte du
+client)**: une boîte dédiée (ex. `assistant@domaine`) reçoit, par une
+redirection cPanel, une copie de chaque email arrivant sur l'adresse
+partagée, et les réponses de l'équipe en Cci (champ « Cci » de l'identité
+Roundcube). On renseigne alors `IMAP_USER` / `IMAP_PASSWORD` de la boîte
+dédiée et `IMAP_MAILBOX_ADDRESS` = l'adresse partagée, pour que les réponses
+de l'équipe soient reconnues comme les nôtres. Le programme ne se connecte
+jamais à la boîte du client.
+
+La boîte est **strictement en lecture seule**: dossiers ouverts avec
+`EXAMINE` (jamais `SELECT`), contenu lu avec `BODY.PEEK[]` (rien n'est
+marqué comme lu), aucune commande `STORE`, `COPY`, `MOVE`, `APPEND`,
+`EXPUNGE`, `CLOSE`, `CREATE` ou `DELETE`. Un garde-fou en liste blanche
+(`src/connectors/imapReadOnlyGuard.ts`) bloque toute autre commande avant
+l'envoi réseau, et `test/imapConnector.test.ts` le vérifie contre un
+serveur IMAP factice qui enregistre chaque commande reçue.
+
+Conséquence: les accusés et relances envoyés par SMTP n'apparaissent pas
+dans le dossier « Envoyés » (y déposer une copie serait une écriture). Ils
+sont mémorisés en base (`smtp_sent_messages`) et réintégrés au fil par le
+connecteur, pour que la détection de réponse humaine fonctionne comme avec
+Gmail/Outlook. Un fil IMAP est reconstitué par les en-têtes
+`References` / `In-Reply-To` (pas par l'objet), sur les
+`IMAP_THREAD_LOOKBACK_DAYS` derniers jours (60 par défaut).
 
 ### 4. Page de connexion (le client branche sa boîte lui-même)
 
@@ -281,14 +313,16 @@ Le projet tourne en **deux instances séparées**, chacune avec son propre
 projet Supabase — jamais la même base ni la même messagerie connectée:
 
 - **`globallink-dev`** — pour tester et corriger des bugs sans risque.
-  Connectée à sa propre messagerie de test, et tourne avec `SHADOW_MODE=true`
-  ("Mode test", bandeau rouge visible sur chaque page admin): le pipeline
-  classe et rédige normalement, mais n'envoie jamais réellement d'accusé ni
-  de relance externe. Deux garde-fous indépendants — la mauvaise
+  Connectée à sa propre messagerie de test, et verrouillée à l'étape 0 par
+  `MAX_STAGE=0` (bandeau rouge visible sur chaque page admin): le pipeline
+  classe et rédige normalement, mais n'envoie jamais réellement d'accusé, de
+  relance ni de rappel. Deux garde-fous indépendants — la mauvaise
   configuration d'un seul des deux ne suffit donc jamais à joindre un vrai
   client.
-- **`globallink-prod`** — la messagerie réelle du client, `SHADOW_MODE`
-  désactivé.
+- **`globallink-prod`** — la messagerie réelle du client, sans plafond.
+  L'étape d'activation (0 silencieux, 1 envoi réel, 2 brouillons, 3 réponse
+  directe) se bascule à la main depuis la page **Étape d'activation**
+  (`/etape`) du back-office ; une base neuve démarre à l'étape 0.
 
 [`render.yaml`](render.yaml) décrit les deux services sous forme de
 blueprint. `globallink-prod` suit la branche `main`, `globallink-dev` suit
@@ -430,7 +464,7 @@ config/
 supabase/
   migrations/0001_init.sql  schéma Postgres, appliqué automatiquement au démarrage (voir src/db.ts)
 src/
-  connectors/               Gmail et Microsoft Graph (interface commune EmailConnector)
+  connectors/               Gmail, Microsoft Graph et IMAP/SMTP (interface commune EmailConnector)
   web/server.ts             login + connexion messagerie + suivi des dossiers + réglages + journal
   web/auth.ts                sessions, CSRF, hash de mot de passe, limitation des tentatives
   crypto.ts                  chiffrement AES-256-GCM des jetons OAuth au repos

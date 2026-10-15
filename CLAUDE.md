@@ -37,7 +37,10 @@ and Microsoft Graph as pluggable connectors behind `EmailConnector` (`src/types.
    sequence from pre_reply, same category-or-thread-override model.
 4. Every relance step run is logged via `recordReminder(threadId, kind, note, stepType)`
    — `stepType` is one of `accuse | relance_interne | relance_interne_filtree |
-   relance_externe_pre_reponse | relance_externe_post_reponse` and is the reliable,
+   relance_interne_test | relance_externe_pre_reponse | relance_externe_post_reponse |
+   relance_externe_test_pre_reponse | relance_externe_test_post_reponse`
+   (`*_test*` = a step that would have gone out but didn't because the activation
+   stage is 0 — `src/stage.ts`: stage 0 sends nothing, not even to the team) and is the reliable,
    query-safe source of truth for "did X happen" (used by the client dashboard
    checklist) — never deduce this from the note's free text.
 5. `src/pipeline/discoverOutbound.ts`: catches cold outreach (an email we send with no
@@ -63,6 +66,9 @@ src/db.ts           schema + all queries. Client-safe projections live in a dedi
                     section at the bottom (listClientThreads, getClientThreadDetail, etc.)
                     — never expose a full ThreadRow/CategoryRow to a client view.
 src/config.ts       all env vars, one place
+src/stage.ts        activation stage (0 silent, 1 real sending, 2 drafts, 3 direct reply) —
+                    stored in DB (app_settings), toggled at /etape. isSendAllowed(action) is the
+                    ONE gate every send path calls; fails closed to 0; MAX_STAGE env caps it
 src/settings.ts     getCategory() — thin wrapper over db.listCategories(), no caching
 src/scheduler.ts    cron wiring (pollIntervalCron, relanceCheckCron, both default */2 * * * *)
 ```
@@ -111,6 +117,16 @@ boundary — extend those, don't bypass them by handing a client view raw admin 
 
 ## Gotchas worth knowing before touching the pipeline
 
+- **Every outbound send goes through `isSendAllowed(action)`** (`src/stage.ts`) — never
+  compare the stage yourself, never add a send path without it. Stage 0 drafts and logs
+  (notes prefixed `[Mode test]`) but sends nothing, internal team rappels included. At
+  stage ≥1 a pre_reply client relance is skipped when `automated_outbound_count === 0`
+  (accusé was only drafted at stage 0) so a client never gets a relance without an accusé.
+- **Classification may create a category** (`NEW_CATEGORY_ID` in `classify.ts` →
+  `createCategoryFromAi` in `db.ts`): it copies the fallback category's settings and
+  relance steps (behaviour-neutral), reuses an existing category with the same slug, and is
+  capped by `AI_CATEGORIES_MAX_PER_DAY` (rolling 24h) — beyond that, `autre`.
+
 - **"Was this reply automated or human?"** is solved by *counting*
   (`automated_outbound_count` on `threads`, incremented after every automated send),
   never by matching message content or ids — round-tripping through Gmail/Graph can
@@ -151,6 +167,15 @@ boundary — extend those, don't bypass them by handing a client view raw admin 
 Note: `tsconfig.json` only type-checks `src/` — `test/` files are excluded, so a
 breaking change to an exported function's signature is only caught by actually running
 `npm test`, not by `tsc --noEmit` alone.
+
+## Read-only mailbox (rule n°1)
+
+The connected mailbox is strictly read-only: never mark read/unread, move, delete,
+label, or create drafts. Connectors expose only reads plus `sendReply` /
+`sendNotification` (Graph replies use the one-shot `/reply` action, not
+`createReply` + draft). OAuth scopes are read + send only (no `gmail.modify`/
+`gmail.compose`, no `Mail.ReadWrite`). `test/mailboxReadOnly.test.ts` and
+`test/silentModeNoSend.test.ts` enforce this — don't add a write method.
 
 ## Standing constraint
 

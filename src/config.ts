@@ -47,7 +47,46 @@ export const config = {
   // (le disque de build n'est pas persistant, contrairement a /var/data).
   brandVoicePath: process.env.BRAND_VOICE_PATH ?? "./config/brand-voice.md",
   connectionStatePath: process.env.CONNECTION_STATE_PATH ?? "./data/connection.json",
-  emailConnector: (process.env.EMAIL_CONNECTOR ?? "gmail") as "gmail" | "graph",
+  emailConnector: (process.env.EMAIL_CONNECTOR ?? "gmail") as "gmail" | "graph" | "imap",
+  // Boite IMAP/SMTP classique (ex: Roundcube/cPanel) — utilisee quand
+  // EMAIL_CONNECTOR=imap. Pas de flux OAuth: identifiants lus ici
+  // uniquement, jamais versionnes (voir .env.example). La lecture IMAP est
+  // strictement passive (EXAMINE + BODY.PEEK, voir imapReadOnlyGuard.ts).
+  imap: {
+    host: process.env.IMAP_HOST ?? "",
+    port: Number(process.env.IMAP_PORT ?? 993),
+    // true = TLS des la connexion (port 993) ; false = STARTTLS (port 143).
+    secure: (process.env.IMAP_SECURE ?? "true") !== "false",
+    user: process.env.IMAP_USER ?? "",
+    password: process.env.IMAP_PASSWORD ?? "",
+    // Mode "boite copie": IMAP_USER/IMAP_PASSWORD sont ceux d'une boite
+    // dediee (ex: assistant@domaine) qui recoit, par une redirection cPanel,
+    // une copie de chaque email arrivant sur l'adresse partagee. On ne se
+    // connecte alors jamais a la boite du client. Renseigner ici l'adresse
+    // partagee (ex: contact@domaine) pour reconnaitre les reponses de
+    // l'equipe (recues en Cci). Vide = SMTP_FROM, puis IMAP_USER.
+    mailboxAddress: process.env.IMAP_MAILBOX_ADDRESS ?? "",
+    inboxFolder: process.env.IMAP_INBOX_FOLDER ?? "INBOX",
+    // Vide = detection automatique via LIST (attribut special-use \Sent),
+    // avec repli sur les noms usuels cPanel/Dovecot ("INBOX.Sent", "Sent").
+    sentFolder: process.env.IMAP_SENT_FOLDER ?? "",
+    // Fenetre de recherche des messages d'un fil (getThread). Sur une boite
+    // de ~800 emails/jour, une recherche d'en-tete sans borne de date
+    // parcourrait des centaines de milliers de messages a chaque cycle.
+    threadLookbackDays: Number(process.env.IMAP_THREAD_LOOKBACK_DAYS ?? 60),
+  },
+  smtp: {
+    host: process.env.SMTP_HOST ?? "",
+    port: Number(process.env.SMTP_PORT ?? 465),
+    // true = TLS des la connexion (port 465) ; false = STARTTLS (port 587).
+    secure: (process.env.SMTP_SECURE ?? "true") !== "false",
+    // Vides = memes identifiants que l'IMAP (cas cPanel standard).
+    user: process.env.SMTP_USER ?? "",
+    password: process.env.SMTP_PASSWORD ?? "",
+    // Adresse "From" des envois et adresse comparee pour isFromUs. Vide =
+    // IMAP_USER (sur cPanel, l'identifiant EST l'adresse email).
+    fromAddress: process.env.SMTP_FROM ?? "",
+  },
   // Cle AES-256 (64 caracteres hexadecimaux) pour chiffrer les jetons OAuth au
   // repos. Generer avec: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   // Si absente, les jetons restent en clair sur disque (avertissement au demarrage).
@@ -56,12 +95,17 @@ export const config = {
   // notification part alors vers la messagerie connectee elle-meme, comme
   // un pense-bete dans sa propre boite plutot que dans le vide.
   notificationEmail: process.env.NOTIFICATION_EMAIL ?? "",
-  // Mode "carnet" (semaine pilote): le pipeline classe et redige normalement,
-  // mais aucun accuse/brouillon n'est reellement envoye ni depose — tout est
-  // journalise dans shadow_log a la place (voir processIncoming.ts). Seul le
-  // rappel interne personnel reste un envoi reel. Permanent tant que
-  // desactive manuellement (pas de bascule automatique, pas de date de fin).
-  shadowModeEnabled: process.env.SHADOW_MODE === "true",
+  // Plafond d'environnement de l'etape d'activation (voir src/stage.ts).
+  // L'etape elle-meme vit en base et se bascule depuis /etape ; ce plafond
+  // permet a un deploiement (ex: globallink-dev, voir render.yaml) de rester
+  // verrouille en silencieux quoi qu'on choisisse dans le back-office.
+  // Ancien SHADOW_MODE=true toujours honore (= MAX_STAGE=0) pour ne pas
+  // lever le verrou d'un deploiement existant a la mise a jour.
+  maxStage: parseMaxStage(process.env.MAX_STAGE, process.env.SHADOW_MODE),
+  // Plafond de categories creees automatiquement par la classification sur
+  // 24h glissantes (voir createCategoryFromAi dans db.ts) — au-dela, l'email
+  // tombe dans la categorie de repli. 0 desactive la creation automatique.
+  aiCategoriesMaxPerDay: Math.max(0, Number(process.env.AI_CATEGORIES_MAX_PER_DAY ?? 3) || 0),
   // Dossier des notes de style par categorie, generees a partir du corpus des
   // vraies reponses de l'equipe (voir src/pipeline/corpusAnalysis.ts) et
   // relues par le prompt de redaction de l'accuse. Le contenu vit en base
@@ -112,7 +156,31 @@ export const config = {
   // attend simplement le cycle suivant. Les rappels internes (jamais vus
   // par un client) ne sont pas concernes par cette limite.
   maxExternalRelancesPerCycle: Number(process.env.MAX_EXTERNAL_RELANCES_PER_CYCLE ?? 5),
+  // Rapport du matin (voir src/pipeline/morningReport.ts). Heures locales
+  // dans config.timezone. Le rapport couvre les 24 h precedant `hour`; la
+  // "nuit" (emails arrives hors horaires de bureau, Chine, Turquie...) va de
+  // `nightStartHour` la veille jusqu'a `hour`. L'envoi par email lui-meme
+  // s'active depuis le back-office (/rapport), jamais par variable d'env.
+  morningReport: {
+    hour: Number(process.env.MORNING_REPORT_HOUR ?? 9),
+    nightStartHour: Number(process.env.MORNING_REPORT_NIGHT_START_HOUR ?? 18),
+    // Apres un redemarrage tardif, un rapport pas encore envoye ne part plus
+    // au-dela de ce delai apres l'heure prevue (un "rapport du matin" recu a
+    // 16 h induit en erreur) — il reste consultable dans le back-office.
+    sendCutoffHours: Number(process.env.MORNING_REPORT_SEND_CUTOFF_HOURS ?? 3),
+  },
 };
+
+/**
+ * Valeur invalide (texte, hors 0..3) => 0: un plafond mal saisi doit
+ * verrouiller les envois, jamais les ouvrir.
+ */
+function parseMaxStage(raw: string | undefined, legacyShadowMode: string | undefined): 0 | 1 | 2 | 3 {
+  if (legacyShadowMode === "true") return 0;
+  if (raw === undefined || raw.trim() === "") return 3;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 && n <= 3 ? (n as 0 | 1 | 2 | 3) : 0;
+}
 
 export function requireAnthropicApiKey(): string {
   return config.anthropicApiKey || required("ANTHROPIC_API_KEY");

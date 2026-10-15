@@ -1,8 +1,8 @@
-import { config } from "../config.js";
 import { getCategory } from "../settings.js";
+import { isSendAllowed } from "../stage.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
-import { buildReplySubject } from "../utils.js";
+import { buildReplySubject, isInternalNotificationSubject } from "../utils.js";
 import { tagSource } from "./errorTag.js";
 import {
   incrementAutomatedOutboundCount,
@@ -37,7 +37,8 @@ export async function processIncomingMessage(
   // facture, courant chez un transitaire) — on ne doit avaler ce message que
   // s'il vient EN PLUS de notre propre boite (auto-adresse), jamais sur le
   // seul prefixe d'objet, qui n'importe quel expediteur peut usurper.
-  const ownEmail = message.subject.startsWith("[Rappel]") ? await connector.getOwnEmailAddress() : undefined;
+  // Meme regle pour le rapport du matin ("[Rapport]", voir morningReport.ts).
+  const ownEmail = isInternalNotificationSubject(message.subject) ? await connector.getOwnEmailAddress() : undefined;
   if (ownEmail && message.from.email.toLowerCase() === ownEmail.toLowerCase()) {
     await markMessageProcessed(message.id, message.threadId);
     return;
@@ -126,6 +127,14 @@ export async function processIncomingMessage(
   });
   await markMessageProcessed(message.id, message.threadId);
 
+  if (classification.createdCategory) {
+    await recordReminder(
+      message.threadId,
+      "internal",
+      `[Catégorie] Nouvelle catégorie créée par l'IA : « ${classification.createdCategory.label} » (aucune catégorie existante ne convenait). Réglages repris de la catégorie de repli — à revoir dans Réglages.`
+    );
+  }
+
   if (!shouldAcknowledge) {
     console.log(`[skip] "${message.subject}" (${category.id}) — pas d'accuse requis.`);
     return;
@@ -173,7 +182,8 @@ export async function sendAcknowledgement(
 
   const ack = await draftAcknowledgement(thread, incoming, category);
 
-  if (config.shadowModeEnabled) {
+  // Etape 0 (silencieux): accuse redige et journalise, jamais envoye.
+  if (!(await isSendAllowed("accuse"))) {
     await recordAckDraft({
       threadId: incoming.threadId,
       messageId: incoming.id,
@@ -186,16 +196,15 @@ export async function sendAcknowledgement(
       ackBody: ack.body,
     });
     // Pas d'envoi reel, mais on fait quand meme avancer le dossier en
-    // pre_reply pour que le rappel interne (30 min, seul envoi reel
-    // autorise cette semaine, voir relanceCheck.ts) se declenche
-    // normalement. incrementAutomatedOutboundCount n'est PAS appele: aucun
+    // pre_reply pour que la sequence de relance avance (redigee, non
+    // envoyee elle aussi tant que l'etape reste 0 — voir relanceCheck.ts). incrementAutomatedOutboundCount n'est PAS appele: aucun
     // message reel n'a rejoint le fil, donc automated_outbound_count doit
     // rester a 0 de notre cote — sinon une VRAIE reponse de l'equipe (le
     // fil, relu, contient alors un message isFromUs de plus que ce
     // compteur) ne serait plus jamais detectee comme reponse humaine (voir
     // checkPreReplyThread dans relanceCheck.ts).
     await setThreadAckSent(incoming.threadId);
-    console.log(`[mode carnet] accuse redige (non envoye) pour ${incoming.from.email} — "${incoming.subject}"`);
+    console.log(`[silencieux] accuse redige (non envoye) pour ${incoming.from.email} — "${incoming.subject}"`);
     return;
   }
 
@@ -213,16 +222,10 @@ export async function sendAcknowledgement(
   // reconnaitre plus tard que ce message (retrouve dans le fil relu depuis
   // la messagerie) est notre propre accuse, pas une reponse humaine.
   await incrementAutomatedOutboundCount(incoming.threadId);
-  // Gmail/Graph marquent automatiquement tout le fil comme lu des qu'on y
-  // envoie une reponse (l'accuse ci-dessus) — sans ce correctif, le message
-  // du client disparait de la liste des non-lus alors que l'equipe ne l'a
-  // pas encore vu. Non bloquant: un echec ici ne doit pas faire echouer
-  // l'accuse deja envoye.
-  try {
-    await connector.markMessageUnread(incoming.id);
-  } catch (err) {
-    console.error(`[non-lu] echec du marquage non-lu pour ${incoming.id}:`, err);
-  }
+  // Aucun marquage lu/non lu ici (ni nulle part): la boite est en lecture
+  // seule. L'ancien "remettre en non lu" apres l'accuse ecrivait dans la
+  // boite, et pouvait meme remettre en non lu un email que l'equipe avait
+  // deja ouvert entre deux cycles.
   // Journalise le destinataire reel de l'accuse — sans ca, un envoi vers une
   // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est
   // visible nulle part avant qu'un rebond n'arrive dans la boite, et devient

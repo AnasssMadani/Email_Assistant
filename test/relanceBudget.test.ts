@@ -8,14 +8,23 @@ import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, Sen
 // send counts across many dossiers in one runRelanceCheck() call, which
 // would be fragile if it had to reason about leftover state from unrelated
 // tests.
-// Ce test verifie de vrais envois (budget de relances externes) — force a
-// "false" explicitement, sans quoi un .env local avec SHADOW_MODE=true (mode
-// carnet, voir config.ts) serait charge par dotenv/config et ferait passer
-// tous les sendReply attendus a 0.
+// Ce test verifie de vrais envois (budget de relances externes): etape 1 en
+// base, et aucun plafond d'environnement — sans quoi un .env local avec
+// MAX_STAGE=0 (ou l'ancien SHADOW_MODE=true) serait charge par dotenv/config
+// et ferait passer tous les envois attendus en silencieux.
 process.env.SHADOW_MODE = "false";
+process.env.MAX_STAGE = "3";
 
-const { addThreadRelanceStep, getThreadRow, listPipelineErrors, setThreadAckSent, upsertThreadReceived } =
-  await freshTestDb();
+const {
+  addThreadRelanceStep,
+  getThreadRow,
+  incrementAutomatedOutboundCount,
+  listPipelineErrors,
+  setStoredStage,
+  setThreadAckSent,
+  upsertThreadReceived,
+} = await freshTestDb();
+await setStoredStage(1);
 const { runRelanceCheck } = await import("../src/pipeline/relanceCheck.js");
 const { config } = await import("../src/config.js");
 
@@ -65,6 +74,7 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
       dueAt,
     });
     await setThreadAckSent(threadId);
+    await incrementAutomatedOutboundCount(threadId); // accuse reellement envoye
     // Une seule etape externe, deja due (delai 0 depuis l'echeance passee).
     await addThreadRelanceStep(threadId, { channel: "external", delayMinutes: 0 }, "pre_reply");
 
@@ -97,7 +107,6 @@ test("runRelanceCheck never sends more external relances in one cycle than the c
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 
   await runRelanceCheck(connector);
@@ -165,7 +174,6 @@ test("runRelanceCheck skips a dossier whose thread id doesn't match the currentl
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 
   await runRelanceCheck(graphConnector);

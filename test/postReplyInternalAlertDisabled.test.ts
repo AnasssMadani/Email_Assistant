@@ -7,15 +7,21 @@ import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, Sen
 // (pre_reply), pas quand c'est le CLIENT qui reste silencieux apres leur
 // reponse (post_reply) - ce second cas n'appelle aucune action de leur part
 // et ne doit plus jamais envoyer de vrai rappel interne, quelle que soit la
-// categorie/urgence configuree.
+// categorie/urgence configuree. Etape 1 (envoi reel) en base: a l'etape 0,
+// aucun rappel ne part de toute facon (voir shadowModeRelance.test.ts).
+process.env.SHADOW_MODE = "false";
+process.env.MAX_STAGE = "3";
+
 const {
   addThreadRelanceStep,
   getThreadRow,
   hasReminderStep,
   setThreadAckSent,
+  setStoredStage,
   setThreadHumanReplied,
   upsertThreadReceived,
 } = await freshTestDb();
+await setStoredStage(1);
 const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
 
 function fakeMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
@@ -55,7 +61,6 @@ function fakeConnector(thread: EmailThread, onSendNotification: () => void): Ema
       onSendNotification();
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 }
 

@@ -57,6 +57,32 @@ services:
         sync: false
       - key: ENCRYPTION_KEY
         sync: false
+      # Boite Roundcube/cPanel de Global Link (lecture seule, voir
+      # imapConnector.ts). Mode recommande: "boite copie" — IMAP_USER /
+      # IMAP_PASSWORD d'une boite dediee qui recoit une copie de tout le
+      # courrier, IMAP_MAILBOX_ADDRESS = l'adresse partagee copiee.
+      - key: EMAIL_CONNECTOR
+        value: imap
+      - key: IMAP_HOST
+        sync: false
+      - key: IMAP_USER
+        sync: false
+      - key: IMAP_PASSWORD
+        sync: false
+      - key: IMAP_MAILBOX_ADDRESS
+        sync: false
+      # Verrou d'etape: tant qu'il vaut 0, rien ne part, quoi qu'on choisisse
+      # dans /etape. A passer a "1" ici, par un commit, le jour de l'etape 1
+      # (apres validation ecrite de la direction de Global Link).
+      - key: MAX_STAGE
+        value: "0"
+      # Vides a l'etape 0: sans SMTP_HOST, aucun envoi n'est possible.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
       - key: BRAND_NAME
         value: Accusé & Relance
       - key: BRAND_PRIMARY_COLOR
@@ -67,9 +93,10 @@ services:
   # ---------- Developpement ----------
   # Meme code, meme build — deux garde-fous independants l'empechent
   # d'atteindre un vrai client: (1) sa propre messagerie de test connectee
-  # (jamais celle de production), et (2) SHADOW_MODE=true ("Mode test"), qui
-  # classe et redige normalement mais ne fait REELEMENT partir aucun accuse
-  # ni relance externe. Un seul de ces deux garde-fous mal configure ne
+  # (jamais celle de production), et (2) MAX_STAGE=0, qui verrouille l'etape
+  # d'activation sur 0 (silencieux) quoi qu'on choisisse dans /etape: le
+  # pipeline classe et redige normalement mais ne fait REELEMENT partir
+  # aucun accuse, relance ni rappel. Un seul de ces deux garde-fous mal configure ne
   # suffit donc jamais a joindre un client reel.
   - type: web
     name: globallink-dev
@@ -93,8 +120,8 @@ services:
       # separe de celui de production, jamais partage.
       - key: DATABASE_URL
         sync: false
-      - key: SHADOW_MODE
-        value: "true"
+      - key: MAX_STAGE
+        value: "0"
       - key: CONNECTION_STATE_PATH
         value: /var/data/connection.json
       - key: GOOGLE_TOKEN_PATH

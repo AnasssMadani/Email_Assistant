@@ -4,6 +4,12 @@ import { freshTestDb } from "./_pgTestDb.js";
 import type { ThreadRow } from "../src/db.js";
 import type { EmailConnector, EmailMessage, EmailThread, NotificationParams, SendReplyParams } from "../src/types.js";
 
+// Ces tests verifient de vrais envois: etape 1 (envoi reel) en base, et
+// aucun plafond d'environnement (un .env local avec MAX_STAGE=0 ou l'ancien
+// SHADOW_MODE=true serait sinon charge par dotenv/config).
+process.env.SHADOW_MODE = "false";
+process.env.MAX_STAGE = "3";
+
 const {
   addThreadRelanceStep,
   getThreadRow,
@@ -12,9 +18,11 @@ const {
   incrementRelance,
   listHumanReplyCorpusByCategory,
   setThreadAckSent,
+  setStoredStage,
   setThreadHumanReplied,
   upsertThreadReceived,
 } = await freshTestDb();
+await setStoredStage(1);
 const { checkPreReplyThread, checkPostReplyThread } = await import("../src/pipeline/relanceCheck.js");
 
 function fakeMessage(overrides: Partial<EmailMessage> = {}): EmailMessage {
@@ -53,7 +61,6 @@ function fakeConnector(thread: EmailThread): EmailConnector {
     async sendNotification(_params: NotificationParams) {
       return { id: "notif-1" };
     },
-    async markMessageUnread() {},
   };
 }
 
