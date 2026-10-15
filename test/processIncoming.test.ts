@@ -129,3 +129,22 @@ test("a classification failure creates a visible ai_error dossier instead of van
   // cycle de scrutation, pas abandonne definitivement.
   assert.equal(await isMessageProcessed(message.id), false);
 });
+
+test("a self-addressed morning report ([Rapport]) is never treated as a new client email", async () => {
+  let getThreadCalls = 0;
+  const connector = fakeConnector(async () => {
+    getThreadCalls++;
+    throw new Error("should never be called for our own [Rapport] subject");
+  });
+
+  const message = fakeIncomingMessage({
+    id: "msg-rapport-1",
+    threadId: "thread-rapport-1",
+    subject: "[Rapport] Rapport du matin — jeudi 15 octobre 2026",
+  });
+  await processIncomingMessage(connector, message);
+
+  assert.equal(getThreadCalls, 0);
+  assert.equal(await getThreadRow(message.threadId), undefined);
+  assert.equal(await isMessageProcessed(message.id), true);
+});

@@ -5,6 +5,7 @@ import { discoverOutboundOnlyThreads } from "./pipeline/discoverOutbound.js";
 import { processIncomingMessage } from "./pipeline/processIncoming.js";
 import { runRelanceCheck } from "./pipeline/relanceCheck.js";
 import { runCorpusAnalysis } from "./pipeline/corpusAnalysis.js";
+import { runMorningReport } from "./pipeline/morningReport.js";
 import { purgeShadowLogOlderThan, recordPipelineError } from "./db.js";
 
 // Un traitement d'email (classification + accuse + 3 brouillons, plusieurs
@@ -16,6 +17,7 @@ let pollInProgress = false;
 let relanceCheckInProgress = false;
 let discoverOutboundInProgress = false;
 let corpusAnalysisInProgress = false;
+let morningReportInProgress = false;
 
 async function pollInbox(): Promise<void> {
   if (pollInProgress) {
@@ -104,6 +106,27 @@ async function runShadowLogPurge(): Promise<void> {
   }
 }
 
+/**
+ * Rapport du matin (voir morningReport.ts). Idempotent: le rapport d'un jour
+ * n'est cree qu'une fois et envoye au plus une fois (reservation en base),
+ * d'ou l'appel sans risque au demarrage en plus de l'horaire planifie — un
+ * redemarrage a 9 h 30 rattrape le rapport manque, un redemarrage a 16 h le
+ * genere pour le back-office sans l'envoyer (voir sendCutoffHours).
+ */
+async function morningReport(): Promise<void> {
+  if (morningReportInProgress) return;
+  morningReportInProgress = true;
+  try {
+    const outcome = await runMorningReport();
+    console.log(`[rapport du matin] ${outcome}`);
+  } catch (err) {
+    console.error("[rapport du matin] erreur:", err);
+    await recordPipelineError("morning_report", null, (err as Error).message);
+  } finally {
+    morningReportInProgress = false;
+  }
+}
+
 export function startScheduler(): void {
   console.log(`Connecteur actif au demarrage: ${createEmailConnector().name}`);
   console.log(`Scrutation boite: ${config.pollIntervalCron}`);
@@ -122,4 +145,9 @@ export function startScheduler(): void {
   // planifie.
   cron.schedule(config.dailyAnalysisCron, () => void runDailyCorpusAnalysis());
   cron.schedule(config.dailyAnalysisCron, () => void runShadowLogPurge());
+
+  const reportHour = config.morningReport.hour;
+  console.log(`Rapport du matin: ${reportHour}h (${config.timezone})`);
+  void morningReport();
+  cron.schedule(`0 ${reportHour} * * *`, () => void morningReport(), { timezone: config.timezone });
 }

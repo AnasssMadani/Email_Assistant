@@ -204,6 +204,15 @@ de page de connexion: renseignez `EMAIL_CONNECTOR=imap` et les variables
 `IMAP_*` / `SMTP_*` dans `.env` (voir `.env.example`). Ce choix prime sur
 une éventuelle connexion Gmail/Outlook enregistrée.
 
+**Mode « boîte copie » (recommandé, sans le mot de passe de la boîte du
+client)**: une boîte dédiée (ex. `assistant@domaine`) reçoit, par une
+redirection cPanel, une copie de chaque email arrivant sur l'adresse
+partagée, et les réponses de l'équipe en Cci (champ « Cci » de l'identité
+Roundcube). On renseigne alors `IMAP_USER` / `IMAP_PASSWORD` de la boîte
+dédiée et `IMAP_MAILBOX_ADDRESS` = l'adresse partagée, pour que les réponses
+de l'équipe soient reconnues comme les nôtres. Le programme ne se connecte
+jamais à la boîte du client.
+
 La boîte est **strictement en lecture seule**: dossiers ouverts avec
 `EXAMINE` (jamais `SELECT`), contenu lu avec `BODY.PEEK[]` (rien n'est
 marqué comme lu), aucune commande `STORE`, `COPY`, `MOVE`, `APPEND`,

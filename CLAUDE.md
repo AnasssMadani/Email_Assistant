@@ -37,9 +37,10 @@ and Microsoft Graph as pluggable connectors behind `EmailConnector` (`src/types.
    sequence from pre_reply, same category-or-thread-override model.
 4. Every relance step run is logged via `recordReminder(threadId, kind, note, stepType)`
    — `stepType` is one of `accuse | relance_interne | relance_interne_filtree |
-   relance_interne_test | relance_externe_pre_reponse | relance_externe_post_reponse`
-   (`relance_interne_test` = a team rappel that would have gone out but didn't,
-   because `SHADOW_MODE` is on: silent mode sends nothing, not even to the team) and is the reliable,
+   relance_interne_test | relance_externe_pre_reponse | relance_externe_post_reponse |
+   relance_externe_test_pre_reponse | relance_externe_test_post_reponse`
+   (`*_test*` = a step that would have gone out but didn't because the activation
+   stage is 0 — `src/stage.ts`: stage 0 sends nothing, not even to the team) and is the reliable,
    query-safe source of truth for "did X happen" (used by the client dashboard
    checklist) — never deduce this from the note's free text.
 5. `src/pipeline/discoverOutbound.ts`: catches cold outreach (an email we send with no
