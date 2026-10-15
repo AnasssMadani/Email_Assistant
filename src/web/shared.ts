@@ -123,6 +123,9 @@ export function sharedStyles(primaryColor: string): string {
   .banner-ok { background: color-mix(in srgb, var(--stamp-done) 10%, transparent); color: var(--stamp-done); border-color: var(--stamp-done); }
   .banner-error { background: color-mix(in srgb, var(--stamp-late) 10%, transparent); color: var(--stamp-late); border-color: var(--stamp-late); }
   .banner-info { background: color-mix(in srgb, var(--stamp-internal) 10%, transparent); color: var(--stamp-internal); border-color: var(--stamp-internal); }
+  .table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .table th, .table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); }
+  .table th { font-weight: 600; color: var(--ink-faint); }
   .status {
     border: 1px solid var(--rule); border-radius: 0; padding: 16px 20px;
     margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center;

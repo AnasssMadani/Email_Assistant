@@ -281,14 +281,16 @@ Le projet tourne en **deux instances séparées**, chacune avec son propre
 projet Supabase — jamais la même base ni la même messagerie connectée:
 
 - **`globallink-dev`** — pour tester et corriger des bugs sans risque.
-  Connectée à sa propre messagerie de test, et tourne avec `SHADOW_MODE=true`
-  ("Mode test", bandeau rouge visible sur chaque page admin): le pipeline
-  classe et rédige normalement, mais n'envoie jamais réellement d'accusé ni
-  de relance externe. Deux garde-fous indépendants — la mauvaise
+  Connectée à sa propre messagerie de test, et verrouillée à l'étape 0 par
+  `MAX_STAGE=0` (bandeau rouge visible sur chaque page admin): le pipeline
+  classe et rédige normalement, mais n'envoie jamais réellement d'accusé, de
+  relance ni de rappel. Deux garde-fous indépendants — la mauvaise
   configuration d'un seul des deux ne suffit donc jamais à joindre un vrai
   client.
-- **`globallink-prod`** — la messagerie réelle du client, `SHADOW_MODE`
-  désactivé.
+- **`globallink-prod`** — la messagerie réelle du client, sans plafond.
+  L'étape d'activation (0 silencieux, 1 envoi réel, 2 brouillons, 3 réponse
+  directe) se bascule à la main depuis la page **Étape d'activation**
+  (`/etape`) du back-office ; une base neuve démarre à l'étape 0.
 
 [`render.yaml`](render.yaml) décrit les deux services sous forme de
 blueprint. `globallink-prod` suit la branche `main`, `globallink-dev` suit

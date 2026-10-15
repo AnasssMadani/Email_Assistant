@@ -11,6 +11,7 @@ import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCh
 import { sendAcknowledgement } from "../pipeline/processIncoming.js";
 import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
 import { getCategory } from "../settings.js";
+import { STAGES, changeStage, getLastKnownStage, getStage, isStage, minimumStageFor } from "../stage.js";
 import {
   addCategoryRelanceStep,
   addThreadRelanceStep,
@@ -40,6 +41,7 @@ import {
   listRemindersForThread,
   listRecentThreads,
   listShadowLogEntries,
+  listStageChanges,
   markMessageProcessed,
   recordPipelineError,
   recordReminder,
@@ -56,6 +58,7 @@ import {
   type ConnectInviteRow,
   type PipelineErrorRow,
   type RelancePhase,
+  type StageChangeRow,
   type ReminderRow,
   type ThreadRow,
 } from "../db.js";
@@ -383,6 +386,13 @@ app.get("/connect/succes", (_req: Request, res: Response) => {
 
 app.use(requireAuth);
 
+// Rafraichit l'etape affichee dans le bandeau (pageShell est synchrone).
+// getStage() ne leve jamais: en cas d'erreur, il retombe sur 0.
+app.use(async (_req: Request, _res: Response, next: NextFunction) => {
+  await getStage();
+  next();
+});
+
 app.get("/", async (req: Request, res: Response) => {
   const baseUrl = `${req.protocol}://${req.get("host")}`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -594,6 +604,39 @@ app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: R
     }
   }
   res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+});
+
+// ---------- Etape d'activation (remplace SHADOW_MODE) ----------
+
+app.get("/etape", async (req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    renderEtapePage(
+      await getStage(),
+      await listStageChanges(20),
+      res.locals.csrfToken as string | undefined,
+      query(req).saved,
+      query(req).erreur
+    )
+  );
+});
+
+app.post("/etape", requireCsrf, async (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  const target = Number(body.stage);
+  try {
+    if (!isStage(target)) throw new Error("Étape inconnue.");
+    const current = await getStage();
+    // Monter = de nouveaux emails partent reellement: confirmation explicite.
+    if (target > current && body.confirm !== "on") {
+      throw new Error("Cochez la case de confirmation pour passer à une étape supérieure.");
+    }
+    await changeStage(target);
+  } catch (err) {
+    res.redirect(`/etape?erreur=${encodeURIComponent((err as Error).message)}`);
+    return;
+  }
+  res.redirect("/etape?saved=1");
 });
 
 // ---------- Reglages (categories + sequences de relance) ----------
@@ -860,6 +903,87 @@ app.post("/ton-de-marque", requireCsrf, async (req: Request, res: Response) => {
   }
 });
 
+// ---------- Etape d'activation ----------
+
+const SEND_ACTION_LABELS = [
+  { action: "accuse", label: "Accusés de réception" },
+  { action: "relance_externe", label: "Relances client" },
+  { action: "rappel_interne", label: "Rappels à l'équipe" },
+  { action: "rapport_matin", label: "Rapport du matin (avec son propre interrupteur)" },
+  { action: "brouillon", label: "Brouillons de réponse (bientôt)" },
+  { action: "reponse_directe", label: "Réponses directes (bientôt)" },
+] as const;
+
+function renderEtapePage(
+  current: number,
+  history: StageChangeRow[],
+  csrfToken: string | undefined,
+  saved: string | undefined,
+  error: string | undefined
+): string {
+  const banner = error
+    ? `<div class="banner banner-error">${escapeHtml(error)}</div>`
+    : saved
+      ? `<div class="banner banner-ok">Étape enregistrée — effective dès le prochain cycle, sans redéploiement.</div>`
+      : "";
+  const lockNote =
+    config.maxStage < 3
+      ? `<div class="banner banner-info">Ce déploiement est verrouillé à l'étape ${config.maxStage} maximum par sa configuration (MAX_STAGE).</div>`
+      : "";
+
+  const options = STAGES.map((s) => {
+    const reachable = s.stage <= config.maxStage && s.stage <= current + 1;
+    const checked = s.stage === current ? "checked" : "";
+    const disabled = reachable ? "" : "disabled";
+    return `<label class="card" style="flex-direction:column; align-items:flex-start; gap:6px; cursor:${reachable ? "pointer" : "not-allowed"}; opacity:${reachable ? 1 : 0.5};">
+      <span><input type="radio" name="stage" value="${s.stage}" ${checked} ${disabled} />
+      <strong>Étape ${s.stage} — ${escapeHtml(s.label)}</strong>${s.stage === current ? ` <span class="stamp stamp-done">en cours</span>` : ""}</span>
+      <span class="section-hint" style="margin:0;">${escapeHtml(s.description)}</span>
+    </label>`;
+  }).join("");
+
+  const matrix = `<table class="table">
+    <thead><tr><th>Envoi</th>${STAGES.map((s) => `<th>Étape ${s.stage}</th>`).join("")}</tr></thead>
+    <tbody>${SEND_ACTION_LABELS.map(
+      (a) =>
+        `<tr><td>${escapeHtml(a.label)}</td>${STAGES.map((s) => `<td>${s.stage >= minimumStageFor(a.action) ? "✓" : "—"}</td>`).join("")}</tr>`
+    ).join("")}</tbody>
+  </table>`;
+
+  const historyRows = history.length
+    ? `<table class="table"><thead><tr><th>Date</th><th>Changement</th></tr></thead><tbody>${history
+        .map(
+          (h) =>
+            `<tr><td>${escapeHtml(formatDateTime(h.changed_at))}</td><td>Étape ${h.from_stage} → Étape ${h.to_stage}</td></tr>`
+        )
+        .join("")}</tbody></table>`
+    : `<p class="section-hint">Aucun changement d'étape pour l'instant.</p>`;
+
+  const body = `
+    ${banner}
+    ${lockNote}
+    <div class="settings-section">
+      <h2>Étape en cours</h2>
+      <p class="section-hint">On monte d'une étape à la fois, après validation écrite de la direction du client. Redescendre est toujours possible, d'un coup, jusqu'à l'étape 0.</p>
+      <form method="POST" action="/etape">
+        ${csrfField(csrfToken)}
+        <div class="cards" style="flex-direction:column;">${options}</div>
+        <label class="checkbox-cell" style="margin:12px 0;"><input type="checkbox" name="confirm" /> Je confirme : en montant d'étape, de vrais emails partent vers les clients.</label>
+        <button class="btn btn-primary" type="submit">Enregistrer l'étape</button>
+      </form>
+    </div>
+    <div class="settings-section">
+      <h2>Ce qui part à chaque étape</h2>
+      ${matrix}
+    </div>
+    <div class="settings-section">
+      <h2>Historique</h2>
+      ${historyRows}
+    </div>`;
+
+  return pageShell("etape", "Étape d'activation", "Ce qui part réellement, et ce qui reste dans le back-office.", body);
+}
+
 // ---------- Confidentialite / retention ----------
 
 app.get("/confidentialite", (_req: Request, res: Response) => {
@@ -870,6 +994,7 @@ app.get("/confidentialite", (_req: Request, res: Response) => {
 // ---------- Gabarit commun ----------
 
 type ActivePage =
+  | "etape"
   | "connexion"
   | "dossiers"
   | "reglages"
@@ -882,6 +1007,7 @@ type ActivePage =
 
 /** Icones minimalistes (style feather-icons), 16x16, meme gabarit que la maquette importee. */
 const NAV_ICONS: Record<ActivePage, string> = {
+  etape: `<rect x="1" y="7" width="22" height="10" rx="5"/><circle cx="16" cy="12" r="3"/>`,
   connexion: `<rect x="4" y="4" width="16" height="16"/><path d="m22 6-10 7L2 6"/>`,
   dossiers: `<rect x="3" y="3" width="18" height="18"/><path d="M3 9h18"/><path d="M9 21V9"/>`,
   reglages: `<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>`,
@@ -894,6 +1020,7 @@ const NAV_ICONS: Record<ActivePage, string> = {
 };
 
 const NAV_ITEMS: Array<{ key: ActivePage; href: string; label: string }> = [
+  { key: "etape", href: "/etape", label: "Étape d'activation" },
   { key: "dossiers", href: "/dossiers", label: "Registre des dossiers" },
   { key: "reglages", href: "/reglages", label: "Réglages" },
   { key: "journal", href: "/journal", label: "Journal" },
@@ -922,16 +1049,19 @@ function pageShell(active: ActivePage, title: string, sub: string, body: string,
         <div class="conn-sub"><a href="/connect">Connecter une boîte →</a></div>
       </div>`;
 
-  // Bandeau permanent, sur CHAQUE page admin, quand SHADOW_MODE est actif —
-  // second garde-fou de securite pour l'instance de dev (voir render.yaml):
-  // meme si la messagerie de dev est mal reconnectee vers une vraie boite,
-  // ce mode empeche tout accuse/relance externe reel de partir. Doit rester
-  // impossible a manquer, pas un simple badge discret dans un coin.
-  const shadowModeBanner = config.shadowModeEnabled
-    ? `<div class="banner banner-error" style="margin-bottom: 16px; font-weight: 600;">
-        🧪 Mode test actif — aucun accusé ni relance n'est réellement envoyé au client, tout est journalisé sans être expédié.
+  // Bandeau permanent, sur CHAQUE page admin, rappelant l'etape en cours.
+  // A l'etape 0 il doit rester impossible a manquer: c'est la garantie
+  // visible que rien ne part (voir src/stage.ts).
+  const stage = getLastKnownStage();
+  const stageInfo = STAGES[stage];
+  const shadowModeBanner =
+    stage === 0
+      ? `<div class="banner banner-error" style="margin-bottom: 16px; font-weight: 600;">
+        🧪 Étape 0 — Silencieux : aucun accusé, relance ni rappel n'est réellement envoyé, tout est rédigé et journalisé sans être expédié. <a href="/etape">Changer d'étape</a>
       </div>`
-    : "";
+      : `<div class="banner banner-info" style="margin-bottom: 16px;">
+        Étape ${stage} — ${escapeHtml(stageInfo.label)} : les envois sont réels. <a href="/etape">Changer d'étape</a>
+      </div>`;
 
   return `<!doctype html>
 <html lang="fr">
@@ -1645,14 +1775,21 @@ async function renderDossierDetailPage(
   const remindersSection = reminders.length
     ? `<div class="settings-section">
         <h2>Rappels &amp; relances de ce dossier</h2>
-        <p class="section-hint">Historique complet, du plus récent au plus ancien — y compris le texte intégral de ce qui aurait été envoyé en mode test.</p>
+        <p class="section-hint">Historique complet, du plus récent au plus ancien — y compris le texte intégral de ce qui aurait été envoyé pendant l'étape silencieuse.</p>
         <div class="ledger">
           ${reminders
             .map((r) => {
-              const isTestDraft = (r.note ?? "").startsWith("[Mode test]");
+              const note = r.note ?? "";
+              const isNotSent = note.startsWith("[Mode test]") || note.startsWith("[Non envoyé]");
+              const isInfo = note.startsWith("[Catégorie]") || note.startsWith("[Erreur IA]");
+              const stamp = isNotSent
+                ? `<span class="stamp stamp-wait">Non envoyé</span>`
+                : isInfo
+                  ? `<span class="stamp stamp-internal">Note</span>`
+                  : `<span class="stamp stamp-done">Envoyé</span>`;
               return `<div class="ledger-row">
                 <div class="ledger-main">
-                  ${isTestDraft ? `<span class="stamp stamp-wait">Mode test — non envoyé</span>` : `<span class="stamp stamp-done">Envoyé</span>`}
+                  ${stamp}
                   <div class="ledger-fact" style="margin-top:8px;"><span class="fact-value" style="white-space:pre-wrap;">${escapeHtml(r.note ?? "")}</span></div>
                 </div>
                 <div class="ledger-facts">
@@ -1793,7 +1930,8 @@ async function renderReglagesPage(
           <div>
             <span class="field-label">Catégorie</span>
             <input type="text" name="label" value="${escapeHtml(cat.label)}" />
-            <span class="cat-id">${escapeHtml(cat.id)}</span>
+            <span class="cat-id">${escapeHtml(cat.id)}${cat.createdByAi ? ` · <span class="stamp stamp-internal">créée par l'IA</span>` : ""}</span>
+            ${cat.description ? `<span class="field-hint">${escapeHtml(cat.description)}</span>` : ""}
           </div>
           <div>
             <span class="field-label">SLA (min)</span>

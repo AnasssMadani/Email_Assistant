@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getPool } from "./dbPool.js";
@@ -9,11 +9,16 @@ import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, Urgency
 const pool = getPool();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCHEMA_PATH = path.resolve(__dirname, "..", "supabase", "migrations", "0001_init.sql");
+const MIGRATIONS_DIR = path.resolve(__dirname, "..", "supabase", "migrations");
 
+/** Rejoue toutes les migrations dans l'ordre (chacune est idempotente: IF NOT EXISTS). */
 async function ensureSchema(): Promise<void> {
-  const sql = readFileSync(SCHEMA_PATH, "utf-8");
-  await pool.query(sql);
+  const files = readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith(".sql"))
+    .sort();
+  for (const file of files) {
+    await pool.query(readFileSync(path.join(MIGRATIONS_DIR, file), "utf-8"));
+  }
 }
 
 /** Forme du fichier JSON d'amorçage historique (config/categories.json) — figee, distincte du modele runtime actuel. */
@@ -153,9 +158,19 @@ async function seedBrandVoiceIfNeeded(): Promise<void> {
   );
 }
 
+/**
+ * Etape d'activation: une seule ligne, amorcee a 0 (silencieux) — jamais a
+ * une etape qui envoie. Le passage a l'etape 1 est toujours un geste
+ * explicite depuis /etape.
+ */
+async function seedStageIfNeeded(): Promise<void> {
+  await pool.query("INSERT INTO app_settings (id, stage) VALUES (1, 0) ON CONFLICT (id) DO NOTHING");
+}
+
 await ensureSchema();
 await seedIfNeeded();
 await seedBrandVoiceIfNeeded();
+await seedStageIfNeeded();
 
 export interface ThreadRow {
   thread_id: string;
@@ -405,6 +420,8 @@ interface CategoryRow {
   examples: string;
   is_ignored: number;
   is_fallback: number;
+  created_by_ai: number;
+  created_at: string | null;
 }
 
 function toCategoryConfig(row: CategoryRow): CategoryConfig {
@@ -415,6 +432,8 @@ function toCategoryConfig(row: CategoryRow): CategoryConfig {
     acknowledgeAutomatically: row.acknowledge_automatically === 1,
     internalAlertsEnabled: row.internal_alerts_enabled === 1,
     internalAlertsMinUrgency: (row.internal_alerts_min_urgency as UrgencyThreshold) || "normal",
+    description: row.description ?? "",
+    createdByAi: row.created_by_ai === 1,
   };
 }
 
@@ -492,8 +511,8 @@ export async function createCategory(params: {
   await pool.query(
     `INSERT INTO categories (
       id, label, sla_minutes, acknowledge_automatically, sort_order,
-      internal_alerts_enabled, internal_alerts_min_urgency
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      internal_alerts_enabled, internal_alerts_min_urgency, created_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [
       id,
       params.label,
@@ -502,6 +521,7 @@ export async function createCategory(params: {
       maxOrderRow.rows[0].maxorder + 1,
       1,
       "normal",
+      new Date().toISOString(),
     ]
   );
 
@@ -510,6 +530,70 @@ export async function createCategory(params: {
 
   const created = await pool.query<CategoryRow>("SELECT * FROM categories WHERE id = $1", [id]);
   return toCategoryConfig(created.rows[0]);
+}
+
+/**
+ * Cree une categorie proposee par la classification quand aucune categorie
+ * existante ne convient (voir classify.ts). Volontairement neutre cote
+ * envois: la nouvelle categorie reprend a l'identique les reglages de la
+ * categorie de repli (SLA, accuse auto, alertes equipe, sequences de
+ * relance) — un email classe dans une categorie creee par l'IA est donc
+ * traite exactement comme s'il etait tombe dans "autre", seul le libelle
+ * change. L'admin la revoit ensuite depuis /reglages (badge "créée par l'IA").
+ *
+ * Garde-fous contre la prolifération (~800 emails/jour):
+ * - un libelle deja connu (meme slug que l'id ou le libelle d'une categorie
+ *   existante) reutilise cette categorie au lieu d'en creer une copie;
+ * - au plus `maxPerDay` creations sur 24h glissantes — au-dela, renvoie
+ *   null et l'appelant retombe sur la categorie de repli.
+ */
+export async function createCategoryFromAi(params: {
+  label: string;
+  description: string;
+  maxPerDay: number;
+}): Promise<{ category: CategoryConfig; created: boolean } | null> {
+  const wantedSlug = slugify(params.label);
+  const existing = (await pool.query<CategoryRow>("SELECT * FROM categories ORDER BY sort_order ASC")).rows;
+  const match = existing.find((row) => row.id === wantedSlug || slugify(row.label) === wantedSlug);
+  if (match) return { category: toCategoryConfig(match), created: false };
+
+  const since = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+  const recent = await pool.query<{ n: string }>(
+    "SELECT COUNT(*) AS n FROM categories WHERE created_by_ai = 1 AND created_at >= $1",
+    [since]
+  );
+  if (Number(recent.rows[0].n) >= params.maxPerDay) return null;
+
+  const fallback = existing.find((row) => row.is_fallback === 1) ?? existing.find((row) => row.id === "autre");
+  if (!fallback) return null;
+
+  const id = await uniqueCategoryId(wantedSlug);
+  const maxOrder = existing.reduce((max, row) => Math.max(max, row.sort_order), -1);
+  await pool.query(
+    `INSERT INTO categories (
+      id, label, sla_minutes, acknowledge_automatically, sort_order,
+      internal_alerts_enabled, internal_alerts_min_urgency, description,
+      created_by_ai, created_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9)`,
+    [
+      id,
+      params.label,
+      fallback.sla_minutes,
+      fallback.acknowledge_automatically,
+      maxOrder + 1,
+      fallback.internal_alerts_enabled,
+      fallback.internal_alerts_min_urgency,
+      params.description,
+      new Date().toISOString(),
+    ]
+  );
+  for (const phase of ["pre_reply", "post_reply"] as const) {
+    const steps = await readSteps(phase, "category", fallback.id);
+    await writeSteps(phase, "category", id, steps);
+  }
+
+  const created = await pool.query<CategoryRow>("SELECT * FROM categories WHERE id = $1", [id]);
+  return { category: toCategoryConfig(created.rows[0]), created: true };
 }
 
 // ---------- Sequences de relance (par categorie ou surcharge par dossier) ----------
@@ -715,7 +799,7 @@ export async function listReminders(limit = 150): Promise<ReminderRow[]> {
 }
 
 /**
- * Rappels/relances (reels ou "mode test" — voir shadowModeEnabled) d'UN
+ * Rappels/relances (reels ou "mode test" — voir src/stage.ts, etape 0) d'UN
  * dossier precis, du plus recent au plus ancien — utilise sur la page de
  * detail du dossier pour revoir l'integralite de ce que le pipeline a
  * rédigé le concernant (accuse via /carnet, relances ici), avant d'activer
@@ -1158,4 +1242,49 @@ export async function setCategoryPlaybook(categoryId: string, content: string): 
      ON CONFLICT (category_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
     [categoryId, content, new Date().toISOString()]
   );
+}
+
+// ==================== Etape d'activation (remplace SHADOW_MODE) ====================
+// Ne pas lire directement: passer par src/stage.ts (getStage / isSendAllowed),
+// qui applique le plafond d'environnement (MAX_STAGE) et retombe sur 0 en cas
+// d'erreur.
+
+export async function getStoredStage(): Promise<{ stage: number; updatedAt: string | null }> {
+  const result = await pool.query<{ stage: number; stage_updated_at: string | null }>(
+    "SELECT stage, stage_updated_at FROM app_settings WHERE id = 1"
+  );
+  const row = result.rows[0];
+  return { stage: row ? Number(row.stage) : 0, updatedAt: row?.stage_updated_at ?? null };
+}
+
+export async function setStoredStage(stage: number): Promise<void> {
+  const now = new Date().toISOString();
+  const previous = await getStoredStage();
+  await pool.query(
+    `INSERT INTO app_settings (id, stage, stage_updated_at) VALUES (1, $1, $2)
+     ON CONFLICT (id) DO UPDATE SET stage = excluded.stage, stage_updated_at = excluded.stage_updated_at`,
+    [stage, now]
+  );
+  if (previous.stage !== stage) {
+    await pool.query("INSERT INTO stage_changes (from_stage, to_stage, changed_at) VALUES ($1, $2, $3)", [
+      previous.stage,
+      stage,
+      now,
+    ]);
+  }
+}
+
+export interface StageChangeRow {
+  id: number;
+  from_stage: number;
+  to_stage: number;
+  changed_at: string;
+}
+
+export async function listStageChanges(limit = 20): Promise<StageChangeRow[]> {
+  const result = await pool.query<StageChangeRow>(
+    "SELECT id, from_stage, to_stage, changed_at FROM stage_changes ORDER BY changed_at DESC, id DESC LIMIT $1",
+    [limit]
+  );
+  return result.rows.map((r) => ({ ...r, id: Number(r.id), from_stage: Number(r.from_stage), to_stage: Number(r.to_stage) }));
 }
