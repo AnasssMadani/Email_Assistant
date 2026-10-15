@@ -47,7 +47,39 @@ export const config = {
   // (le disque de build n'est pas persistant, contrairement a /var/data).
   brandVoicePath: process.env.BRAND_VOICE_PATH ?? "./config/brand-voice.md",
   connectionStatePath: process.env.CONNECTION_STATE_PATH ?? "./data/connection.json",
-  emailConnector: (process.env.EMAIL_CONNECTOR ?? "gmail") as "gmail" | "graph",
+  emailConnector: (process.env.EMAIL_CONNECTOR ?? "gmail") as "gmail" | "graph" | "imap",
+  // Boite IMAP/SMTP classique (ex: Roundcube/cPanel) — utilisee quand
+  // EMAIL_CONNECTOR=imap. Pas de flux OAuth: identifiants lus ici
+  // uniquement, jamais versionnes (voir .env.example). La lecture IMAP est
+  // strictement passive (EXAMINE + BODY.PEEK, voir imapReadOnlyGuard.ts).
+  imap: {
+    host: process.env.IMAP_HOST ?? "",
+    port: Number(process.env.IMAP_PORT ?? 993),
+    // true = TLS des la connexion (port 993) ; false = STARTTLS (port 143).
+    secure: (process.env.IMAP_SECURE ?? "true") !== "false",
+    user: process.env.IMAP_USER ?? "",
+    password: process.env.IMAP_PASSWORD ?? "",
+    inboxFolder: process.env.IMAP_INBOX_FOLDER ?? "INBOX",
+    // Vide = detection automatique via LIST (attribut special-use \Sent),
+    // avec repli sur les noms usuels cPanel/Dovecot ("INBOX.Sent", "Sent").
+    sentFolder: process.env.IMAP_SENT_FOLDER ?? "",
+    // Fenetre de recherche des messages d'un fil (getThread). Sur une boite
+    // de ~800 emails/jour, une recherche d'en-tete sans borne de date
+    // parcourrait des centaines de milliers de messages a chaque cycle.
+    threadLookbackDays: Number(process.env.IMAP_THREAD_LOOKBACK_DAYS ?? 60),
+  },
+  smtp: {
+    host: process.env.SMTP_HOST ?? "",
+    port: Number(process.env.SMTP_PORT ?? 465),
+    // true = TLS des la connexion (port 465) ; false = STARTTLS (port 587).
+    secure: (process.env.SMTP_SECURE ?? "true") !== "false",
+    // Vides = memes identifiants que l'IMAP (cas cPanel standard).
+    user: process.env.SMTP_USER ?? "",
+    password: process.env.SMTP_PASSWORD ?? "",
+    // Adresse "From" des envois et adresse comparee pour isFromUs. Vide =
+    // IMAP_USER (sur cPanel, l'identifiant EST l'adresse email).
+    fromAddress: process.env.SMTP_FROM ?? "",
+  },
   // Cle AES-256 (64 caracteres hexadecimaux) pour chiffrer les jetons OAuth au
   // repos. Generer avec: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   // Si absente, les jetons restent en clair sur disque (avertissement au demarrage).

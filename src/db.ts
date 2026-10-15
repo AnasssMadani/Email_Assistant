@@ -841,6 +841,40 @@ export async function getAiUsageSummarySince(sinceIso: string): Promise<AiUsageS
   return { since: sinceIso, total, byCallType };
 }
 
+// ---------- Envois SMTP du connecteur IMAP (voir table smtp_sent_messages) ----------
+
+export interface SmtpSentMessageRow {
+  rfc_message_id: string;
+  thread_id: string;
+  to_email: string;
+  subject: string;
+  body_text: string;
+  sent_at: string;
+}
+
+export async function recordSmtpSentMessage(params: {
+  rfcMessageId: string;
+  threadId: string;
+  toEmail: string;
+  subject: string;
+  bodyText: string;
+  sentAt: string;
+}): Promise<void> {
+  await pool.query(
+    `INSERT INTO smtp_sent_messages (rfc_message_id, thread_id, to_email, subject, body_text, sent_at)
+     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (rfc_message_id) DO NOTHING`,
+    [params.rfcMessageId, params.threadId, params.toEmail, params.subject, params.bodyText, params.sentAt]
+  );
+}
+
+export async function listSmtpSentMessages(threadId: string): Promise<SmtpSentMessageRow[]> {
+  const result = await pool.query<SmtpSentMessageRow>(
+    "SELECT * FROM smtp_sent_messages WHERE thread_id = $1 ORDER BY sent_at ASC",
+    [threadId]
+  );
+  return result.rows;
+}
+
 // ---------- Compteur des envois automatiques (distinguer un humain d'une relance) ----------
 
 /**

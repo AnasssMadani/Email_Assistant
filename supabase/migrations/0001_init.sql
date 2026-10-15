@@ -217,3 +217,21 @@ CREATE TABLE IF NOT EXISTS prompts (
   content TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- Envois automatiques (accuses, relances) faits par le connecteur
+-- IMAP/SMTP. Contrairement a Gmail/Graph, un envoi SMTP n'apparait PAS dans
+-- la boite (aucun "Envoyes" automatique cote cPanel), et on s'interdit d'y
+-- deposer une copie (APPEND = ecriture, regle n°1: boite en lecture seule).
+-- Sans cette table, getThread() ne verrait jamais nos propres envois et le
+-- comptage automated_outbound_count (relanceCheck.ts) raterait la premiere
+-- reponse humaine. rfc_message_id = l'en-tete Message-ID genere par nous.
+CREATE TABLE IF NOT EXISTS smtp_sent_messages (
+  rfc_message_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  to_email TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body_text TEXT NOT NULL,
+  sent_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_smtp_sent_messages_thread ON smtp_sent_messages(thread_id);

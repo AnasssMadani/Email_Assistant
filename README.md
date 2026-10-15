@@ -197,6 +197,27 @@ connexion (étape 3).
    dans `.env` (`AZURE_TENANT_ID=common` si multitenant, sinon l'ID du
    tenant du client).
 
+**IMAP / SMTP (Roundcube, cPanel, toute boîte classique)** — pas d'OAuth ni
+de page de connexion: renseignez `EMAIL_CONNECTOR=imap` et les variables
+`IMAP_*` / `SMTP_*` dans `.env` (voir `.env.example`). Ce choix prime sur
+une éventuelle connexion Gmail/Outlook enregistrée.
+
+La boîte est **strictement en lecture seule**: dossiers ouverts avec
+`EXAMINE` (jamais `SELECT`), contenu lu avec `BODY.PEEK[]` (rien n'est
+marqué comme lu), aucune commande `STORE`, `COPY`, `MOVE`, `APPEND`,
+`EXPUNGE`, `CLOSE`, `CREATE` ou `DELETE`. Un garde-fou en liste blanche
+(`src/connectors/imapReadOnlyGuard.ts`) bloque toute autre commande avant
+l'envoi réseau, et `test/imapConnector.test.ts` le vérifie contre un
+serveur IMAP factice qui enregistre chaque commande reçue.
+
+Conséquence: les accusés et relances envoyés par SMTP n'apparaissent pas
+dans le dossier « Envoyés » (y déposer une copie serait une écriture). Ils
+sont mémorisés en base (`smtp_sent_messages`) et réintégrés au fil par le
+connecteur, pour que la détection de réponse humaine fonctionne comme avec
+Gmail/Outlook. Un fil IMAP est reconstitué par les en-têtes
+`References` / `In-Reply-To` (pas par l'objet), sur les
+`IMAP_THREAD_LOOKBACK_DAYS` derniers jours (60 par défaut).
+
 ### 4. Page de connexion (le client branche sa boîte lui-même)
 
 ```bash
@@ -430,7 +451,7 @@ config/
 supabase/
   migrations/0001_init.sql  schéma Postgres, appliqué automatiquement au démarrage (voir src/db.ts)
 src/
-  connectors/               Gmail et Microsoft Graph (interface commune EmailConnector)
+  connectors/               Gmail, Microsoft Graph et IMAP/SMTP (interface commune EmailConnector)
   web/server.ts             login + connexion messagerie + suivi des dossiers + réglages + journal
   web/auth.ts                sessions, CSRF, hash de mot de passe, limitation des tentatives
   crypto.ts                  chiffrement AES-256-GCM des jetons OAuth au repos
