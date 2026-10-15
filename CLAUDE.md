@@ -37,7 +37,9 @@ and Microsoft Graph as pluggable connectors behind `EmailConnector` (`src/types.
    sequence from pre_reply, same category-or-thread-override model.
 4. Every relance step run is logged via `recordReminder(threadId, kind, note, stepType)`
    — `stepType` is one of `accuse | relance_interne | relance_interne_filtree |
-   relance_externe_pre_reponse | relance_externe_post_reponse` and is the reliable,
+   relance_interne_test | relance_externe_pre_reponse | relance_externe_post_reponse`
+   (`relance_interne_test` = a team rappel that would have gone out but didn't,
+   because `SHADOW_MODE` is on: silent mode sends nothing, not even to the team) and is the reliable,
    query-safe source of truth for "did X happen" (used by the client dashboard
    checklist) — never deduce this from the note's free text.
 5. `src/pipeline/discoverOutbound.ts`: catches cold outreach (an email we send with no
@@ -151,6 +153,15 @@ boundary — extend those, don't bypass them by handing a client view raw admin 
 Note: `tsconfig.json` only type-checks `src/` — `test/` files are excluded, so a
 breaking change to an exported function's signature is only caught by actually running
 `npm test`, not by `tsc --noEmit` alone.
+
+## Read-only mailbox (rule n°1)
+
+The connected mailbox is strictly read-only: never mark read/unread, move, delete,
+label, or create drafts. Connectors expose only reads plus `sendReply` /
+`sendNotification` (Graph replies use the one-shot `/reply` action, not
+`createReply` + draft). OAuth scopes are read + send only (no `gmail.modify`/
+`gmail.compose`, no `Mail.ReadWrite`). `test/mailboxReadOnly.test.ts` and
+`test/silentModeNoSend.test.ts` enforce this — don't add a write method.
 
 ## Standing constraint
 

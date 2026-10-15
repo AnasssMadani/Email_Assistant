@@ -58,14 +58,11 @@ export interface EmailConnector {
   sendReply(params: SendReplyParams): Promise<{ id: string }>;
   /** Email autonome, hors fil client (pas de threadId) — utilise pour les notifications internes (rappels). */
   sendNotification(params: NotificationParams): Promise<{ id: string }>;
-  /**
-   * Remet un message a l'etat "non lu". Gmail et Graph marquent
-   * automatiquement tout le fil comme lu des qu'on y envoie une reponse
-   * (l'accuse automatique dans ce cas) — sans ce correctif, l'email du
-   * client disparait visuellement de la liste des nouveaux messages non lus
-   * de l'equipe alors que personne chez nous ne l'a reellement encore lu.
-   */
-  markMessageUnread(messageId: string): Promise<void>;
+  // Regle n°1 du projet: la boite est en LECTURE SEULE. Hormis les deux
+  // envois ci-dessus (qui ajoutent un message dans "Envoyes", rien d'autre),
+  // un connecteur n'expose AUCUNE methode qui modifie un message existant:
+  // pas de marquage lu/non lu, pas de deplacement, pas de suppression, pas
+  // de brouillon. Ne pas en ajouter — voir test/mailboxReadOnly.test.ts.
 }
 
 /**

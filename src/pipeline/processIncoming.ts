@@ -186,9 +186,9 @@ export async function sendAcknowledgement(
       ackBody: ack.body,
     });
     // Pas d'envoi reel, mais on fait quand meme avancer le dossier en
-    // pre_reply pour que le rappel interne (30 min, seul envoi reel
-    // autorise cette semaine, voir relanceCheck.ts) se declenche
-    // normalement. incrementAutomatedOutboundCount n'est PAS appele: aucun
+    // pre_reply pour que la sequence (rappel interne, relances) se deroule
+    // normalement — en mode silencieux, chaque etape est journalisee sans
+    // rien envoyer (voir relanceCheck.ts). incrementAutomatedOutboundCount n'est PAS appele: aucun
     // message reel n'a rejoint le fil, donc automated_outbound_count doit
     // rester a 0 de notre cote — sinon une VRAIE reponse de l'equipe (le
     // fil, relu, contient alors un message isFromUs de plus que ce
@@ -213,16 +213,10 @@ export async function sendAcknowledgement(
   // reconnaitre plus tard que ce message (retrouve dans le fil relu depuis
   // la messagerie) est notre propre accuse, pas une reponse humaine.
   await incrementAutomatedOutboundCount(incoming.threadId);
-  // Gmail/Graph marquent automatiquement tout le fil comme lu des qu'on y
-  // envoie une reponse (l'accuse ci-dessus) — sans ce correctif, le message
-  // du client disparait de la liste des non-lus alors que l'equipe ne l'a
-  // pas encore vu. Non bloquant: un echec ici ne doit pas faire echouer
-  // l'accuse deja envoye.
-  try {
-    await connector.markMessageUnread(incoming.id);
-  } catch (err) {
-    console.error(`[non-lu] echec du marquage non-lu pour ${incoming.id}:`, err);
-  }
+  // Aucun marquage lu/non lu ici (ni nulle part): la boite est en lecture
+  // seule. L'ancien "remettre en non lu" apres l'accuse ecrivait dans la
+  // boite, et pouvait meme remettre en non lu un email que l'equipe avait
+  // deja ouvert entre deux cycles.
   // Journalise le destinataire reel de l'accuse — sans ca, un envoi vers une
   // adresse corrompue (parsing, saisie manuelle via /traiter, etc.) n'est
   // visible nulle part avant qu'un rebond n'arrive dans la boite, et devient

@@ -262,7 +262,21 @@ export async function checkPreReplyThread(
   const shouldAlertTeam =
     category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
 
-  if (shouldAlertTeam) {
+  if (shouldAlertTeam && config.shadowModeEnabled) {
+    // Mode silencieux: rien ne part, pas meme vers l'equipe (etape 0 =
+    // "rien n'est envoye"). Journalise sous un step_type distinct de
+    // "relance_interne" (qui signifie "reellement envoye") pour que le
+    // registre puisse montrer ce qui serait parti sans jamais le confondre
+    // avec un vrai envoi.
+    const to = config.notificationEmail || (await connector.getOwnEmailAddress());
+    await recordReminder(
+      row.thread_id,
+      "internal",
+      `[Mode test] Rappel interne qui aurait été envoyé à ${to} — non envoyé.\n\n${note}`,
+      "relance_interne_test"
+    );
+    console.log(`[mode test] rappel interne non envoye — "${row.subject}"`);
+  } else if (shouldAlertTeam) {
     await sendInternalNotification(connector, row, note);
     await recordReminder(row.thread_id, "internal", note, "relance_interne");
     console.log(`[rappel interne] "${row.subject}" — echeance depassee, a traiter.`);
@@ -416,8 +430,8 @@ const URGENCY_LABELS: Record<string, string> = { low: "Faible", normal: "Normale
  * seulement journalise en base (invisible sans ouvrir l'application). Part
  * vers NOTIFICATION_EMAIL si defini, sinon vers la messagerie connectee
  * elle-meme (un pense-bete dans sa propre boite). Volontairement tres
- * visible (bandeau, sujet marque) — mode carnet: c'est le SEUL email reel
- * envoye cette semaine, il doit sauter aux yeux dans une boite chargee.
+ * visible (bandeau, sujet marque) pour sauter aux yeux dans une boite
+ * chargee. Jamais appelee en mode silencieux (voir checkPreReplyThread).
  * Best-effort: un echec d'envoi ne doit pas empecher le rappel d'etre
  * journalise normalement.
  */

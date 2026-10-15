@@ -190,7 +190,9 @@ connexion (étape 3).
 3. Dans "Redirect URIs" (type **Web**), ajoutez la valeur de
    `AZURE_REDIRECT_URI` (`http://localhost:4300/auth/graph/callback` par défaut).
 4. API permissions → Microsoft Graph → **Delegated permissions**:
-   `Mail.Read`, `Mail.Send`, `Mail.ReadWrite`, `User.Read`, `offline_access`.
+   `Mail.Read`, `Mail.Send`, `User.Read`, `offline_access`.
+   Pas de `Mail.ReadWrite` : la boîte reste en lecture seule (rien n'est
+   marqué lu/non lu, déplacé, supprimé ni déposé en brouillon).
    Ne demandez jamais de permissions applicatives tenant-wide pour ce projet.
 5. Certificates & secrets → créez un client secret.
 6. Renseignez `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_TENANT_ID`
