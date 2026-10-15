@@ -185,6 +185,7 @@ test("live mode: an accusé is one sendReply and nothing else — the client's e
   };
   const { connector, calls } = recordingConnector({ id: threadId, messages: [message] });
 
+  await db.setStoredStage(1); // envois reels (une base neuve demarre a l'etape 0)
   await processIncomingMessage(connector, message);
 
   assert.deepEqual(calls.filter((c) => !READ_METHODS.includes(c)), ["sendReply"]);

@@ -1,5 +1,5 @@
-import { config } from "../config.js";
 import { getCategory } from "../settings.js";
+import { isSendAllowed } from "../stage.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
 import { buildReplySubject } from "../utils.js";
@@ -126,6 +126,14 @@ export async function processIncomingMessage(
   });
   await markMessageProcessed(message.id, message.threadId);
 
+  if (classification.createdCategory) {
+    await recordReminder(
+      message.threadId,
+      "internal",
+      `[Catégorie] Nouvelle catégorie créée par l'IA : « ${classification.createdCategory.label} » (aucune catégorie existante ne convenait). Réglages repris de la catégorie de repli — à revoir dans Réglages.`
+    );
+  }
+
   if (!shouldAcknowledge) {
     console.log(`[skip] "${message.subject}" (${category.id}) — pas d'accuse requis.`);
     return;
@@ -173,7 +181,8 @@ export async function sendAcknowledgement(
 
   const ack = await draftAcknowledgement(thread, incoming, category);
 
-  if (config.shadowModeEnabled) {
+  // Etape 0 (silencieux): accuse redige et journalise, jamais envoye.
+  if (!(await isSendAllowed("accuse"))) {
     await recordAckDraft({
       threadId: incoming.threadId,
       messageId: incoming.id,
@@ -186,16 +195,15 @@ export async function sendAcknowledgement(
       ackBody: ack.body,
     });
     // Pas d'envoi reel, mais on fait quand meme avancer le dossier en
-    // pre_reply pour que la sequence (rappel interne, relances) se deroule
-    // normalement — en mode silencieux, chaque etape est journalisee sans
-    // rien envoyer (voir relanceCheck.ts). incrementAutomatedOutboundCount n'est PAS appele: aucun
+    // pre_reply pour que la sequence de relance avance (redigee, non
+    // envoyee elle aussi tant que l'etape reste 0 — voir relanceCheck.ts). incrementAutomatedOutboundCount n'est PAS appele: aucun
     // message reel n'a rejoint le fil, donc automated_outbound_count doit
     // rester a 0 de notre cote — sinon une VRAIE reponse de l'equipe (le
     // fil, relu, contient alors un message isFromUs de plus que ce
     // compteur) ne serait plus jamais detectee comme reponse humaine (voir
     // checkPreReplyThread dans relanceCheck.ts).
     await setThreadAckSent(incoming.threadId);
-    console.log(`[mode carnet] accuse redige (non envoye) pour ${incoming.from.email} — "${incoming.subject}"`);
+    console.log(`[silencieux] accuse redige (non envoye) pour ${incoming.from.email} — "${incoming.subject}"`);
     return;
   }
 

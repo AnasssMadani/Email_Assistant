@@ -56,13 +56,17 @@ export const config = {
   // notification part alors vers la messagerie connectee elle-meme, comme
   // un pense-bete dans sa propre boite plutot que dans le vide.
   notificationEmail: process.env.NOTIFICATION_EMAIL ?? "",
-  // Mode silencieux (etape 0): le pipeline classe et redige normalement,
-  // mais RIEN n'est envoye — ni accuse, ni relance client, ni rappel
-  // interne a l'equipe. Tout est journalise a la place (shadow_log pour les
-  // accuses, reminders pour les relances et rappels — voir processIncoming.ts
-  // et relanceCheck.ts). Permanent tant que desactive manuellement (pas de
-  // bascule automatique, pas de date de fin).
-  shadowModeEnabled: process.env.SHADOW_MODE === "true",
+  // Plafond d'environnement de l'etape d'activation (voir src/stage.ts).
+  // L'etape elle-meme vit en base et se bascule depuis /etape ; ce plafond
+  // permet a un deploiement (ex: globallink-dev, voir render.yaml) de rester
+  // verrouille en silencieux quoi qu'on choisisse dans le back-office.
+  // Ancien SHADOW_MODE=true toujours honore (= MAX_STAGE=0) pour ne pas
+  // lever le verrou d'un deploiement existant a la mise a jour.
+  maxStage: parseMaxStage(process.env.MAX_STAGE, process.env.SHADOW_MODE),
+  // Plafond de categories creees automatiquement par la classification sur
+  // 24h glissantes (voir createCategoryFromAi dans db.ts) — au-dela, l'email
+  // tombe dans la categorie de repli. 0 desactive la creation automatique.
+  aiCategoriesMaxPerDay: Math.max(0, Number(process.env.AI_CATEGORIES_MAX_PER_DAY ?? 3) || 0),
   // Dossier des notes de style par categorie, generees a partir du corpus des
   // vraies reponses de l'equipe (voir src/pipeline/corpusAnalysis.ts) et
   // relues par le prompt de redaction de l'accuse. Le contenu vit en base
@@ -114,6 +118,17 @@ export const config = {
   // par un client) ne sont pas concernes par cette limite.
   maxExternalRelancesPerCycle: Number(process.env.MAX_EXTERNAL_RELANCES_PER_CYCLE ?? 5),
 };
+
+/**
+ * Valeur invalide (texte, hors 0..3) => 0: un plafond mal saisi doit
+ * verrouiller les envois, jamais les ouvrir.
+ */
+function parseMaxStage(raw: string | undefined, legacyShadowMode: string | undefined): 0 | 1 | 2 | 3 {
+  if (legacyShadowMode === "true") return 0;
+  if (raw === undefined || raw.trim() === "") return 3;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 && n <= 3 ? (n as 0 | 1 | 2 | 3) : 0;
+}
 
 export function requireAnthropicApiKey(): string {
   return config.anthropicApiKey || required("ANTHROPIC_API_KEY");

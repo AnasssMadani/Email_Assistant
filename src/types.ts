@@ -82,6 +82,10 @@ export interface CategoryConfig {
   acknowledgeAutomatically: boolean;
   internalAlertsEnabled: boolean;
   internalAlertsMinUrgency: UrgencyThreshold;
+  /** Description libre (renseignee notamment par l'IA quand elle cree la categorie), reprise dans le prompt de classification. */
+  description: string;
+  /** Vrai si la categorie a ete creee automatiquement par la classification (voir createCategoryFromAi dans db.ts). */
+  createdByAi: boolean;
 }
 
 export type RelanceChannel = "internal" | "external";
@@ -107,6 +111,8 @@ export interface ClassificationResult {
   urgency: "low" | "normal" | "high";
   summary: string;
   requiresAcknowledgement: boolean;
+  /** Renseigne quand la classification vient de creer cette categorie (aucune existante ne convenait). */
+  createdCategory?: { id: string; label: string };
 }
 
 export type ThreadStatus =

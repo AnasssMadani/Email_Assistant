@@ -1,5 +1,6 @@
 import { config } from "../config.js";
 import { getCategory } from "../settings.js";
+import { isSendAllowed } from "../stage.js";
 import { draftRelance } from "../ai/draftRelance.js";
 import { tagSource } from "./errorTag.js";
 import { buildReplySubject, urgencyMeetsThreshold } from "../utils.js";
@@ -198,16 +199,31 @@ export async function checkPreReplyThread(
 
     const category = await getCategory(row.category_id);
 
-    // Mode test: aucune relance externe reelle n'est envoyee, mais le texte
-    // est quand meme redige par Claude et journalise integralement (objet +
-    // corps) pour permettre une revue complete depuis la page du dossier
-    // avant d'activer les envois reels (voir shadowModeEnabled).
-    if (config.shadowModeEnabled) {
+    // Etape 0 (silencieux): aucune relance externe reelle n'est envoyee,
+    // mais le texte est quand meme redige par Claude et journalise
+    // integralement (objet + corps) pour permettre une revue complete depuis
+    // la page du dossier avant d'activer les envois reels (voir stage.ts).
+    if (!(await isSendAllowed("relance_externe"))) {
       const relance = await draftRelance(thread, lastInbound, category, "pre_reply");
       await recordReminder(
         row.thread_id,
         "internal",
         `[Mode test] Relance externe qui aurait ete envoyee a ${row.sender_email} — non envoyee.\n\nObjet: ${buildReplySubject(row.subject)}\n\n${relance.body}`
+      );
+      await incrementRelance(row.thread_id, "relance_sent");
+      return;
+    }
+
+    // Dossier ouvert pendant l'etape 0: son accuse a ete redige mais jamais
+    // envoye (automated_outbound_count reste a 0). Le relancer maintenant
+    // reviendrait a ecrire "votre demande est toujours en cours" a un client
+    // qui n'a jamais rien recu de nous — on journalise et on avance la
+    // sequence sans rien envoyer.
+    if (row.automated_outbound_count === 0) {
+      await recordReminder(
+        row.thread_id,
+        "internal",
+        `[Non envoyé] Relance client annulée : aucun accusé n'a réellement été envoyé sur ce dossier (ouvert pendant l'étape silencieuse).`
       );
       await incrementRelance(row.thread_id, "relance_sent");
       return;
@@ -262,20 +278,20 @@ export async function checkPreReplyThread(
   const shouldAlertTeam =
     category.internalAlertsEnabled && urgencyMeetsThreshold(row.urgency, category.internalAlertsMinUrgency);
 
-  if (shouldAlertTeam && config.shadowModeEnabled) {
-    // Mode silencieux: rien ne part, pas meme vers l'equipe (etape 0 =
-    // "rien n'est envoye"). Journalise sous un step_type distinct de
-    // "relance_interne" (qui signifie "reellement envoye") pour que le
-    // registre puisse montrer ce qui serait parti sans jamais le confondre
-    // avec un vrai envoi.
+  if (shouldAlertTeam && !(await isSendAllowed("rappel_interne"))) {
+    // Etape 0: "rien n'est envoye", y compris le rappel a l'equipe (qui, sans
+    // NOTIFICATION_EMAIL, s'ecrirait dans la boite connectee elle-meme).
+    // Journalise sous un step_type distinct de "relance_interne" (= reellement
+    // envoye) et de "relance_interne_filtree" (= filtre par urgence), pour que
+    // le carnet l'affiche comme "Simule — non envoye".
     const to = config.notificationEmail || (await connector.getOwnEmailAddress());
     await recordReminder(
       row.thread_id,
       "internal",
-      `[Mode test] Rappel interne qui aurait été envoyé à ${to} — non envoyé.\n\n${note}`,
+      `[Mode test] Rappel interne qui aurait été envoyé à ${to} — non envoyé (étape silencieuse).\n\n${note}`,
       "relance_interne_test"
     );
-    console.log(`[mode test] rappel interne non envoye — "${row.subject}"`);
+    console.log(`[etape 0] rappel interne non envoye — "${row.subject}"`);
   } else if (shouldAlertTeam) {
     await sendInternalNotification(connector, row, note);
     await recordReminder(row.thread_id, "internal", note, "relance_interne");
@@ -334,11 +350,11 @@ export async function checkPostReplyThread(
 
     const category = await getCategory(row.category_id);
 
-    // Mode test: idem checkPreReplyThread — aucune relance externe reelle
-    // cette semaine, y compris celle-ci (relancer le client apres NOTRE
-    // reponse), quelle que soit la sequence post_reply configuree. Le texte
-    // est quand meme redige et journalise integralement pour revue.
-    if (config.shadowModeEnabled) {
+    // Etape 0: idem checkPreReplyThread — aucune relance externe reelle,
+    // y compris celle-ci (relancer le client apres NOTRE reponse), quelle
+    // que soit la sequence post_reply configuree. Le texte est quand meme
+    // redige et journalise integralement pour revue.
+    if (!(await isSendAllowed("relance_externe"))) {
       const relance = await draftRelance(
         thread,
         lastOutbound,
@@ -430,8 +446,8 @@ const URGENCY_LABELS: Record<string, string> = { low: "Faible", normal: "Normale
  * seulement journalise en base (invisible sans ouvrir l'application). Part
  * vers NOTIFICATION_EMAIL si defini, sinon vers la messagerie connectee
  * elle-meme (un pense-bete dans sa propre boite). Volontairement tres
- * visible (bandeau, sujet marque) pour sauter aux yeux dans une boite
- * chargee. Jamais appelee en mode silencieux (voir checkPreReplyThread).
+ * visible (bandeau, sujet marque): il doit sauter aux yeux dans une boite
+ * chargee. Ne part qu'a partir de l'etape 1 (voir checkPreReplyThread).
  * Best-effort: un echec d'envoi ne doit pas empecher le rappel d'etre
  * journalise normalement.
  */
