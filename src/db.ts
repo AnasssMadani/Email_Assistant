@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getPool } from "./dbPool.js";
@@ -9,11 +9,22 @@ import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, Urgency
 const pool = getPool();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCHEMA_PATH = path.resolve(__dirname, "..", "supabase", "migrations", "0001_init.sql");
+const MIGRATIONS_DIR = path.resolve(__dirname, "..", "supabase", "migrations");
 
+/**
+ * Rejoue chaque fichier de supabase/migrations dans l'ordre de leur nom
+ * (0001_, 0002_...). Tous sont ecrits en CREATE ... IF NOT EXISTS, donc
+ * idempotents: les rejouer a chaque demarrage est sans effet sur une base
+ * deja a jour, et ajoute simplement les nouvelles tables sur une base plus
+ * ancienne.
+ */
 async function ensureSchema(): Promise<void> {
-  const sql = readFileSync(SCHEMA_PATH, "utf-8");
-  await pool.query(sql);
+  const files = readdirSync(MIGRATIONS_DIR)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+  for (const file of files) {
+    await pool.query(readFileSync(path.join(MIGRATIONS_DIR, file), "utf-8"));
+  }
 }
 
 /** Forme du fichier JSON d'amorçage historique (config/categories.json) — figee, distincte du modele runtime actuel. */
@@ -280,7 +291,10 @@ export type ReminderStepType =
   | "relance_interne"
   | "relance_interne_filtree"
   | "relance_externe_pre_reponse"
-  | "relance_externe_post_reponse";
+  | "relance_externe_post_reponse"
+  /** Mode silencieux: relance externe redigee et journalisee, jamais envoyee au client. */
+  | "relance_externe_test_pre_reponse"
+  | "relance_externe_test_post_reponse";
 
 export async function recordReminder(
   threadId: string,
@@ -1158,4 +1172,222 @@ export async function setCategoryPlaybook(categoryId: string, content: string): 
      ON CONFLICT (category_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
     [categoryId, content, new Date().toISOString()]
   );
+}
+
+// ==================== Reglages du back-office (cle/valeur) ====================
+
+export async function getAppSetting(key: string): Promise<string | undefined> {
+  const result = await pool.query<{ value: string }>("SELECT value FROM app_settings WHERE key = $1", [key]);
+  return result.rows[0]?.value;
+}
+
+export async function setAppSetting(key: string, value: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, $3)
+     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    [key, value, new Date().toISOString()]
+  );
+}
+
+// ==================== Rapport du matin ====================
+
+export interface MorningReportRow {
+  id: number;
+  report_date: string;
+  period_start: string;
+  period_end: string;
+  generated_at: string;
+  content: string;
+  send_claimed_at: string | null;
+  sent_at: string | null;
+  sent_to: string | null;
+  send_error: string | null;
+}
+
+/**
+ * Insere le rapport d'un jour s'il n'existe pas encore (report_date UNIQUE)
+ * et renvoie la ligne en base — celle qui vient d'etre creee, ou celle deja
+ * presente si un autre cycle/processus l'a ecrite avant. Jamais d'ecrasement:
+ * le rapport d'un matin reste celui qui a (eventuellement) ete envoye.
+ */
+export async function insertMorningReportIfAbsent(params: {
+  reportDate: string;
+  periodStart: string;
+  periodEnd: string;
+  content: string;
+}): Promise<MorningReportRow> {
+  await pool.query(
+    `INSERT INTO morning_reports (report_date, period_start, period_end, generated_at, content)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (report_date) DO NOTHING`,
+    [params.reportDate, params.periodStart, params.periodEnd, new Date().toISOString(), params.content]
+  );
+  const row = await getMorningReportByDate(params.reportDate);
+  if (!row) throw new Error(`Rapport du ${params.reportDate} introuvable juste apres son insertion.`);
+  return row;
+}
+
+export async function getMorningReportByDate(reportDate: string): Promise<MorningReportRow | undefined> {
+  const result = await pool.query<MorningReportRow>("SELECT * FROM morning_reports WHERE report_date = $1", [
+    reportDate,
+  ]);
+  return result.rows[0];
+}
+
+export async function listMorningReports(limit = 30): Promise<MorningReportRow[]> {
+  const result = await pool.query<MorningReportRow>(
+    "SELECT * FROM morning_reports ORDER BY report_date DESC LIMIT $1",
+    [limit]
+  );
+  return result.rows;
+}
+
+/**
+ * Reserve l'envoi d'un rapport: vrai pour UN SEUL appelant, meme si deux
+ * cycles ou deux processus tentent l'envoi en meme temps. A appeler avant
+ * tout envoi reel — un rapport reserve n'est jamais renvoye, meme si l'envoi
+ * echoue ensuite (mieux vaut un rapport manquant, visible dans le
+ * back-office, qu'un doublon dans la boite de la direction).
+ */
+export async function claimMorningReportSend(id: number): Promise<boolean> {
+  const result = await pool.query(
+    "UPDATE morning_reports SET send_claimed_at = $1 WHERE id = $2 AND send_claimed_at IS NULL",
+    [new Date().toISOString(), id]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+export async function recordMorningReportSendResult(
+  id: number,
+  result: { sentTo: string[]; error: string | null }
+): Promise<void> {
+  await pool.query("UPDATE morning_reports SET sent_at = $1, sent_to = $2, send_error = $3 WHERE id = $4", [
+    result.sentTo.length ? new Date().toISOString() : null,
+    result.sentTo.length ? result.sentTo.join(", ") : null,
+    result.error,
+    id,
+  ]);
+}
+
+/** Emails classes sur la periode (une ligne shadow_log par email classe, spam exclu — voir processIncoming.ts), par categorie. */
+export async function countClassifiedEmailsByCategory(
+  startIso: string,
+  endIso: string
+): Promise<Array<{ categoryId: string; count: number }>> {
+  const result = await pool.query<{ category_id: string; n: string }>(
+    `SELECT category_id, COUNT(*) AS n FROM shadow_log
+     WHERE created_at >= $1 AND created_at < $2
+     GROUP BY category_id`,
+    [startIso, endIso]
+  );
+  return result.rows.map((r) => ({ categoryId: r.category_id, count: Number(r.n) }));
+}
+
+export async function countClassifiedEmailsBetween(startIso: string, endIso: string): Promise<number> {
+  const result = await pool.query<{ n: string }>(
+    "SELECT COUNT(*) AS n FROM shadow_log WHERE created_at >= $1 AND created_at < $2",
+    [startIso, endIso]
+  );
+  return Number(result.rows[0].n);
+}
+
+/** Dossiers dont l'accuse a ete envoye (ou redige en mode silencieux — setThreadAckSent est appele dans les deux cas) sur la periode. */
+export async function countAcknowledgedThreadsBetween(startIso: string, endIso: string): Promise<number> {
+  const result = await pool.query<{ n: string }>(
+    "SELECT COUNT(*) AS n FROM threads WHERE ack_sent_at IS NOT NULL AND ack_sent_at >= $1 AND ack_sent_at < $2",
+    [startIso, endIso]
+  );
+  return Number(result.rows[0].n);
+}
+
+/** Nouveaux dossiers entrants classes "pas d'accuse necessaire" sur la periode. */
+export async function countSkippedThreadsBetween(startIso: string, endIso: string): Promise<number> {
+  const result = await pool.query<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM threads
+     WHERE status = 'skipped' AND origin = 'inbound' AND received_at >= $1 AND received_at < $2`,
+    [startIso, endIso]
+  );
+  return Number(result.rows[0].n);
+}
+
+/** Etapes de relance journalisees sur la periode, par step_type (source de verite, jamais le texte libre de la note). */
+export async function countReminderStepsBetween(
+  startIso: string,
+  endIso: string
+): Promise<Partial<Record<ReminderStepType, number>>> {
+  const result = await pool.query<{ step_type: string; n: string }>(
+    `SELECT step_type, COUNT(*) AS n FROM reminders
+     WHERE step_type IS NOT NULL AND created_at >= $1 AND created_at < $2
+     GROUP BY step_type`,
+    [startIso, endIso]
+  );
+  const counts: Partial<Record<ReminderStepType, number>> = {};
+  for (const row of result.rows) counts[row.step_type as ReminderStepType] = Number(row.n);
+  return counts;
+}
+
+export async function countPipelineErrorsBetween(startIso: string, endIso: string): Promise<number> {
+  const result = await pool.query<{ n: string }>(
+    "SELECT COUNT(*) AS n FROM pipeline_errors WHERE created_at >= $1 AND created_at < $2",
+    [startIso, endIso]
+  );
+  return Number(result.rows[0].n);
+}
+
+export async function listThreadsByStatus(statuses: ThreadStatus[]): Promise<ThreadRowWithSnapshots[]> {
+  if (statuses.length === 0) return [];
+  const placeholders = statuses.map((_s, i) => `$${i + 1}`).join(", ");
+  const result = await pool.query<ThreadRowWithSnapshots>(`SELECT * FROM threads WHERE status IN (${placeholders})`, statuses);
+  return result.rows;
+}
+
+/** ThreadRow + colonnes de gel de sequence (absentes de ThreadRow, lues seulement par le rapport du matin). */
+export type ThreadRowWithSnapshots = ThreadRow & {
+  pre_reply_relance_snapshot: string | null;
+  post_reply_relance_snapshot: string | null;
+};
+
+/**
+ * Toutes les sequences de relance d'une phase en DEUX requetes (categories
+ * + surcharges par dossier), pour que le rapport du matin puisse calculer la
+ * prochaine relance de centaines de dossiers sans 2-3 requetes par dossier.
+ * resolveEffectiveSteps applique ensuite le meme ordre de priorite que
+ * getEffectiveRelanceSteps (surcharge manuelle → gel → categorie en direct).
+ * Lecture seule: ne fige jamais rien (freezeRelanceStepsSnapshot reste
+ * reserve a runRelanceCheck).
+ */
+export async function loadAllRelanceSteps(phase: RelancePhase): Promise<{
+  byCategory: Map<string, RelanceStep[]>;
+  byThread: Map<string, RelanceStep[]>;
+}> {
+  const result = await pool.query<RelanceStepRow & { owner_type: string; owner_id: string }>(
+    `SELECT owner_type, owner_id, step_order, channel, delay_minutes FROM ${tableFor(phase)} ORDER BY step_order ASC`
+  );
+  const byCategory = new Map<string, RelanceStep[]>();
+  const byThread = new Map<string, RelanceStep[]>();
+  for (const row of result.rows) {
+    const target = row.owner_type === "thread" ? byThread : byCategory;
+    const list = target.get(row.owner_id) ?? [];
+    list.push({ order: row.step_order, channel: row.channel as RelanceChannel, delayMinutes: row.delay_minutes });
+    target.set(row.owner_id, list);
+  }
+  return { byCategory, byThread };
+}
+
+export function resolveEffectiveSteps(
+  row: ThreadRowWithSnapshots,
+  phase: RelancePhase,
+  all: { byCategory: Map<string, RelanceStep[]>; byThread: Map<string, RelanceStep[]> }
+): RelanceStep[] {
+  const override = all.byThread.get(row.thread_id);
+  if (override && override.length > 0) return override;
+  const snapshot = phase === "post_reply" ? row.post_reply_relance_snapshot : row.pre_reply_relance_snapshot;
+  if (snapshot) {
+    try {
+      return JSON.parse(snapshot) as RelanceStep[];
+    } catch {
+      // gel illisible: meme repli que readRelanceStepsSnapshot
+    }
+  }
+  return all.byCategory.get(row.category_id) ?? [];
 }

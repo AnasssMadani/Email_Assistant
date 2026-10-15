@@ -2,7 +2,7 @@ import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
-import { buildReplySubject } from "../utils.js";
+import { buildReplySubject, isInternalNotificationSubject } from "../utils.js";
 import { tagSource } from "./errorTag.js";
 import {
   incrementAutomatedOutboundCount,
@@ -37,7 +37,8 @@ export async function processIncomingMessage(
   // facture, courant chez un transitaire) — on ne doit avaler ce message que
   // s'il vient EN PLUS de notre propre boite (auto-adresse), jamais sur le
   // seul prefixe d'objet, qui n'importe quel expediteur peut usurper.
-  const ownEmail = message.subject.startsWith("[Rappel]") ? await connector.getOwnEmailAddress() : undefined;
+  // Meme regle pour le rapport du matin ("[Rapport]", voir morningReport.ts).
+  const ownEmail = isInternalNotificationSubject(message.subject) ? await connector.getOwnEmailAddress() : undefined;
   if (ownEmail && message.from.email.toLowerCase() === ownEmail.toLowerCase()) {
     await markMessageProcessed(message.id, message.threadId);
     return;

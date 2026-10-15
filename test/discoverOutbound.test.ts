@@ -140,3 +140,28 @@ test("messages sent before the pipeline started observing are ignored", async ()
 
   assert.equal(await getThreadRow("thread-old"), undefined);
 });
+
+test("our own internal emails in Sent ([Rapport], [Rappel]) are never registered as cold outreach to relance", async () => {
+  // Graph (sendMail) ne renvoie pas l'id du message envoye: sa copie
+  // "Envoyes" n'est donc pas deja marquee traitee, et sans ce garde-fou le
+  // destinataire interne du rapport recevrait des relances "post-reponse".
+  const connector = fakeConnector([
+    fakeSentMessage({
+      id: "msg-report",
+      threadId: "thread-report",
+      to: [{ email: "direction@example.com" }],
+      subject: "[Rapport] Rapport du matin — jeudi 15 octobre 2026",
+    }),
+    fakeSentMessage({
+      id: "msg-rappel",
+      threadId: "thread-rappel",
+      to: [{ email: "equipe@example.com" }],
+      subject: "[Rappel] 🚨 DOSSIER SANS RÉPONSE — Devis",
+    }),
+  ]);
+
+  await discoverOutboundOnlyThreads(connector);
+
+  assert.equal(await getThreadRow("thread-report"), undefined);
+  assert.equal(await getThreadRow("thread-rappel"), undefined);
+});

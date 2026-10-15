@@ -10,6 +10,18 @@ import { createEmailConnector } from "../connectors/index.js";
 import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCheck.js";
 import { sendAcknowledgement } from "../pipeline/processIncoming.js";
 import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
+import {
+  computeLiveMorningReport,
+  formatReportDay,
+  formatReportTime,
+  getMorningReportSendSettings,
+  needsHumanLabel,
+  parseMorningReportContent,
+  parseRecipients,
+  saveMorningReportSendSettings,
+  type MorningReportData,
+  type MorningReportSendSettings,
+} from "../pipeline/morningReport.js";
 import { getCategory } from "../settings.js";
 import {
   addCategoryRelanceStep,
@@ -26,6 +38,7 @@ import {
   getCategoryPlaybook,
   getCategoryRelanceSteps,
   getEffectiveRelanceSteps,
+  getMorningReportByDate,
   getThreadRelanceOverride,
   getThreadRow,
   getValidConnectInvite,
@@ -34,6 +47,7 @@ import {
   listCategoriesWithCorpus,
   listConnectInvites,
   listHumanReplyCorpusByCategory,
+  listMorningReports,
   listPipelineErrors,
   listRecentAiUsage,
   listReminders,
@@ -54,6 +68,7 @@ import {
   type AiUsageSummary,
   type CarnetEntry,
   type ConnectInviteRow,
+  type MorningReportRow,
   type PipelineErrorRow,
   type RelancePhase,
   type ReminderRow,
@@ -735,6 +750,54 @@ app.get("/consommation", async (_req: Request, res: Response) => {
   res.send(renderConsommationPage(summary, recent));
 });
 
+// ---------- Rapport du matin ----------
+
+app.get("/rapport", async (req: Request, res: Response) => {
+  const q = query(req);
+  const reports = await listMorningReports(30);
+  const settings = await getMorningReportSendSettings();
+  let data: MorningReportData | undefined;
+  let row: MorningReportRow | undefined;
+  if (q.apercu) {
+    data = await computeLiveMorningReport();
+  } else {
+    row = q.date ? await getMorningReportByDate(q.date) : reports[0];
+    data = row ? parseMorningReportContent(row) : undefined;
+  }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    renderRapportPage({
+      data,
+      row,
+      reports,
+      settings,
+      live: Boolean(q.apercu),
+      csrfToken: res.locals.csrfToken as string | undefined,
+      saved: q.saved,
+      invalid: q.invalid,
+    })
+  );
+});
+
+app.post("/rapport/reglages", requireCsrf, async (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  let recipients: string[];
+  try {
+    recipients = parseRecipients(body.recipients ?? "");
+  } catch (err) {
+    res.redirect(`/rapport?invalid=${encodeURIComponent((err as Error).message)}`);
+    return;
+  }
+  try {
+    await saveMorningReportSendSettings({ enabled: body.enabled === "on", recipients });
+  } catch (err) {
+    await recordPipelineError("web_request", null, `[Rapport du matin — réglages] ${(err as Error).message}`);
+    res.redirect(`/rapport?invalid=${encodeURIComponent("Enregistrement impossible, voir le Journal.")}`);
+    return;
+  }
+  res.redirect("/rapport?saved=1");
+});
+
 // ---------- Envois sans dossier (suivi manuel) ----------
 
 /**
@@ -877,6 +940,7 @@ type ActivePage =
   | "envois"
   | "carnet"
   | "consommation"
+  | "rapport"
   | "ton-de-marque"
   | "confidentialite";
 
@@ -888,6 +952,7 @@ const NAV_ICONS: Record<ActivePage, string> = {
   journal: `<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>`,
   envois: `<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>`,
   carnet: `<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>`,
+  rapport: `<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>`,
   consommation: `<line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>`,
   "ton-de-marque": `<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>`,
   confidentialite: `<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>`,
@@ -895,6 +960,7 @@ const NAV_ICONS: Record<ActivePage, string> = {
 
 const NAV_ITEMS: Array<{ key: ActivePage; href: string; label: string }> = [
   { key: "dossiers", href: "/dossiers", label: "Registre des dossiers" },
+  { key: "rapport", href: "/rapport", label: "Rapport du matin" },
   { key: "reglages", href: "/reglages", label: "Réglages" },
   { key: "journal", href: "/journal", label: "Journal" },
   { key: "envois", href: "/envois", label: "Envois" },
@@ -2083,6 +2149,7 @@ const PIPELINE_ERROR_CONTEXT_LABELS: Record<string, string> = {
   relance_check: "Vérification des relances",
   manual_override: "Traitement manuel d'un dossier",
   discover_outbound: "Détection d'un envoi sans dossier",
+  morning_report: "Rapport du matin",
   web_request: "Action dans l'application",
   category_update: "Modification d'une catégorie",
   category_relance_step_add: "Ajout d'une étape de relance (catégorie)",
@@ -2138,6 +2205,54 @@ function renderReminderRow(row: ReminderRow): string {
     </div>
   </div>`;
 }
+
+// ---------- Rapport du matin ----------
+
+app.get("/rapport", async (req: Request, res: Response) => {
+  const q = query(req);
+  const reports = await listMorningReports(30);
+  const settings = await getMorningReportSendSettings();
+  let data: MorningReportData | undefined;
+  let row: MorningReportRow | undefined;
+  if (q.apercu) {
+    data = await computeLiveMorningReport();
+  } else {
+    row = q.date ? await getMorningReportByDate(q.date) : reports[0];
+    data = row ? parseMorningReportContent(row) : undefined;
+  }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    renderRapportPage({
+      data,
+      row,
+      reports,
+      settings,
+      live: Boolean(q.apercu),
+      csrfToken: res.locals.csrfToken as string | undefined,
+      saved: q.saved,
+      invalid: q.invalid,
+    })
+  );
+});
+
+app.post("/rapport/reglages", requireCsrf, async (req: Request, res: Response) => {
+  const body = req.body as Record<string, string>;
+  let recipients: string[];
+  try {
+    recipients = parseRecipients(body.recipients ?? "");
+  } catch (err) {
+    res.redirect(`/rapport?invalid=${encodeURIComponent((err as Error).message)}`);
+    return;
+  }
+  try {
+    await saveMorningReportSendSettings({ enabled: body.enabled === "on", recipients });
+  } catch (err) {
+    await recordPipelineError("web_request", null, `[Rapport du matin — réglages] ${(err as Error).message}`);
+    res.redirect(`/rapport?invalid=${encodeURIComponent("Enregistrement impossible, voir le Journal.")}`);
+    return;
+  }
+  res.redirect("/rapport?saved=1");
+});
 
 // ---------- Envois sans dossier (suivi manuel) ----------
 
@@ -2412,6 +2527,233 @@ function renderConfidentialitePage(): string {
  * 500 generique d'Express, invisible cote admin. Desormais journalisee dans
  * pipeline_errors (visible sur /journal) avec le chemin et le message exacts.
  */
+// ---------- Rapport du matin (rendu) ----------
+
+function reportSendStatus(row: MorningReportRow): { label: string; stampClass: string } {
+  if (row.send_error && row.sent_to) return { label: `Envoi partiel — ${row.send_error}`, stampClass: "stamp-late" };
+  if (row.send_error) return { label: `Échec d'envoi — ${row.send_error}`, stampClass: "stamp-late" };
+  if (row.sent_at) return { label: `Envoyé à ${row.sent_to ?? ""} — ${formatDateTime(row.sent_at)}`, stampClass: "stamp-done" };
+  if (row.send_claimed_at) return { label: "Envoi en cours", stampClass: "stamp-wait" };
+  return { label: "Non envoyé — visible ici seulement", stampClass: "stamp-skip" };
+}
+
+function renderSendSettingsPanel(settings: MorningReportSendSettings, csrfToken: string | undefined): string {
+  const hour = config.morningReport.hour;
+  const defaultRecipient = config.notificationEmail || getConnectionState()?.email || "la messagerie connectée";
+  const recipientsLabel = settings.recipients.length ? settings.recipients.join(", ") : defaultRecipient;
+  const status = config.shadowModeEnabled
+    ? `<div class="banner banner-info">Mode silencieux actif : le rapport est généré chaque jour à ${hour} h et reste visible ici uniquement. Aucun email n'est envoyé, même si l'envoi est coché ci-dessous.</div>`
+    : settings.enabled
+      ? `<div class="banner banner-ok">Envoi activé : le rapport part chaque jour à ${hour} h (${escapeHtml(config.timezone)}) à ${escapeHtml(recipientsLabel)}.</div>`
+      : `<div class="banner banner-info">Envoi désactivé : le rapport est généré chaque jour à ${hour} h et reste visible ici uniquement.</div>`;
+  return `<div class="settings-section">
+    <h2>Envoi par email</h2>
+    <p class="section-hint">Un interrupteur distinct des accusés et relances. Un changement s'applique au prochain rapport de ${hour} h ; le rapport d'un jour ne part jamais deux fois.</p>
+    ${status}
+    <form method="POST" action="/rapport/reglages" style="margin-top: 12px;">
+      ${csrfField(csrfToken)}
+      <label class="checkbox-cell" style="margin-bottom: 10px;">
+        <input type="checkbox" name="enabled" ${settings.enabled ? "checked" : ""} />
+        Envoyer le rapport par email chaque matin à ${hour} h
+      </label>
+      <label class="ledger-meta" for="report-recipients">Destinataires (séparés par des virgules). Vide : ${escapeHtml(defaultRecipient)}</label>
+      <div style="display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap;">
+        <input id="report-recipients" type="text" name="recipients" value="${escapeHtml(settings.recipients.join(", "))}" placeholder="${escapeHtml(defaultRecipient)}" style="flex: 1 1 280px; min-width: 0;" />
+        <button class="btn btn-primary btn-sm" type="submit">Enregistrer</button>
+      </div>
+    </form>
+  </div>`;
+}
+
+function reportThreadLine(ref: { threadId: string; subject: string; senderEmail: string; senderName: string | null }): string {
+  const sender = ref.senderName ? `${ref.senderName} <${ref.senderEmail}>` : ref.senderEmail;
+  return `<a class="subject-link" href="/dossiers/${encodeURIComponent(ref.threadId)}">${escapeHtml(ref.subject || "(sans objet)")}</a>
+    <div class="ledger-meta">${escapeHtml(sender)}</div>`;
+}
+
+function renderReportBody(data: MorningReportData): string {
+  const ackLabel = data.shadowMode ? "Accusés rédigés (non envoyés)" : "Accusés envoyés";
+  const metrics = `<div class="metric-grid">
+    <div class="metric">
+      <div class="metric-label">Emails reçus</div>
+      <div class="metric-value">${data.received.total}</div>
+      <div class="metric-sub">dont ${data.received.night} la nuit</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">${ackLabel}</div>
+      <div class="metric-value">${data.acknowledgements.count}</div>
+      <div class="metric-sub">${data.acknowledgements.skipped} sans accusé nécessaire</div>
+    </div>
+    <div class="metric ${data.needsHuman.total > 0 ? "metric-warn" : ""}">
+      <div class="metric-label">À traiter par l'équipe</div>
+      <div class="metric-value">${data.needsHuman.total}</div>
+      <div class="metric-sub">${data.pending.awaitingTeamOverdue} délai(s) dépassé(s)</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Relances client prévues (24 h)</div>
+      <div class="metric-value">${data.pending.upcomingTotal}</div>
+      <div class="metric-sub">${data.pending.awaitingClient} dossier(s) en attente du client</div>
+    </div>
+  </div>`;
+
+  const categoryRows = data.received.byCategory
+    .map(
+      (r) => `<div class="ledger-row">
+        <div class="ledger-main"><span class="subject-static">${escapeHtml(r.label)}</span></div>
+        <div class="ledger-facts"><div class="ledger-fact"><span class="fact-label">Emails</span><span class="fact-value">${r.count}</span></div></div>
+      </div>`
+    )
+    .join("");
+  const aiErrorRow = data.received.aiErrors
+    ? `<div class="ledger-row"><div class="ledger-main"><span class="subject-static">Non classés (échec IA)</span></div>
+        <div class="ledger-facts"><div class="ledger-fact"><span class="fact-label">Dossiers</span><span class="fact-value">${data.received.aiErrors}</span></div></div></div>`
+    : "";
+  const categories =
+    categoryRows || aiErrorRow
+      ? `<div class="ledger"><div class="ledger-head"><span>Catégorie</span></div>${categoryRows}${aiErrorRow}</div>`
+      : `<div class="ledger"><div class="empty">Aucun email classé sur la période.</div></div>`;
+
+  const relanceFacts = data.shadowMode
+    ? `<div class="ledger-fact"><span class="fact-label">Relances client rédigées (non envoyées)</span><span class="fact-value">${data.relances.testPreReply + data.relances.testPostReply}</span></div>`
+    : `<div class="ledger-fact"><span class="fact-label">Relances client avant notre réponse</span><span class="fact-value">${data.relances.externalPreReply}</span></div>
+       <div class="ledger-fact"><span class="fact-label">Relances client après notre réponse</span><span class="fact-value">${data.relances.externalPostReply}</span></div>`;
+  const activity = `<div class="ledger"><div class="ledger-row"><div class="ledger-facts">
+    <div class="ledger-fact"><span class="fact-label">${ackLabel}</span><span class="fact-value">${data.acknowledgements.count}</span></div>
+    ${relanceFacts}
+    <div class="ledger-fact"><span class="fact-label">Rappels envoyés à l'équipe</span><span class="fact-value">${data.relances.internalSent}</span></div>
+    <div class="ledger-fact"><span class="fact-label">Rappels équipe filtrés</span><span class="fact-value">${data.relances.internalFiltered}</span></div>
+  </div></div></div>`;
+
+  const needsHumanRows = data.needsHuman.items
+    .map((item) => {
+      const when = item.reason === "overdue" ? `Échéance ${formatReportTime(item.since)}` : `Reçu ${formatReportTime(item.since)}`;
+      return `<div class="ledger-row">
+        <div class="ledger-main">${reportThreadLine(item)}</div>
+        <div class="ledger-facts">
+          <span class="stamp ${item.reason === "urgent" ? "stamp-wait" : "stamp-late"}">${escapeHtml(needsHumanLabel(item.reason))}</span>
+          <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(item.categoryLabel)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Urgence</span><span class="fact-value">${escapeHtml(urgencyStamp(item.urgency).label)}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Quand</span><span class="fact-value">${escapeHtml(when)}</span></div>
+        </div>
+      </div>`;
+    })
+    .join("");
+  const needsHumanRest = data.needsHuman.total - data.needsHuman.items.length;
+  const needsHuman = data.needsHuman.total
+    ? `<div class="ledger"><div class="ledger-head"><span>Dossier</span></div>${needsHumanRows}${
+        needsHumanRest > 0 ? `<div class="empty">… et ${needsHumanRest} autre(s) — voir le <a href="/dossiers">registre</a>.</div>` : ""
+      }</div>`
+    : `<div class="ledger"><div class="empty">Rien en attente de l'équipe.</div></div>`;
+
+  const upcomingRows = data.pending.upcoming
+    .map(
+      (item) => `<div class="ledger-row">
+        <div class="ledger-main">${reportThreadLine(item)}</div>
+        <div class="ledger-facts">
+          <div class="ledger-fact"><span class="fact-label">Prévue</span><span class="fact-value">${escapeHtml(formatReportTime(item.fireAt))}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Phase</span><span class="fact-value">${item.phase === "pre_reply" ? "Avant notre réponse" : "Après notre réponse"}</span></div>
+          <div class="ledger-fact"><span class="fact-label">Catégorie</span><span class="fact-value">${escapeHtml(item.categoryLabel)}</span></div>
+        </div>
+      </div>`
+    )
+    .join("");
+  const upcomingRest = data.pending.upcomingTotal - data.pending.upcoming.length;
+  const upcoming = data.pending.upcomingTotal
+    ? `<div class="ledger"><div class="ledger-head"><span>Relance client prévue</span></div>${upcomingRows}${
+        upcomingRest > 0 ? `<div class="empty">… et ${upcomingRest} autre(s).</div>` : ""
+      }</div>`
+    : `<div class="ledger"><div class="empty">Aucune relance client prévue dans les 24 h.</div></div>`;
+
+  const errors = data.pipelineErrors
+    ? `<div class="banner banner-error">${data.pipelineErrors} erreur(s) technique(s) sur la période — voir le <a href="/journal">Journal</a>.</div>`
+    : "";
+
+  return `
+    ${metrics}
+    ${errors}
+    <div class="settings-section">
+      <h2>À traiter par l'équipe</h2>
+      <p class="section-hint">Délai promis au client dépassé sans réponse, échec de l'IA (classification ou accusé), ou demande urgente encore sans réponse — à l'instant où le rapport a été généré.</p>
+      ${needsHuman}
+    </div>
+    <div class="settings-section">
+      <h2>Emails reçus par catégorie</h2>
+      <p class="section-hint">Chaque email classé par l'IA sur la période (spam et newsletters exclus).</p>
+      ${categories}
+    </div>
+    <div class="settings-section">
+      <h2>Accusés et relances</h2>
+      ${activity}
+    </div>
+    <div class="settings-section">
+      <h2>Suivis en cours</h2>
+      <p class="section-hint">${data.pending.awaitingTeam} dossier(s) attendent une réponse de l'équipe (dont ${data.pending.awaitingTeamOverdue} en retard), ${data.pending.awaitingClient} attendent une réponse du client.${data.shadowMode ? " Mode silencieux : les relances ci-dessous seront seulement rédigées." : ""}</p>
+      ${upcoming}
+    </div>`;
+}
+
+function renderRapportPage(opts: {
+  data: MorningReportData | undefined;
+  row: MorningReportRow | undefined;
+  reports: MorningReportRow[];
+  settings: MorningReportSendSettings;
+  live: boolean;
+  csrfToken: string | undefined;
+  saved: string | undefined;
+  invalid: string | undefined;
+}): string {
+  const banner = opts.invalid
+    ? `<div class="banner banner-error">${escapeHtml(opts.invalid)}</div>`
+    : opts.saved
+      ? `<div class="banner banner-ok">Réglages enregistrés.</div>`
+      : "";
+
+  const tabs = `<div style="display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap;">
+    <a class="btn btn-sm ${opts.live ? "btn-secondary" : "btn-primary"}" href="/rapport">Dernier rapport</a>
+    <a class="btn btn-sm ${opts.live ? "btn-primary" : "btn-secondary"}" href="/rapport?apercu=1">Aperçu en direct (depuis ${config.morningReport.hour} h)</a>
+  </div>`;
+
+  let heading: string;
+  if (opts.live && opts.data) {
+    heading = `<div class="banner banner-info">Aperçu calculé à l'instant, du ${escapeHtml(formatReportTime(opts.data.periodStart))} à maintenant. Il n'est ni enregistré ni envoyé.</div>`;
+  } else if (opts.row && opts.data) {
+    const status = reportSendStatus(opts.row);
+    heading = `<div class="settings-section" style="margin-bottom: 18px;">
+      <h2>Rapport du ${escapeHtml(formatReportDay(opts.data))}</h2>
+      <p class="section-hint">Du ${escapeHtml(formatReportTime(opts.data.periodStart))} au ${escapeHtml(formatReportTime(opts.data.periodEnd))} · <span class="stamp ${status.stampClass}">${escapeHtml(status.label)}</span></p>
+    </div>`;
+  } else {
+    heading = "";
+  }
+  const report = opts.data
+    ? heading + renderReportBody(opts.data)
+    : `<div class="ledger"><div class="empty">Aucun rapport pour l'instant. Le premier est généré à ${config.morningReport.hour} h, ou au prochain démarrage du service. L'aperçu en direct est disponible dès maintenant.</div></div>`;
+
+  const historyRows = opts.reports
+    .map((r) => {
+      const status = reportSendStatus(r);
+      const current = !opts.live && opts.row?.id === r.id;
+      return `<div class="ledger-row">
+        <div class="ledger-main">
+          <a class="subject-link" href="/rapport?date=${encodeURIComponent(r.report_date)}">${escapeHtml(r.report_date)}</a>${current ? ` <span class="ledger-meta">(affiché)</span>` : ""}
+          <div class="ledger-meta">Généré le ${escapeHtml(formatDateTime(r.generated_at))}</div>
+        </div>
+        <div class="ledger-facts"><span class="stamp ${status.stampClass}">${escapeHtml(status.label)}</span></div>
+      </div>`;
+    })
+    .join("");
+  const history = opts.reports.length
+    ? `<div class="settings-section"><h2>Historique (30 derniers jours)</h2><div class="ledger">${historyRows}</div></div>`
+    : "";
+
+  return pageShell(
+    "rapport",
+    "Rapport du matin",
+    `Chaque jour à ${config.morningReport.hour} h : emails reçus par catégorie, accusés, relances et dossiers qui attendent un humain.`,
+    banner + tabs + report + renderSendSettingsPanel(opts.settings, opts.csrfToken) + history
+  );
+}
+
 function renderErrorPage(): string {
   return `<!doctype html>
 <html lang="fr">

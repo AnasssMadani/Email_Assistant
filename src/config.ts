@@ -112,6 +112,19 @@ export const config = {
   // attend simplement le cycle suivant. Les rappels internes (jamais vus
   // par un client) ne sont pas concernes par cette limite.
   maxExternalRelancesPerCycle: Number(process.env.MAX_EXTERNAL_RELANCES_PER_CYCLE ?? 5),
+  // Rapport du matin (voir src/pipeline/morningReport.ts). Heures locales
+  // dans config.timezone. Le rapport couvre les 24 h precedant `hour`; la
+  // "nuit" (emails arrives hors horaires de bureau, Chine, Turquie...) va de
+  // `nightStartHour` la veille jusqu'a `hour`. L'envoi par email lui-meme
+  // s'active depuis le back-office (/rapport), jamais par variable d'env.
+  morningReport: {
+    hour: Number(process.env.MORNING_REPORT_HOUR ?? 9),
+    nightStartHour: Number(process.env.MORNING_REPORT_NIGHT_START_HOUR ?? 18),
+    // Apres un redemarrage tardif, un rapport pas encore envoye ne part plus
+    // au-dela de ce delai apres l'heure prevue (un "rapport du matin" recu a
+    // 16 h induit en erreur) — il reste consultable dans le back-office.
+    sendCutoffHours: Number(process.env.MORNING_REPORT_SEND_CUTOFF_HOURS ?? 3),
+  },
 };
 
 export function requireAnthropicApiKey(): string {

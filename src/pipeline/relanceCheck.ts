@@ -207,7 +207,8 @@ export async function checkPreReplyThread(
       await recordReminder(
         row.thread_id,
         "internal",
-        `[Mode test] Relance externe qui aurait ete envoyee a ${row.sender_email} — non envoyee.\n\nObjet: ${buildReplySubject(row.subject)}\n\n${relance.body}`
+        `[Mode test] Relance externe qui aurait ete envoyee a ${row.sender_email} — non envoyee.\n\nObjet: ${buildReplySubject(row.subject)}\n\n${relance.body}`,
+        "relance_externe_test_pre_reponse"
       );
       await incrementRelance(row.thread_id, "relance_sent");
       return;
@@ -335,7 +336,8 @@ export async function checkPostReplyThread(
       await recordReminder(
         row.thread_id,
         "internal",
-        `[Mode test] Relance post-reponse qui aurait ete envoyee a ${row.sender_email} — non envoyee.\n\nObjet: ${buildReplySubject(row.subject)}\n\n${relance.body}`
+        `[Mode test] Relance post-reponse qui aurait ete envoyee a ${row.sender_email} — non envoyee.\n\nObjet: ${buildReplySubject(row.subject)}\n\n${relance.body}`,
+        "relance_externe_test_post_reponse"
       );
       await incrementPostReplyRelance(row.thread_id, "post_reply_relance_sent");
       return;
