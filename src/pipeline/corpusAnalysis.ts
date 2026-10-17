@@ -1,10 +1,12 @@
 import { getCategory } from "../settings.js";
 import { analyzeCategoryCorpus } from "../ai/analyzeCorpus.js";
 import {
+  listAllHumanReplyCorpus,
   listCategoriesWithCorpus,
   listHumanReplyCorpusByCategory,
   recordPipelineError,
   setCategoryPlaybook,
+  TEAM_PLAYBOOK_ID,
 } from "../db.js";
 
 /**
@@ -20,6 +22,7 @@ export async function runCorpusAnalysis(): Promise<void> {
 
 /** Même analyse, limitée aux catégories données (import manuel: seules celles touchées sont refaites). */
 export async function runCorpusAnalysisFor(categoryIds: string[]): Promise<void> {
+  if (categoryIds.length > 0) await runTeamStyleAnalysis();
   for (const categoryId of categoryIds) {
     const allReplies = await listHumanReplyCorpusByCategory(categoryId);
     if (allReplies.length === 0) continue;
@@ -52,5 +55,41 @@ export async function runCorpusAnalysisFor(categoryIds: string[]): Promise<void>
       console.error(`[analyse corpus] erreur categorie ${categoryId}:`, err);
       await recordPipelineError("corpus_analysis", null, (err as Error).message);
     }
+  }
+}
+
+/**
+ * Note de style generale de l'equipe, toutes categories confondues: une
+ * categorie qui n'a encore aucune reponse apprise (nouvelle categorie, ou
+ * peu frequente) s'en sert a la place de sa propre note (voir
+ * draftAcknowledgement.ts). L'equipe ecrit de la meme facon quel que soit
+ * le sujet ("Hi dear", "Well noted with thanks", meme signature).
+ */
+async function runTeamStyleAnalysis(): Promise<void> {
+  const allReplies = await listAllHumanReplyCorpus();
+  if (allReplies.length === 0) return;
+  const replies = allReplies.slice(-40);
+  try {
+    const analysis = await analyzeCategoryCorpus("toutes les demandes", replies);
+    await setCategoryPlaybook(
+      TEAM_PLAYBOOK_ID,
+      [
+        "# Style observe — equipe (toutes categories)",
+        "",
+        `_Genere automatiquement a partir de ${replies.length} reponse(s) reelle(s) de l'equipe, historique cite retire._`,
+        "",
+        "## Ton",
+        "",
+        analysis.tone,
+        "",
+        "## Structure typique",
+        "",
+        analysis.structure,
+        "",
+      ].join("\n")
+    );
+  } catch (err) {
+    console.error("[analyse corpus] erreur note generale:", err);
+    await recordPipelineError("corpus_analysis", null, (err as Error).message);
   }
 }

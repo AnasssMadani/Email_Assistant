@@ -39,6 +39,8 @@ export const config = {
   // Une instance par environnement (dev/prod) — voir README, section Supabase.
   databaseUrl: process.env.DATABASE_URL ?? "",
   categoriesConfigPath: process.env.CATEGORIES_CONFIG_PATH ?? "./config/categories.json",
+  /** Categories metier du client, appliquees une fois par version (voir applyCategoryProfile dans db.ts). Vide = aucun profil. */
+  categoryProfilePath: process.env.CATEGORY_PROFILE_PATH ?? "./config/category-profile.json",
   // Contenu par defaut, lu UNE SEULE FOIS au tout premier demarrage (base
   // vide) pour amorcer la ligne `brand_voice` en base — modifiable ensuite
   // uniquement depuis /ton-de-marque, jamais relu depuis ce fichier. Le

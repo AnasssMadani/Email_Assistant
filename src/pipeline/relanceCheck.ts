@@ -1,4 +1,4 @@
-import { stripQuotedHistory } from "./emailText.js";
+import { cleanReplyForLearning } from "./emailText.js";
 import { config } from "../config.js";
 import { getCategory } from "../settings.js";
 import { isSendAllowed } from "../stage.js";
@@ -21,7 +21,7 @@ import {
   setThreadStatus,
   type ThreadRow,
 } from "../db.js";
-import type { EmailConnector, RelanceStep } from "../types.js";
+import type { EmailConnector, EmailMessage, RelanceStep } from "../types.js";
 
 /**
  * Compteur partage sur un seul cycle de runRelanceCheck: plafonne le nombre
@@ -161,11 +161,14 @@ export async function checkPreReplyThread(
   // (automated_outbound_count): au-dela, l'exces est forcement humain, quel
   // que soit son contenu exact. Le dernier message isFromUs du fil (trie
   // chronologiquement) est alors ce message humain.
+  // prior_outbound_count: messages de l'equipe deja presents dans le fil AVANT
+  // l'email qui a ouvert ce dossier (fil partenaire en cours). Sans lui, la
+  // reponse d'hier comptait comme reponse a l'email d'aujourd'hui et le
+  // dossier passait "repondu" des le premier cycle, avec un delai negatif.
   const ourMessages = thread.messages.filter((m) => m.isFromUs);
+  const expectedOurs = row.automated_outbound_count + (row.prior_outbound_count ?? 0);
   const replyAfterAck =
-    row.ack_sent_at !== null && ourMessages.length > row.automated_outbound_count
-      ? ourMessages[ourMessages.length - 1]
-      : undefined;
+    row.ack_sent_at !== null && ourMessages.length > expectedOurs ? ourMessages[ourMessages.length - 1] : undefined;
 
   if (replyAfterAck) {
     // Corpus des vraies reponses de l'equipe (mode carnet — voir
@@ -174,7 +177,8 @@ export async function checkPreReplyThread(
     await recordHumanReplyCorpus({
       threadId: row.thread_id,
       categoryId: row.category_id,
-      replyBody: stripQuotedHistory(replyAfterAck.bodyText),
+      replyBody: cleanReplyForLearning(replyAfterAck.bodyText),
+      clientAsk: lastInboundBefore(thread.messages, replyAfterAck),
     });
     // Un humain vient de repondre de fond: ce n'est plus "notre equipe est
     // en retard", c'est desormais "on attend le client" — nouvelle phase.
@@ -511,4 +515,14 @@ async function sendInternalNotification(connector: EmailConnector, row: ThreadRo
       `Echec envoi de la notification de rappel interne: ${(err as Error).message}`
     );
   }
+}
+
+/** Dernier message recu (pas de nous) avant `reply`: la demande a laquelle l'equipe repondait, pour l'apprentissage. */
+function lastInboundBefore(messages: EmailMessage[], reply: EmailMessage): string | undefined {
+  const index = messages.indexOf(reply);
+  const before = index >= 0 ? messages.slice(0, index) : messages;
+  const ask = [...before].reverse().find((m) => !m.isFromUs);
+  if (!ask) return undefined;
+  const text = cleanReplyForLearning(ask.bodyText).trim();
+  return text ? text.slice(0, 4000) : undefined;
 }

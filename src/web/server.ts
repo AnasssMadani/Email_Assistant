@@ -84,7 +84,8 @@ import {
   type ReminderRow,
   type ThreadRow,
 } from "../db.js";
-import type { CategoryConfig, EmailMessage, RelanceChannel, RelanceStep } from "../types.js";
+import type { AckSchedule, CategoryConfig, EmailMessage, RelanceChannel, RelanceStep } from "../types.js";
+import { DEFAULT_OFFICE_HOURS, getOfficeHours, setOfficeHours, type OfficeHours } from "../officeHours.js";
 import {
   authConfigured,
   clearSessionCookie,
@@ -167,6 +168,38 @@ function alertModeOf(cat: CategoryConfig): keyof typeof ALERT_MODES {
 
 function parseAlertMode(value: string | undefined): { enabled: boolean; minUrgency: "low" | "normal" | "high" } {
   return ALERT_MODES[(value as keyof typeof ALERT_MODES) ?? "normal"] ?? ALERT_MODES.normal;
+}
+
+/**
+ * Choix de l'accuse par categorie (/reglages): jamais, toujours, ou seulement
+ * hors des heures de bureau (nuit, week-end) — en journee l'equipe repond
+ * elle-meme en quelques minutes. Valeur inconnue = jamais (le plus strict).
+ */
+const ACK_MODES = {
+  never: { acknowledgeAutomatically: false, ackSchedule: "always" },
+  always: { acknowledgeAutomatically: true, ackSchedule: "always" },
+  outside_hours: { acknowledgeAutomatically: true, ackSchedule: "outside_hours" },
+} as const satisfies Record<string, { acknowledgeAutomatically: boolean; ackSchedule: AckSchedule }>;
+
+const ACK_MODE_LABELS: Record<keyof typeof ACK_MODES, string> = {
+  never: "Jamais",
+  always: "Toujours",
+  outside_hours: "Hors heures de bureau",
+};
+
+function parseAckMode(value: string | undefined): { acknowledgeAutomatically: boolean; ackSchedule: AckSchedule } {
+  return ACK_MODES[value as keyof typeof ACK_MODES] ?? ACK_MODES.never;
+}
+
+function ackModeOf(cat: CategoryConfig): keyof typeof ACK_MODES {
+  if (!cat.acknowledgeAutomatically) return "never";
+  return cat.ackSchedule === "outside_hours" ? "outside_hours" : "always";
+}
+
+function renderAckModeSelect(selected: keyof typeof ACK_MODES): string {
+  return `<select name="ackMode">${(Object.keys(ACK_MODES) as Array<keyof typeof ACK_MODES>)
+    .map((mode) => `<option value="${mode}" ${mode === selected ? "selected" : ""}>${escapeHtml(ACK_MODE_LABELS[mode])}</option>`)
+    .join("")}</select>`;
 }
 
 /**
@@ -742,7 +775,7 @@ app.post("/reglages/categories", requireCsrf, async (req: Request, res: Response
     await createCategory({
       label,
       slaMinutes: Math.max(0, parseLocaleNumber(body.slaMinutes) || 1440),
-      acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
+      ...parseAckMode(body.ackMode),
     });
   });
 });
@@ -754,9 +787,24 @@ app.post("/reglages/categories/:id", requireCsrf, async (req: Request, res: Resp
     await updateCategory(req.params.id, {
       label: (body.label ?? "").trim() || req.params.id,
       slaMinutes: Math.max(0, parseLocaleNumber(body.slaMinutes)),
-      acknowledgeAutomatically: body.acknowledgeAutomatically === "on",
+      ...parseAckMode(body.ackMode),
       internalAlertsEnabled: alertMode.enabled,
       internalAlertsMinUrgency: alertMode.minUrgency,
+      // Absent du formulaire (ancienne page en cache) = description inchangee.
+      description: typeof body.description === "string" ? body.description.trim().slice(0, 600) : undefined,
+    });
+  });
+});
+
+app.post("/reglages/heures-bureau", requireCsrf, async (req: Request, res: Response) => {
+  const body = req.body as Record<string, string | string[]>;
+  await runOrRedirectReglagesError(res, "office_hours_update", async () => {
+    const rawDays = body.days;
+    const days = (Array.isArray(rawDays) ? rawDays : rawDays ? [rawDays] : []).map(Number);
+    await setOfficeHours({
+      days,
+      start: String(body.start ?? DEFAULT_OFFICE_HOURS.start),
+      end: String(body.end ?? DEFAULT_OFFICE_HOURS.end),
     });
   });
 });
@@ -2093,6 +2141,26 @@ async function renderCategoryStepsPanel(
 
 // ---------- Reglages ----------
 
+const WEEKDAY_LABELS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
+
+function renderOfficeHoursForm(hours: OfficeHours, csrfToken: string | undefined): string {
+  const dayBoxes = WEEKDAY_LABELS.map(
+    (label, i) =>
+      `<label class="checkbox-cell"><input type="checkbox" name="days" value="${i + 1}" ${hours.days.includes(i + 1) ? "checked" : ""} /> ${label}</label>`
+  ).join(" ");
+  return `<form class="category-block" method="POST" action="/reglages/heures-bureau">
+      ${csrfField(csrfToken)}
+      <span class="field-label">Heures de bureau de l'équipe (${escapeHtml(config.timezone)})</span>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px;">
+        ${dayBoxes}
+        <label>de <input type="time" name="start" value="${escapeHtml(hours.start)}" required /></label>
+        <label>à <input type="time" name="end" value="${escapeHtml(hours.end)}" required /></label>
+        <button class="btn btn-primary btn-sm" type="submit">Enregistrer</button>
+      </div>
+      <span class="field-hint">Utilisées par les catégories réglées « Hors heures de bureau ».</span>
+    </form>`;
+}
+
 async function renderReglagesPage(
   categories: CategoryConfig[],
   csrfToken: string | undefined,
@@ -2100,6 +2168,7 @@ async function renderReglagesPage(
   error: string | undefined,
   openCategory?: string
 ): Promise<string> {
+  const officeHours = await getOfficeHours();
   const banner = error
     ? `<div class="banner banner-error">L'action a échoué — l'erreur a été journalisée, voir la page <a href="/journal">Journal</a>.</div>`
     : saved
@@ -2126,16 +2195,16 @@ async function renderReglagesPage(
             <span class="field-label">Catégorie</span>
             <input type="text" name="label" value="${escapeHtml(cat.label)}" />
             <span class="cat-id">${escapeHtml(cat.id)}${cat.createdByAi ? ` · <span class="stamp stamp-internal">créée par l'IA</span>` : ""}</span>
-            ${cat.description ? `<span class="field-hint">${escapeHtml(cat.description)}</span>` : ""}
+            <textarea name="description" rows="2" maxlength="600" placeholder="Quels emails vont dans cette catégorie ? (lu par l'IA pour classer)" style="width:100%;margin-top:6px;">${escapeHtml(cat.description)}</textarea>
           </div>
           <div>
-            <span class="field-label">SLA (min)</span>
-            <input type="number" name="slaMinutes" value="${cat.slaMinutes}" min="0" step="1" title="Délai que l'accusé de réception promet au client, en minutes (ex: 1440 = « réponse sous 24h »). C'est aussi le point de départ des rappels et relances automatiques ci-dessous." />
+            <span class="field-label">Délai de réponse (min)</span>
+            <input type="number" name="slaMinutes" value="${cat.slaMinutes}" min="0" step="1" title="Délai interne pour répondre, en minutes (ex: 1440 = 24h). Point de départ des rappels à l'équipe et des relances ci-dessous. L'accusé ne promet aucun délai au client." />
             <span class="field-hint">${escapeHtml(formatDelay(cat.slaMinutes))}</span>
           </div>
-          <div class="checkbox-cell">
-            <input type="checkbox" id="ack-${escapeHtml(cat.id)}" name="acknowledgeAutomatically" ${cat.acknowledgeAutomatically ? "checked" : ""} />
-            <label for="ack-${escapeHtml(cat.id)}">Accusé auto.</label>
+          <div>
+            <span class="field-label">Accusé de réception</span>
+            ${renderAckModeSelect(ackModeOf(cat))}
           </div>
           <div>
             <span class="field-label">Alerter l'équipe si sans réponse</span>
@@ -2164,13 +2233,14 @@ async function renderReglagesPage(
     ${banner}
     <div class="settings-section">
       <h2>Catégories &amp; séquences de relance</h2>
-      <p class="section-hint">Libellé, SLA et accusé automatique par catégorie. "Alerter l'équipe si sans réponse" filtre les rappels internes: réglez sur "Jamais" ou "Urgence haute uniquement" pour les catégories à faible enjeu, afin de ne pas noyer la boîte de l'équipe pour des demandes banales. Les délais précis restent réglables dans "Réglages avancés" ci-dessous, par catégorie ou pour un dossier précis depuis sa page de détail.</p>
+      <p class="section-hint">Libellé, description, délai de réponse et accusé par catégorie. La description est lue par l'IA pour classer les emails : plus elle est précise, mieux elle classe. « Hors heures de bureau » n'envoie l'accusé que la nuit et le week-end (voir les heures ci-dessous), quand l'équipe n'est pas là pour répondre elle-même. "Alerter l'équipe si sans réponse" filtre les rappels internes: réglez sur "Jamais" ou "Urgence haute uniquement" pour les catégories à faible enjeu, afin de ne pas noyer la boîte de l'équipe pour des demandes banales. Les délais précis restent réglables dans "Réglages avancés" ci-dessous, par catégorie ou pour un dossier précis depuis sa page de détail.</p>
       ${categoryBlocks}
+      ${renderOfficeHoursForm(officeHours, csrfToken)}
       <form class="new-category-form" method="POST" action="/reglages/categories">
         ${csrfField(csrfToken)}
         <input type="text" name="label" placeholder="Nom de la nouvelle catégorie" required />
-        <input type="number" name="slaMinutes" value="1440" min="0" step="1" title="Délai promis au client dans l'accusé de réception, en minutes (1440 = 24h)" />
-        <label class="checkbox-cell"><input type="checkbox" name="acknowledgeAutomatically" checked /> Accusé auto.</label>
+        <input type="number" name="slaMinutes" value="1440" min="0" step="1" title="Délai interne pour répondre, en minutes (1440 = 24h)" />
+        <label>Accusé ${renderAckModeSelect("never")}</label>
         <button class="btn btn-secondary btn-sm" type="submit">+ Nouvelle catégorie</button>
       </form>
     </div>
@@ -2617,6 +2687,10 @@ const CARNET_NO_ACK_SHORT: Record<string, string> = {
   categorie: "catégorie sans accusé",
   equipe: "équipe déjà intervenue",
   sensible: "sujet sensible",
+  automatique: "envois automatiques",
+  doublon: "déjà accusés",
+  heures_bureau: "heures de bureau",
+  suspect: "suspects",
   "": "en cours ou en erreur",
 };
 
@@ -2626,7 +2700,11 @@ const CARNET_NO_ACK_REASONS: Record<string, string> = {
   ia: "Aucun — l'IA a jugé qu'aucun accusé n'était nécessaire pour cet email (information, notification...).",
   categorie: "Aucun — cette catégorie n'envoie pas d'accusé automatique (voir Réglages).",
   equipe: "Aucun — l'équipe a déjà répondu dans cette conversation.",
-  sensible: "Aucun — sujet sensible (paiement, litige, réclamation) : une personne doit répondre.",
+  sensible: "Aucun — sujet sensible (litige, réclamation, pénalité) : une personne doit répondre.",
+  automatique: "Aucun — message envoyé par un robot (portail d'armateur, adresse noreply) : personne n'attend de réponse.",
+  doublon: "Aucun — un accusé a déjà été rédigé pour cette conversation ou cette référence ces 7 derniers jours.",
+  heures_bureau: "Aucun — reçu pendant les heures de bureau : cette catégorie n'accuse que la nuit et le week-end.",
+  suspect: "Aucun — email suspect (hameçonnage probable) : ne pas ouvrir les pièces jointes ni les liens.",
   "": "Aucun accusé rédigé pour l'instant (rédaction en cours, ou erreur — voir le Journal).",
 };
 

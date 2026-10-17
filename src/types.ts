@@ -27,6 +27,8 @@ export interface EmailMessage {
   isFromUs: boolean;
   /** Vrai si le message contient au moins une piece jointe (PDF, etc.) — permet a une relance automatique d'y faire reference sans l'inventer. */
   hasAttachments: boolean;
+  /** En-tetes d'envoi automatique (Auto-Submitted, Precedence: bulk...), quand le connecteur sait les lire. Absent = inconnu. */
+  isAutomated?: boolean;
 }
 
 export interface EmailThread {
@@ -74,12 +76,16 @@ export interface EmailConnector {
  */
 export type UrgencyThreshold = "low" | "normal" | "high";
 
+export type AckSchedule = "always" | "outside_hours";
+
 export interface CategoryConfig {
   id: string;
   label: string;
   /** Delai promis au client dans l'accuse de reception, en minutes (permet un reglage plus fin qu'en heures, coherent avec les etapes de relance deja en minutes). */
   slaMinutes: number;
   acknowledgeAutomatically: boolean;
+  /** Quand l'accuse part, si acknowledgeAutomatically: a toute heure, ou seulement hors des heures de bureau. */
+  ackSchedule: AckSchedule;
   internalAlertsEnabled: boolean;
   internalAlertsMinUrgency: UrgencyThreshold;
   /** Description libre (renseignee notamment par l'IA quand elle cree la categorie), reprise dans le prompt de classification. */
@@ -111,8 +117,12 @@ export interface ClassificationResult {
   urgency: "low" | "normal" | "high";
   summary: string;
   requiresAcknowledgement: boolean;
-  /** Sujet sensible (paiement, litige, reclamation...): un humain doit repondre, pas d'accuse automatique. */
+  /** Sujet sensible (litige, reclamation, menace de penalite...): un humain doit repondre, pas d'accuse automatique. */
   needsHumanReply?: boolean;
+  /** Email suspect (hameconnage probable): jamais d'accuse, signale dans le carnet. */
+  suspicious?: boolean;
+  /** Pourquoi l'email semble suspect, en une phrase (affiche dans le carnet). */
+  suspicionReason?: string;
   /** Renseigne quand la classification vient de creer cette categorie (aucune existante ne convenait). */
   createdCategory?: { id: string; label: string };
 }
