@@ -1,0 +1,119 @@
+{
+  "_comment": "Categories metier du client (ici: transitaire / commissionnaire de transport). Appliquees UNE fois par numero de version (cle app_kv_settings 'category_profile_version'), au demarrage: une categorie absente est creee avec tous ses reglages; une categorie existante recoit sa description (si vide), son nouveau libelle (si l'ancien est encore dans previousLabels) et son reglage d'accuse (ack). Son SLA, ses alertes et ses sequences de relance existantes ne sont jamais modifies. Ensuite, tout se regle dans /reglages. ack: never | always | outside_hours. steps: delais (minutes apres l'echeance) des rappels internes a la creation; aucune relance au client par defaut.",
+  "version": 1,
+  "categories": [
+    {
+      "id": "nouvelle_demande",
+      "label": "Nouvelle demande client",
+      "description": "Un client ou un prospect demande un nouveau service (transport, dedouanement, entreposage) ou nous ecrit pour la premiere fois. Pas une reponse dans une operation deja en cours.",
+      "ack": "always",
+      "slaMinutes": 240,
+      "alerts": "normal",
+      "steps": [
+        0
+      ]
+    },
+    {
+      "id": "devis",
+      "label": "Demande de cotation",
+      "previousLabels": [
+        "Demande de devis"
+      ],
+      "description": "Quelqu'un nous demande un prix ou une offre (RFQ, demande de tarif). Pas un tarif qu'un partenaire nous envoie en reponse a notre propre demande.",
+      "ack": "always"
+    },
+    {
+      "id": "tarif_partenaire",
+      "label": "Tarif recu d'un partenaire",
+      "description": "Un agent, un transitaire ou un armateur nous envoie un prix, une offre ou une grille tarifaire, souvent en reponse a notre demande de cotation.",
+      "ack": "never",
+      "slaMinutes": 1440,
+      "alerts": "never",
+      "steps": [
+        0
+      ]
+    },
+    {
+      "id": "suivi_dossier",
+      "label": "Operation en cours",
+      "previousLabels": [
+        "Suivi d'un dossier en cours"
+      ],
+      "description": "Un partenaire ou un client pose une question ou demande une action sur un envoi deja en cours: booking, destinataire (consignee), MBL/HBL final, free time, chargement, dedouanement.",
+      "ack": "outside_hours"
+    },
+    {
+      "id": "documents",
+      "label": "Documents d'expedition",
+      "description": "Envoi ou demande de documents: BL, HBL, MBL, draft, pre-alerte, facture commerciale, liste de colisage, BAD, avis d'arrivee envoye par un agent ou un magasin.",
+      "ack": "outside_hours",
+      "slaMinutes": 1440,
+      "alerts": "normal",
+      "steps": [
+        0
+      ]
+    },
+    {
+      "id": "facturation_paiement",
+      "label": "Facturation et paiement",
+      "description": "Factures, releves de compte (SOA), relances de paiement, preuves de virement (swift), avoirs, surestaries et frais a payer.",
+      "ack": "never",
+      "slaMinutes": 1440,
+      "alerts": "normal",
+      "steps": [
+        0
+      ]
+    },
+    {
+      "id": "reclamation",
+      "label": "Reclamation / litige",
+      "previousLabels": [
+        "Reclamation"
+      ],
+      "description": "Reclamation, litige, contestation, menace de penalite ou de procedure, demande de restitution de conteneur, marchandise bloquee.",
+      "ack": "never"
+    },
+    {
+      "id": "notification_transporteur",
+      "label": "Notification automatique (armateur, portail)",
+      "description": "Message envoye par un systeme: statut de DO, confirmation de booking, avis d'arrivee (NOA), facture envoyee automatiquement, changement de navire, notification d'un portail client. Personne n'attend de reponse.",
+      "ack": "never",
+      "slaMinutes": 0,
+      "alerts": "never",
+      "steps": []
+    },
+    {
+      "id": "suspect",
+      "label": "Suspect / hameconnage",
+      "description": "Email probablement frauduleux: demande urgente non sollicitee avec piece jointe ou lien, nom d'entreprise qui ne correspond pas au domaine de l'expediteur, changement de coordonnees bancaires, 'Dear info'.",
+      "ack": "never",
+      "slaMinutes": 0,
+      "alerts": "never",
+      "steps": []
+    },
+    {
+      "id": "interne",
+      "description": "Uniquement un collegue de l'entreprise qui ecrit depuis une adresse de l'entreprise. Jamais un partenaire, un agent ou un client externe."
+    },
+    {
+      "id": "spam_newsletter",
+      "description": "Publicite, newsletter, prospection commerciale non sollicitee. Pas les notifications des armateurs ou des portails (voir Notification automatique).",
+      "label": "Publicite / newsletter",
+      "previousLabels": [
+        "Spam / newsletter / notification automatique"
+      ]
+    },
+    {
+      "id": "demande_information",
+      "description": "Question generale d'un tiers, sans operation en cours et sans demande de prix."
+    },
+    {
+      "id": "candidature",
+      "description": "Candidature spontanee, CV, demande de stage."
+    },
+    {
+      "id": "autre",
+      "description": "Aucune autre categorie ne convient."
+    }
+  ]
+}

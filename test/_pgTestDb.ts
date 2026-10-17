@@ -12,6 +12,10 @@ import type { Pool } from "pg";
  */
 export async function freshTestDb() {
   process.env.CATEGORIES_CONFIG_PATH ??= "config/categories.json";
+  // Profil metier (config/category-profile.json) desactive par defaut: les
+  // tests existants decrivent le comportement des categories d'origine.
+  // Les tests du profil le reactivent explicitement.
+  process.env.CATEGORY_PROFILE_PATH ??= "";
   const mem = newDb({ autoCreateForeignKeyIndices: true });
   const pool = new (mem.adapters.createPg().Pool)() as unknown as Pool;
   const { setPoolForTesting } = await import("../src/dbPool.js");

@@ -106,7 +106,8 @@ test("a normal email still gets its accuse drafted in silent mode", async () => 
 test("a real send is refused while the brand voice still has a placeholder", async () => {
   await db.setStoredStage(1);
   ackBody = "Merci.\n\nL'equipe\n[coordonnées / site web]";
-  const m = msg("m-ph", "t-ph");
+  // Another subject: the same one would now be skipped as a duplicate accuse.
+  const m = msg("m-ph", "t-ph", { subject: "Booking 7712" });
   await processIncomingMessage(connectorFor({ id: "t-ph", messages: [m] }), m);
   assert.equal(sent.length, 0, "nothing sent");
   assert.equal((await db.getThreadRow("t-ph"))?.status, "ai_error");
