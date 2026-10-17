@@ -2,8 +2,9 @@ import { z } from "zod";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_MODEL, getClient } from "./client.js";
 import { recordUsage, withRetry } from "./structured.js";
-import { getBrandVoice, getCategoryPlaybook } from "../db.js";
-import { formatSingleMessage, formatSlaForPrompt, LANGUAGE_INSTRUCTION } from "./prompts.js";
+import { getBrandVoice, getCategoryPlaybook, TEAM_PLAYBOOK_ID } from "../db.js";
+import { stripQuotedHistory } from "../pipeline/emailText.js";
+import { formatSingleMessage, LANGUAGE_INSTRUCTION } from "./prompts.js";
 import type { CategoryConfig, EmailMessage, EmailThread } from "../types.js";
 
 export interface AckDraft {
@@ -32,9 +33,10 @@ async function draftAcknowledgementOnce(
   const client = getClient();
   const brandVoice = await getBrandVoice();
   // Vide tant qu'aucune analyse de corpus n'a encore tourne pour cette
-  // categorie (voir corpusAnalysis.ts) — une chaine vide ne change rien au
-  // prompt, ce n'est pas une erreur.
-  const categoryPlaybook = await getCategoryPlaybook(category.id);
+  // categorie (voir corpusAnalysis.ts): on se rabat alors sur la note de
+  // style generale de l'equipe (toutes categories confondues). Une chaine
+  // vide ne change rien au prompt, ce n'est pas une erreur.
+  const categoryPlaybook = (await getCategoryPlaybook(category.id)) || (await getCategoryPlaybook(TEAM_PLAYBOOK_ID));
 
   const tool: Anthropic.Tool = {
     name: "write_acknowledgement",
@@ -51,9 +53,10 @@ async function draftAcknowledgementOnce(
 
   const response = await client.messages.create({
     model: CLAUDE_MODEL,
-    max_tokens: 900,
+    max_tokens: 400,
     system: [
       "Tu rediges des accuses de reception au nom d'une entreprise.",
+      "Un accuse dit seulement que le message est bien recu et qu'il est pris en charge.",
       "",
       LANGUAGE_INSTRUCTION,
       "",
@@ -62,18 +65,23 @@ async function draftAcknowledgementOnce(
       categoryPlaybook,
       "",
       "Regles strictes:",
-      "- Cite explicitement l'objet reel de la demande (pas de formule generique du type",
-      "  'nous avons bien recu votre message').",
-      `- Annonce un delai de reponse de ${formatSlaForPrompt(category.slaMinutes)} maximum, sans donner`,
-      "  d'heure ou de date precise.",
-      "- Ne promets rien d'autre que la prise en compte de la demande: aucun engagement",
-      "  sur un prix, une disponibilite ou une decision.",
+      "- Court: une a trois phrases avant la signature, comme les vraies reponses de l'equipe",
+      "  (ex: 'Well noted with thanks, we are checking and will revert.').",
+      "- Si le message porte une reference (booking, BL, numero de dossier ou de facture),",
+      "  cite-la telle quelle, une seule fois. Sinon, nomme le sujet en quelques mots.",
+      "- Ne recopie AUCUN montant, prix, taux, date, port, poids ou volume, meme s'ils",
+      "  figurent dans le message: un chiffre mal recopie rendrait l'accuse faux.",
+      "- N'annonce aucun delai de reponse et ne promets rien: aucun engagement sur un prix,",
+      "  une disponibilite, une date ou une decision.",
       "- Le corps doit pouvoir etre envoye tel quel: pas d'en-tete 'Objet:', pas de",
       "  placeholder, pas de mention d'IA.",
     ].join("\n"),
     tools: [tool],
     tool_choice: { type: "tool", name: "write_acknowledgement" },
-    messages: [{ role: "user", content: formatSingleMessage(incoming) }],
+    // Le dernier message seul, sans l'historique cite: l'accuse ne doit
+    // repondre qu'a ce qui vient d'etre ecrit, et l'historique y injectait
+    // des chiffres d'anciens messages (taux, dates).
+    messages: [{ role: "user", content: formatSingleMessage({ ...incoming, bodyText: stripQuotedHistory(incoming.bodyText) }) }],
   });
   await recordUsage("accuse_reception", thread.id, response.usage);
 

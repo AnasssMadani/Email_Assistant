@@ -4,7 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getPool } from "./dbPool.js";
 import { config } from "./config.js";
-import type { CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
+import { cleanReplyForLearning } from "./pipeline/emailText.js";
+import type { AckSchedule, CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
 
 const pool = getPool();
 
@@ -173,8 +174,102 @@ async function seedStageIfNeeded(): Promise<void> {
   await pool.query("INSERT INTO app_settings (id, stage) VALUES (1, 0) ON CONFLICT (id) DO NOTHING");
 }
 
+interface CategoryProfileFile {
+  version: number;
+  categories: Array<{
+    id: string;
+    label?: string;
+    previousLabels?: string[];
+    description?: string;
+    ack?: "never" | "always" | "outside_hours";
+    slaMinutes?: number;
+    alerts?: "never" | "high" | "normal" | "low";
+    steps?: number[];
+  }>;
+}
+
+const CATEGORY_PROFILE_VERSION_KEY = "category_profile_version";
+
+/**
+ * Categories metier du client (config/category-profile.json), appliquees UNE
+ * fois par numero de version: les reglages faits ensuite dans /reglages ne
+ * sont jamais ecrases a un redemarrage. Une categorie absente est creee avec
+ * tous ses reglages et des rappels internes seulement (jamais de relance au
+ * client par defaut). Une categorie existante ne recoit que sa description
+ * (si vide), son nouveau libelle (si l'ancien n'a pas ete modifie) et son
+ * reglage d'accuse: son SLA, ses alertes et ses sequences restent intacts.
+ */
+async function applyCategoryProfile(): Promise<void> {
+  if (!config.categoryProfilePath) return;
+  let profile: CategoryProfileFile;
+  try {
+    profile = JSON.parse(readFileSync(path.resolve(config.categoryProfilePath), "utf-8")) as CategoryProfileFile;
+  } catch {
+    return;
+  }
+  const applied = await pool.query<{ value: string }>("SELECT value FROM app_kv_settings WHERE key = $1", [
+    CATEGORY_PROFILE_VERSION_KEY,
+  ]);
+  if (Number(applied.rows[0]?.value ?? 0) >= profile.version) return;
+
+  const existing = new Map(
+    (await pool.query<CategoryRow>("SELECT * FROM categories")).rows.map((row) => [row.id, row])
+  );
+  let order = [...existing.values()].reduce((max, row) => Math.max(max, row.sort_order), -1);
+  const now = new Date().toISOString();
+
+  for (const cat of profile.categories) {
+    const ackFlag = cat.ack === undefined ? undefined : cat.ack === "never" ? 0 : 1;
+    const schedule = cat.ack === "outside_hours" ? "outside_hours" : "always";
+    const row = existing.get(cat.id);
+    if (!row) {
+      if (!cat.label) continue;
+      const alerts = cat.alerts ?? "normal";
+      await pool.query(
+        `INSERT INTO categories (
+          id, label, sla_minutes, acknowledge_automatically, ack_schedule, sort_order,
+          internal_alerts_enabled, internal_alerts_min_urgency, description, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          cat.id,
+          cat.label,
+          Math.max(0, Math.round(cat.slaMinutes ?? 1440)),
+          ackFlag ?? 0,
+          schedule,
+          ++order,
+          alerts === "never" ? 0 : 1,
+          alerts === "never" ? "high" : alerts,
+          cat.description ?? "",
+          now,
+        ]
+      );
+      const steps = (cat.steps ?? [0]).map((delay) => ({ channel: "internal" as const, delayMinutes: Math.max(0, delay) }));
+      await writeSteps("pre_reply", "category", cat.id, steps);
+      await writeSteps("post_reply", "category", cat.id, []);
+      continue;
+    }
+    const renamed = cat.label && cat.previousLabels?.includes(row.label) ? cat.label : row.label;
+    const description = row.description?.trim() ? row.description : (cat.description ?? "");
+    await pool.query(
+      `UPDATE categories SET label = $1, description = $2,
+        acknowledge_automatically = COALESCE($3, acknowledge_automatically),
+        ack_schedule = CASE WHEN $3::int IS NULL THEN ack_schedule ELSE $4 END
+       WHERE id = $5`,
+      [renamed, description, ackFlag ?? null, schedule, cat.id]
+    );
+  }
+
+  await pool.query(
+    `INSERT INTO app_kv_settings (key, value, updated_at) VALUES ($1, $2, $3)
+     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    [CATEGORY_PROFILE_VERSION_KEY, String(profile.version), now]
+  );
+  console.log(`[categories] profil metier v${profile.version} applique.`);
+}
+
 await ensureSchema();
 await seedIfNeeded();
+await applyCategoryProfile();
 await seedBrandVoiceIfNeeded();
 await seedStageIfNeeded();
 
@@ -196,6 +291,8 @@ export interface ThreadRow {
   post_reply_relance_count: number;
   outbound_had_attachment: number;
   automated_outbound_count: number;
+  /** Nos messages deja presents dans le fil a l'ouverture du dossier (voir migration 0007). */
+  prior_outbound_count: number;
   origin: "inbound" | "outbound";
   created_at: string;
   updated_at: string;
@@ -235,13 +332,18 @@ export async function upsertThreadReceived(params: {
   status: ThreadStatus;
   dueAt: string | null;
   origin?: "inbound" | "outbound";
+  /** Date de l'email lui-meme (en-tete Date). Absente: l'heure de traitement. */
+  receivedAt?: Date;
+  /** Nos messages deja dans le fil avant cet email (l'equipe avait deja echange). Pris en compte a la creation du dossier seulement. */
+  priorOutboundCount?: number;
 }): Promise<void> {
   const now = new Date().toISOString();
   await pool.query(
     `INSERT INTO threads (
       thread_id, subject, sender_email, sender_name, category_id, urgency,
-      sla_minutes, status, received_at, due_at, relance_count, origin, created_at, updated_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12, $13)
+      sla_minutes, status, received_at, due_at, relance_count, origin, created_at, updated_at,
+      prior_outbound_count
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12, $13, $14)
     ON CONFLICT (thread_id) DO UPDATE SET
       subject = excluded.subject,
       category_id = excluded.category_id,
@@ -265,13 +367,25 @@ export async function upsertThreadReceived(params: {
       params.urgency,
       params.slaMinutes,
       params.status,
-      now,
+      emailDateOrNow(params.receivedAt, now),
       params.dueAt,
       params.origin ?? "inbound",
       now,
       now,
+      Math.max(0, params.priorOutboundCount ?? 0),
     ]
   );
+}
+
+/**
+ * Date reelle de l'email (pas l'heure a laquelle le programme l'a lu: un
+ * email lu en retard, apres une panne ou au premier demarrage, faussait
+ * sinon tous les delais de reponse de l'equipe). Une date invalide ou dans
+ * le futur (horloge de l'expediteur dereglee) retombe sur l'heure de lecture.
+ */
+function emailDateOrNow(date: Date | undefined, nowIso: string): string {
+  if (!date || Number.isNaN(date.getTime())) return nowIso;
+  return date.getTime() > Date.parse(nowIso) ? nowIso : date.toISOString();
 }
 
 export async function setThreadStatus(threadId: string, status: ThreadStatus): Promise<void> {
@@ -446,6 +560,7 @@ interface CategoryRow {
   is_fallback: number;
   created_by_ai: number;
   created_at: string | null;
+  ack_schedule: string | null;
 }
 
 function toCategoryConfig(row: CategoryRow): CategoryConfig {
@@ -454,6 +569,7 @@ function toCategoryConfig(row: CategoryRow): CategoryConfig {
     label: row.label,
     slaMinutes: row.sla_minutes,
     acknowledgeAutomatically: row.acknowledge_automatically === 1,
+    ackSchedule: row.ack_schedule === "outside_hours" ? "outside_hours" : "always",
     internalAlertsEnabled: row.internal_alerts_enabled === 1,
     internalAlertsMinUrgency: (row.internal_alerts_min_urgency as UrgencyThreshold) || "normal",
     description: row.description ?? "",
@@ -472,8 +588,11 @@ export async function updateCategory(
     label: string;
     slaMinutes: number;
     acknowledgeAutomatically: boolean;
+    ackSchedule?: AckSchedule;
     internalAlertsEnabled: boolean;
     internalAlertsMinUrgency: UrgencyThreshold;
+    /** Description reprise par la classification. Absente = inchangee. */
+    description?: string;
   }
 ): Promise<void> {
   await pool.query(
@@ -482,7 +601,9 @@ export async function updateCategory(
       sla_minutes = $2,
       acknowledge_automatically = $3,
       internal_alerts_enabled = $4,
-      internal_alerts_min_urgency = $5
+      internal_alerts_min_urgency = $5,
+      ack_schedule = COALESCE($7, ack_schedule),
+      description = COALESCE($8, description)
      WHERE id = $6`,
     [
       patch.label,
@@ -491,6 +612,8 @@ export async function updateCategory(
       patch.internalAlertsEnabled ? 1 : 0,
       patch.internalAlertsMinUrgency,
       id,
+      patch.ackSchedule ?? null,
+      patch.description ?? null,
     ]
   );
 }
@@ -527,6 +650,7 @@ export async function createCategory(params: {
   label: string;
   slaMinutes: number;
   acknowledgeAutomatically: boolean;
+  ackSchedule?: AckSchedule;
 }): Promise<CategoryConfig> {
   const id = await uniqueCategoryId(slugify(params.label));
   const maxOrderRow = await pool.query<{ maxorder: number }>(
@@ -535,8 +659,8 @@ export async function createCategory(params: {
   await pool.query(
     `INSERT INTO categories (
       id, label, sla_minutes, acknowledge_automatically, sort_order,
-      internal_alerts_enabled, internal_alerts_min_urgency, created_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      internal_alerts_enabled, internal_alerts_min_urgency, created_at, ack_schedule
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [
       id,
       params.label,
@@ -546,6 +670,7 @@ export async function createCategory(params: {
       1,
       "normal",
       new Date().toISOString(),
+      params.ackSchedule ?? "always",
     ]
   );
 
@@ -1068,7 +1193,7 @@ export interface CarnetEntry {
   ackDrafted: boolean;
   ackSubject: string;
   ackBody: string;
-  /** Raison de l'absence d'accuse: ia | categorie | equipe | sensible. null = accuse redige, ou pas encore traite. */
+  /** Raison de l'absence d'accuse (voir AckSkipReason). null = accuse redige, ou pas encore traite. */
   ackSkipReason: string | null;
   reviewedOk: boolean;
   createdAt: string;
@@ -1211,8 +1336,50 @@ export async function recordAckDraft(params: {
 }
 
 /** Memorise pourquoi aucun accuse n'a ete redige pour ce message (affiche dans le carnet). */
-export async function recordAckSkipped(messageId: string, reason: "ia" | "categorie" | "equipe" | "sensible"): Promise<void> {
+export type AckSkipReason =
+  | "ia"
+  | "categorie"
+  | "equipe"
+  | "sensible"
+  /** Envoi automatique (robot, portail d'armateur): range sans appel a l'IA. */
+  | "automatique"
+  /** Accuse deja redige pour la meme conversation (meme expediteur, meme sujet ou meme reference). */
+  | "doublon"
+  /** Categorie reglee "hors heures de bureau" et l'email est arrive pendant les heures de bureau. */
+  | "heures_bureau"
+  /** Email suspect (hameconnage probable): jamais d'accuse. */
+  | "suspect";
+
+export async function recordAckSkipped(messageId: string, reason: AckSkipReason): Promise<void> {
   await pool.query("UPDATE shadow_log SET ack_skip_reason = $1 WHERE message_id = $2", [reason, messageId]);
+}
+
+/**
+ * Accuses rediges recemment pour des expediteurs d'un domaine donne (meme
+ * fil, ou autre fil de la meme conversation: le connecteur IMAP voit parfois
+ * deux fils distincts quand un logiciel de messagerie perd l'en-tete
+ * References). Sert a ne jamais accuser deux fois la meme conversation.
+ */
+export async function listRecentAcksForDomain(
+  domain: string,
+  sinceIso: string
+): Promise<Array<{ threadId: string; subject: string; senderEmail: string }>> {
+  const suffix = `@${domain.toLowerCase()}`;
+  const result = await pool.query<{ thread_id: string; original_subject: string; sender_email: string }>(
+    `SELECT thread_id, original_subject, sender_email FROM shadow_log
+     WHERE ack_drafted = 1 AND created_at >= $1 AND LOWER(sender_email) LIKE $2`,
+    [sinceIso, `%${suffix}`]
+  );
+  // Un "_" ou "%" dans le domaine serait un joker LIKE: le filtre exact se fait ici.
+  return result.rows
+    .filter((r) => r.sender_email.toLowerCase().endsWith(suffix))
+    .map((r) => ({ threadId: r.thread_id, subject: r.original_subject, senderEmail: r.sender_email }));
+}
+
+/** Vrai si un accuse a deja ete redige dans ce fil (quel que soit l'expediteur). */
+export async function threadHasAckDraft(threadId: string): Promise<boolean> {
+  const result = await pool.query("SELECT 1 FROM shadow_log WHERE thread_id = $1 AND ack_drafted = 1 LIMIT 1", [threadId]);
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function listShadowLogEntries(limit = 500): Promise<CarnetEntry[]> {
@@ -1393,7 +1560,32 @@ export async function listHumanReplyCorpusByCategory(categoryId: string): Promis
     "SELECT reply_body FROM human_reply_corpus WHERE category_id = $1 ORDER BY created_at ASC",
     [categoryId]
   );
-  return result.rows.map((r) => r.reply_body);
+  return cleanCorpusBodies(result.rows.map((r) => r.reply_body));
+}
+
+/** Toutes les reponses apprises, toutes categories confondues (note de style generale de l'equipe). */
+export async function listAllHumanReplyCorpus(): Promise<string[]> {
+  const result = await pool.query<{ reply_body: string }>("SELECT reply_body FROM human_reply_corpus ORDER BY created_at ASC");
+  return cleanCorpusBodies(result.rows.map((r) => r.reply_body));
+}
+
+/**
+ * Nettoie a la lecture (les lignes deja enregistrees contiennent parfois
+ * l'historique cite et du CSS, voir cleanReplyForLearning), retire les
+ * reponses vides et les doublons exacts (une meme reponse rattachee a
+ * plusieurs dossiers ne doit pas peser plusieurs fois dans la note de style).
+ */
+function cleanCorpusBodies(bodies: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const body of bodies) {
+    const cleaned = cleanReplyForLearning(body);
+    const key = cleaned.toLowerCase().replace(/\s+/g, " ").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+  }
+  return out;
 }
 
 // ==================== Ton de marque & notes de style (Phase 1: en base) ====================
@@ -1419,6 +1611,9 @@ export async function setBrandVoice(content: string): Promise<void> {
  * analyse de corpus n'a encore tourne pour cette categorie: absence de ligne
  * n'est pas une erreur, juste "pas encore de note de style".
  */
+/** Cle de la note de style generale de l'equipe (toutes categories), dans category_playbooks. */
+export const TEAM_PLAYBOOK_ID = "_equipe";
+
 export async function getCategoryPlaybook(categoryId: string): Promise<string> {
   const result = await pool.query<{ content: string }>("SELECT content FROM category_playbooks WHERE category_id = $1", [
     categoryId,

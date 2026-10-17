@@ -21,10 +21,17 @@ and Microsoft Graph as pluggable connectors behind `EmailConnector` (`src/types.
 
 ## Pipeline flow
 
-1. **Intake** (`src/pipeline/processIncoming.ts`): incoming message → `classifyEmail()`
-   (`src/ai/classify.ts`, category id/label only, no per-category description) → if the
-   category acknowledges automatically, `draftAcknowledgement()` sends the accusé and the
-   dossier enters **pre_reply** phase (`due_at` = now + category SLA).
+1. **Intake** (`src/pipeline/processIncoming.ts`): incoming message → robot senders
+   (`src/pipeline/automatedSender.ts`: noreply/mailer-daemon addresses, Auto-Submitted
+   headers) are filed without any AI call → `classifyEmail()` (`src/ai/classify.ts`,
+   category label + description, also flags `suspicious` phishing → `suspect` category)
+   → ack policy (`ackSuppression` + `ackPolicySuppression`: team already replied,
+   sensitive subject, category ack mode `never`/`always`/`outside_hours` with office
+   hours from `src/officeHours.ts`, one ack per conversation/reference over 7 days) →
+   `draftAcknowledgement()` sends the accusé and the dossier enters **pre_reply** phase.
+   Every skipped ack records a reason (`AckSkipReason` in `db.ts`, shown in the Carnet).
+   `received_at` is the email's own date; `prior_outbound_count` stores our messages
+   already in the thread before it, so the human-reply count ignores them.
    - Skips silently: `isFromUs` messages, already-processed message ids, and anything
      whose subject starts with our own `[Rappel] ` prefix (echoes of our own internal
      notifications sent to the connected mailbox itself — see Gotchas).
@@ -78,7 +85,11 @@ src/scheduler.ts    cron wiring (pollIntervalCron, relanceCheckCron, both defaul
 - `threads`: one row per dossier. `status` is a single `ThreadStatus` enum shared by both
   phases — pre_reply and post_reply statuses must never collide (that caused a real
   oscillation bug — see Gotchas).
-- `categories`: `sla_minutes` is source of truth, `sla_hours` dual-written for legacy
+- `categories`: business categories come from `config/category-profile.json`, applied
+  once per `version` at startup (`applyCategoryProfile` in `db.ts`); it never touches an
+  existing category's SLA, alerts or steps. Bump `version` to re-apply.
+  `ack_schedule` ('always'|'outside_hours') refines `acknowledge_automatically`.
+  `sla_minutes` is source of truth, `sla_hours` dual-written for legacy
   schema compat. `internal_alerts_enabled` + `internal_alerts_min_urgency` gate whether a
   pre/post_reply "notify team" step actually sends — filtered alerts still advance the
   sequence but log as `relance_interne_filtree`, never `relance_interne`.

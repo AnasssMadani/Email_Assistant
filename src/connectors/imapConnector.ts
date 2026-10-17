@@ -5,6 +5,7 @@ import nodemailer, { type SendMailOptions } from "nodemailer";
 import { config } from "../config.js";
 import { isMessageProcessed, listSmtpSentMessages, recordSmtpSentMessage } from "../db.js";
 import { installReadOnlyGuard } from "./imapReadOnlyGuard.js";
+import { htmlToText } from "../pipeline/emailText.js";
 import {
   decodeImapThreadId,
   encodeImapMessageId,
@@ -257,10 +258,13 @@ export class ImapSmtpConnector implements EmailConnector {
       inReplyTo: parsed.inReplyTo,
     });
     const from = firstAddress(parsed.from);
+    // Partie texte vide mais HTML present (frequent depuis un iPhone ou
+    // Outlook): conversion qui garde les retours a la ligne, sinon le
+    // nettoyage de l'historique cite ne fonctionne plus (voir htmlToText).
     const bodyText = parsed.text?.trim()
       ? parsed.text
       : typeof parsed.html === "string"
-        ? parsed.html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+        ? htmlToText(parsed.html)
         : "";
     const message: EmailMessage = {
       id: encodeImapMessageId(ref),
@@ -272,6 +276,7 @@ export class ImapSmtpConnector implements EmailConnector {
       bodyText,
       receivedAt: parsed.date ?? (msg.internalDate ? new Date(msg.internalDate) : new Date()),
       isFromUs: this.isOwnSender(from.email, ownEmail),
+      isAutomated: hasAutomatedHeaders(parsed.headers),
       hasAttachments: hasAttachmentNode(msg.bodyStructure),
     };
     const chain = [...parseReferences(parsed.references), normalizeMessageId(parsed.inReplyTo), rfcMessageId].filter(
@@ -524,3 +529,23 @@ function hasAttachmentNode(node: MessageStructureObject | undefined): boolean {
   return (node.childNodes ?? []).some((child) => hasAttachmentNode(child));
 }
 
+
+/**
+ * En-tetes standard d'un envoi automatique (RFC 3834 Auto-Submitted,
+ * Precedence: bulk/list/junk, X-Autoreply...). Un tel message ne recoit
+ * jamais d'accuse, et il est range sans appel a l'IA (voir automatedSender.ts).
+ * List-Unsubscribe seul ne suffit pas: certains partenaires humains
+ * ecrivent depuis des outils qui l'ajoutent.
+ */
+function hasAutomatedHeaders(headers: Map<string, unknown>): boolean {
+  const read = (key: string): string => {
+    const value = headers.get(key);
+    if (typeof value === "string") return value.toLowerCase().trim();
+    if (value && typeof value === "object" && "value" in value) return String((value as { value: unknown }).value).toLowerCase().trim();
+    return "";
+  };
+  const autoSubmitted = read("auto-submitted");
+  if (autoSubmitted && autoSubmitted !== "no") return true;
+  if (/^(bulk|junk|list|auto_reply)$/.test(read("precedence"))) return true;
+  return headers.has("x-autoreply") || headers.has("x-autorespond");
+}
