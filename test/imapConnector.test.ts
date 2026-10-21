@@ -142,7 +142,7 @@ after(async () => {
 let uidValiditySeed = 1000;
 
 async function setup(
-  options: { user?: string; mailboxAddress?: string; copyMailbox?: boolean; extraInbox?: FakeMailbox["messages"] } = {}
+  options: { user?: string; mailboxAddress?: string; copyMailbox?: boolean; extraInbox?: FakeMailbox["messages"]; catchUpHours?: number } = {}
 ) {
   // UIDVALIDITY distinct par test: les ids de message (dossier + UIDVALIDITY
   // + UID) restent uniques alors que la base de test est partagee par tout
@@ -173,6 +173,7 @@ async function setup(
         inboxFolder: "INBOX",
         sentFolder: "",
         threadLookbackDays: 60,
+        catchUpHours: options.catchUpHours,
         allowInsecureForTesting: true,
       },
       smtp: { host: "smtp.test", port: 465, secure: true, user: "", password: "", fromAddress: "" },
@@ -390,6 +391,28 @@ test("a text part that actually holds HTML code is converted to readable text", 
   assert.match(invoice.bodyText, /Dear PROMARK ,\n+Please find attached invoice 1110\./);
   // Un email texte normal reste tel quel.
   assert.match(inbox.find((m) => m.subject === "Grille tarifaire")?.bodyText ?? "", /^Ci-joint notre grille\./);
+});
+
+test("after an outage, catch-up also reads older unprocessed emails; without it only the last 25", async () => {
+  const backlog = Array.from({ length: 40 }, (_, i) => ({
+    uid: 300 + i,
+    raw: mail({
+      From: `Agent ${i} <agent${i}@backlog.tr>`,
+      To: OWN,
+      Subject: `Backlog ${i}`,
+      "Message-ID": `<backlog-${i}@backlog.tr>`,
+    }),
+  }));
+  const plain = await setup({ extraInbox: backlog });
+  const lastOnly = await plain.connector.listRecentInboxMessages(25);
+  await plain.connector.close();
+  assert.equal(lastOnly.length, 25);
+
+  const withCatchUp = await setup({ extraInbox: backlog, catchUpHours: 1_000_000 });
+  const caughtUp = await withCatchUp.connector.listRecentInboxMessages(25);
+  await withCatchUp.connector.close();
+  assert.equal(caughtUp.length, 43, "all 3 fixture emails + 40 backlog emails");
+  assertOnlyReadOnlyCommands(withCatchUp.server);
 });
 
 test("already-processed messages are not downloaded again", async () => {

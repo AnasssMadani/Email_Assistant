@@ -2691,6 +2691,7 @@ const CARNET_NO_ACK_SHORT: Record<string, string> = {
   doublon: "déjà accusés",
   heures_bureau: "heures de bureau",
   suspect: "suspects",
+  armateur: "armateurs et portails",
   "": "en cours ou en erreur",
 };
 
@@ -2705,6 +2706,7 @@ const CARNET_NO_ACK_REASONS: Record<string, string> = {
   doublon: "Aucun — un accusé a déjà été rédigé pour cette conversation ou cette référence ces 7 derniers jours.",
   heures_bureau: "Aucun — reçu pendant les heures de bureau : cette catégorie n'accuse que la nuit et le week-end.",
   suspect: "Aucun — email suspect (hameçonnage probable) : ne pas ouvrir les pièces jointes ni les liens.",
+  armateur: "Aucun — l'expéditeur est un armateur ou un portail : un accusé serait inutile (le dossier reste suivi).",
   "": "Aucun accusé rédigé pour l'instant (rédaction en cours, ou erreur — voir le Journal).",
 };
 

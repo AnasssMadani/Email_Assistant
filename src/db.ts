@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { getPool } from "./dbPool.js";
 import { config } from "./config.js";
 import { cleanReplyForLearning } from "./pipeline/emailText.js";
+import { PUBLIC_MAIL_DOMAINS } from "./utils.js";
 import type { AckSchedule, CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
 
 const pool = getPool();
@@ -1348,7 +1349,9 @@ export type AckSkipReason =
   /** Categorie reglee "hors heures de bureau" et l'email est arrive pendant les heures de bureau. */
   | "heures_bureau"
   /** Email suspect (hameconnage probable): jamais d'accuse. */
-  | "suspect";
+  | "suspect"
+  /** Expediteur armateur ou portail (config NO_ACK_DOMAINS): suivi, mais jamais d'accuse. */
+  | "armateur";
 
 export async function recordAckSkipped(messageId: string, reason: AckSkipReason): Promise<void> {
   await pool.query("UPDATE shadow_log SET ack_skip_reason = $1 WHERE message_id = $2", [reason, messageId]);
@@ -1374,6 +1377,41 @@ export async function listRecentAcksForDomain(
   return result.rows
     .filter((r) => r.sender_email.toLowerCase().endsWith(suffix))
     .map((r) => ({ threadId: r.thread_id, subject: r.original_subject, senderEmail: r.sender_email }));
+}
+
+export interface SenderHistory {
+  /** Emails deja recus de cet expediteur (ou de son domaine), hors emails juges suspects. */
+  previousEmails: number;
+  /** Dossiers de cet expediteur (ou de son domaine) auxquels l'equipe a deja repondu. */
+  teamReplies: number;
+}
+
+/**
+ * Ce que la boite sait deja d'un expediteur sur les 90 derniers jours.
+ * Messagerie grand public: l'adresse exacte seulement; sinon tout le domaine
+ * (un partenaire ecrit depuis plusieurs adresses). Les emails classes
+ * "suspect" ne comptent jamais: un fraudeur ne devient pas connu en
+ * s'etant fait signaler.
+ */
+export async function getSenderHistory(senderEmail: string): Promise<SenderHistory> {
+  const email = senderEmail.toLowerCase();
+  const domain = email.split("@")[1];
+  if (!domain) return { previousEmails: 0, teamReplies: 0 };
+  const exact = PUBLIC_MAIL_DOMAINS.has(domain);
+  const matches = (candidate: string) => (exact ? candidate.toLowerCase() === email : candidate.toLowerCase().endsWith(`@${domain}`));
+  const since = new Date(Date.now() - 90 * 86_400_000).toISOString();
+  const seen = await pool.query<{ sender_email: string }>(
+    `SELECT sender_email FROM shadow_log WHERE created_at >= $1 AND category_id <> 'suspect' AND LOWER(sender_email) LIKE $2`,
+    [since, `%${exact ? email : `@${domain}`}`]
+  );
+  const replied = await pool.query<{ sender_email: string }>(
+    `SELECT sender_email FROM threads WHERE created_at >= $1 AND human_replied_at IS NOT NULL AND category_id <> 'suspect' AND LOWER(sender_email) LIKE $2`,
+    [since, `%${exact ? email : `@${domain}`}`]
+  );
+  return {
+    previousEmails: seen.rows.filter((r) => matches(r.sender_email)).length,
+    teamReplies: replied.rows.filter((r) => matches(r.sender_email)).length,
+  };
 }
 
 /** Vrai si un accuse a deja ete redige dans ce fil (quel que soit l'expediteur). */

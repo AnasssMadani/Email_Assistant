@@ -38,6 +38,8 @@ export interface ImapSmtpSettings {
     inboxFolder: string;
     sentFolder: string;
     threadLookbackDays: number;
+    /** Heures de rattrapage apres une panne (0 = desactive, voir config.imap.catchUpHours). */
+    catchUpHours?: number;
     /** Reserve aux tests (serveur IMAP factice en clair sur 127.0.0.1). */
     allowInsecureForTesting?: boolean;
   };
@@ -94,6 +96,9 @@ function settingsFromConfig(): ImapSmtpSettings {
  *   (smtp_sent_messages) et reinjectes dans getThread(), pour que le
  *   comptage automated_outbound_count fonctionne comme avec Gmail/Graph.
  */
+/** Nombre maximal d'emails relus en plus de la fenetre normale lors d'un rattrapage. */
+const CATCH_UP_EXTRA_MESSAGES = 100;
+
 export class ImapSmtpConnector implements EmailConnector {
   readonly name = "imap" as const;
   private readonly settings: ImapSmtpSettings;
@@ -328,9 +333,17 @@ export class ImapSmtpConnector implements EmailConnector {
       // (UID) seul, sans contenu — puis on ne telecharge que ceux qui n'ont
       // pas deja ete traites (meme optimisation que GmailConnector.listByLabel).
       const start = Math.max(1, mailbox.exists - maxResults + 1);
+      // Rattrapage: apres une panne de plus de quelques minutes, plus de N
+      // emails ont pu arriver. On regarde un peu plus loin, mais on ne garde
+      // de ces plus anciens que ceux recus dans la fenetre de rattrapage.
+      const catchUpMs = (this.settings.imap.catchUpHours ?? 0) * 3_600_000;
+      const from = catchUpMs > 0 ? Math.max(1, start - CATCH_UP_EXTRA_MESSAGES) : start;
+      const oldestAllowed = Date.now() - catchUpMs;
       const candidateUids: number[] = [];
-      for await (const msg of client.fetch(`${start}:*`, { uid: true })) {
-        candidateUids.push(msg.uid);
+      for await (const msg of client.fetch(`${from}:*`, { uid: true, internalDate: true })) {
+        if (msg.seq >= start || (msg.internalDate && new Date(msg.internalDate).getTime() >= oldestAllowed)) {
+          candidateUids.push(msg.uid);
+        }
       }
       const processed = await Promise.all(
         candidateUids.map((uid) => isMessageProcessed(encodeImapMessageId({ folder: path, uidValidity, uid })))
