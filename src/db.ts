@@ -1631,6 +1631,27 @@ export async function listCategoriesWithCorpus(): Promise<string[]> {
   return result.rows.map((r) => r.category_id);
 }
 
+/** Exemples recents d'une categorie pour guider un brouillon: la demande (quand elle est connue) et la vraie reponse de l'equipe. */
+export async function listCorpusExamplesForDraft(
+  categoryId: string,
+  limit = 6
+): Promise<Array<{ clientAsk: string | null; replyBody: string }>> {
+  const result = await pool.query<{ client_ask: string | null; reply_body: string }>(
+    "SELECT client_ask, reply_body FROM human_reply_corpus WHERE category_id = $1 ORDER BY (client_ask IS NULL), created_at DESC LIMIT $2",
+    [categoryId, limit * 3]
+  );
+  const seen = new Set<string>();
+  const out: Array<{ clientAsk: string | null; replyBody: string }> = [];
+  for (const row of result.rows) {
+    const body = cleanReplyForLearning(row.reply_body);
+    if (!body || seen.has(body)) continue;
+    seen.add(body);
+    out.push({ clientAsk: row.client_ask ? cleanReplyForLearning(row.client_ask) : null, replyBody: body });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 export async function listHumanReplyCorpusByCategory(categoryId: string): Promise<string[]> {
   const result = await pool.query<{ reply_body: string }>(
     "SELECT reply_body FROM human_reply_corpus WHERE category_id = $1 ORDER BY created_at ASC",
@@ -1966,4 +1987,105 @@ export function resolveEffectiveSteps(
     }
   }
   return all.byCategory.get(row.category_id) ?? [];
+}
+
+
+// ==================== Brouillons de reponse (back-office seulement) ====================
+
+export interface ReplyDraftRow {
+  id: number;
+  threadId: string;
+  messageId: string;
+  categoryId: string;
+  shouldReply: boolean;
+  reason: string;
+  subject: string;
+  body: string;
+  missing: string[];
+  confidence: "low" | "medium" | "high";
+  source: "auto" | "manuel";
+  createdAt: string;
+}
+
+export async function saveReplyDraft(params: {
+  threadId: string;
+  messageId: string;
+  categoryId: string;
+  shouldReply: boolean;
+  reason: string;
+  subject: string;
+  body: string;
+  missing: string[];
+  confidence: "low" | "medium" | "high";
+  source: "auto" | "manuel";
+}): Promise<void> {
+  await pool.query(
+    `INSERT INTO reply_drafts (thread_id, message_id, category_id, should_reply, reason, subject, body, missing, confidence, source)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT DO NOTHING`,
+    [
+      params.threadId,
+      params.messageId,
+      params.categoryId,
+      params.shouldReply ? 1 : 0,
+      params.reason,
+      params.subject,
+      params.body,
+      JSON.stringify(params.missing),
+      params.confidence,
+      params.source,
+    ]
+  );
+}
+
+function toReplyDraft(r: {
+  id: string | number;
+  thread_id: string;
+  message_id: string;
+  category_id: string;
+  should_reply: number;
+  reason: string;
+  subject: string;
+  body: string;
+  missing: string;
+  confidence: string;
+  source: string;
+  created_at: string | Date;
+}): ReplyDraftRow {
+  let missing: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(r.missing);
+    if (Array.isArray(parsed)) missing = parsed.filter((m): m is string => typeof m === "string");
+  } catch {
+    /* champ vide ou ancien format */
+  }
+  return {
+    id: Number(r.id),
+    threadId: r.thread_id,
+    messageId: r.message_id,
+    categoryId: r.category_id,
+    shouldReply: Number(r.should_reply) === 1,
+    reason: r.reason,
+    subject: r.subject,
+    body: r.body,
+    missing,
+    confidence: (["low", "medium", "high"].includes(r.confidence) ? r.confidence : "low") as ReplyDraftRow["confidence"],
+    source: r.source === "manuel" ? "manuel" : "auto",
+    createdAt: new Date(r.created_at).toISOString(),
+  };
+}
+
+export async function getLatestReplyDraft(threadId: string): Promise<ReplyDraftRow | undefined> {
+  const result = await pool.query(
+    "SELECT * FROM reply_drafts WHERE thread_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+    [threadId]
+  );
+  return result.rows[0] ? toReplyDraft(result.rows[0]) : undefined;
+}
+
+/** Brouillons automatiques des 24 dernieres heures (fenetre glissante): plafond de cout (voir config.draftRepliesMaxPerDay). */
+export async function countReplyDraftsLast24h(): Promise<number> {
+  const since = new Date(Date.now() - 86_400_000).toISOString();
+  const result = await pool.query<{ n: string }>("SELECT COUNT(*) AS n FROM reply_drafts WHERE created_at >= $1 AND source = 'auto'", [since]);
+  return Number(result.rows[0]?.n ?? 0);
 }

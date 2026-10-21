@@ -6,6 +6,7 @@ import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
 import { buildReplySubject, emailInDomains, isInternalNotificationSubject, PUBLIC_MAIL_DOMAINS } from "../utils.js";
 import { tagSource } from "./errorTag.js";
 import { stripQuotedHistory } from "./emailText.js";
+import { maybeAutoDraftReply } from "./replyDrafts.js";
 import { isAutomatedMessage } from "./automatedSender.js";
 import { getOfficeHours, isWithinOfficeHours } from "../officeHours.js";
 import {
@@ -206,6 +207,7 @@ export async function processIncomingMessage(
       `[À vérifier] Correspondant connu, mais l'IA a trouvé cet email suspect : ${classification.suspicionReason?.trim() || "signaux d'hameçonnage détectés"}. Aucun accusé envoyé ; vérifiez avant d'ouvrir un lien ou une pièce jointe.`
     );
     console.log(`[suspect, expediteur connu] "${message.subject}" — ${message.from.email}, suivi sans accuse.`);
+    await maybeAutoDraftReply(thread, message, category);
     return;
   }
 
@@ -238,6 +240,7 @@ export async function processIncomingMessage(
     await setThreadAckSent(message.threadId);
     await recordReminder(message.threadId, "internal", `[Accusé non envoyé] ${suppression.note}`);
     console.log(`[accuse supprime] "${message.subject}" — ${suppression.note}`);
+    await maybeAutoDraftReply(thread, message, category);
     return;
   }
 
@@ -258,7 +261,9 @@ export async function processIncomingMessage(
       "internal",
       `[Erreur IA] La rédaction/l'envoi de l'accusé a échoué : ${(err as Error).message}`
     );
+    return;
   }
+  await maybeAutoDraftReply(thread, message, category);
 }
 
 const SUSPECT_CATEGORY_ID = "suspect";

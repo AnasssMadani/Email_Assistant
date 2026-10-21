@@ -143,6 +143,12 @@ export const config = {
     process.env.NO_ACK_DOMAINS,
     "cma-cgm.com,maersk.com,msc.com,one-line.com,hlag.com,hapag-lloyd.com,coscon.com,coscoshipping.com,coscoshipping.ma,hmm21.com,arkasdenizcilik.com.tr,arkas-maroc.com"
   ),
+  // Brouillons de reponse rediges par l'IA pour l'equipe, a chaque email suivi
+  // (off par defaut: un appel Claude de plus par email). Ils ne quittent jamais
+  // l'application: aucun envoi, rien dans la boite mail. Le bouton « Préparer
+  // une réponse » d'un dossier fonctionne meme quand ceci est desactive.
+  draftRepliesEnabled: process.env.ENABLE_DRAFT_REPLIES === "true",
+  draftRepliesMaxPerDay: Math.max(0, Number(process.env.DRAFT_REPLIES_MAX_PER_DAY ?? 80) || 0),
   // Domaines dont TOUT message est automatique (portails sans adresse noreply
   // reconnaissable): ranges sans appel a l'IA, comme les noreply.
   automatedDomains: parseDomainList(process.env.AUTOMATED_DOMAINS, "portnet.ma"),

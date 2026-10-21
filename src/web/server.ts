@@ -9,6 +9,7 @@ import { GraphConnector } from "../connectors/graphConnector.js";
 import { createEmailConnector } from "../connectors/index.js";
 import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCheck.js";
 import { sendAcknowledgement } from "../pipeline/processIncoming.js";
+import { draftAndStoreReply } from "../pipeline/replyDrafts.js";
 import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
 import { learnFromPastedThreads, refreshPlaybooks, undoLearningBatch } from "../pipeline/learning.js";
 import { renderLearningBody } from "./learningView.js";
@@ -48,6 +49,7 @@ import {
   getEffectiveRelanceSteps,
   getMorningReportByDate,
   getThreadRelanceOverride,
+  getLatestReplyDraft,
   getThreadRow,
   getValidConnectInvite,
   hasThreadRelanceOverride,
@@ -84,6 +86,7 @@ import {
   type ReminderRow,
   type ThreadRow,
 } from "../db.js";
+import type { ReplyDraftRow } from "../db.js";
 import type { AckSchedule, CategoryConfig, EmailMessage, RelanceChannel, RelanceStep } from "../types.js";
 import { DEFAULT_OFFICE_HOURS, getOfficeHours, setOfficeHours, type OfficeHours } from "../officeHours.js";
 import {
@@ -620,6 +623,29 @@ app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, async (
  * applique la categorie choisie par l'admin, et declenche l'accuse comme si
  * la classification avait ete bonne des le depart.
  */
+app.post("/dossiers/:threadId/preparer-reponse", requireCsrf, async (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  const threadRow = await getThreadRow(threadId);
+  if (!threadRow) {
+    res.redirect("/dossiers");
+    return;
+  }
+  try {
+    const connector = createEmailConnector();
+    const thread = await connector.getThread(threadId);
+    const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
+    if (!lastInbound) throw new Error("Aucun message entrant trouvé dans ce fil.");
+    const category = await getCategory(threadRow.category_id);
+    await draftAndStoreReply({ thread, incoming: lastInbound, category, source: "manuel" });
+  } catch (err) {
+    console.error(`[brouillon] erreur sur le dossier ${threadId}:`, err);
+    await recordPipelineError("reply_draft", threadId, (err as Error).message);
+    res.redirect(`/dossiers/${encodeURIComponent(threadId)}?error=1`);
+    return;
+  }
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+});
+
 app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   const threadRow = await getThreadRow(threadId);
@@ -1847,6 +1873,35 @@ function renderThreadRow(
 
 // ---------- Detail d'un dossier ----------
 
+const CONFIDENCE_LABELS = {
+  high: "L'équipe n'aura presque rien à changer",
+  medium: "Quelques champs à compléter",
+  low: "Le fond dépend d'une décision ou d'une information absente du fil",
+} as const;
+
+function renderReplyDraftSection(draft: ReplyDraftRow | undefined, threadId: string, csrfToken: string | undefined): string {
+  const form = `<form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(threadId)}/preparer-reponse">
+      ${csrfField(csrfToken)}
+      <button class="btn btn-primary btn-sm" type="submit">${draft ? "Préparer à nouveau" : "Préparer une réponse"}</button>
+    </form>`;
+  let body = `<p class="section-hint">Aucun brouillon pour ce dossier.</p>`;
+  if (draft && !draft.shouldReply) {
+    body = `<p><strong>Aucune réponse nécessaire.</strong> ${escapeHtml(draft.reason)}</p>`;
+  } else if (draft) {
+    const highlighted = escapeHtml(draft.body).replace(/\[\[([^\]]+)\]\]/g, "<mark>[[$1]]</mark>");
+    body = `<p class="section-hint">${escapeHtml(draft.reason)} — ${escapeHtml(CONFIDENCE_LABELS[draft.confidence])}.</p>
+      ${draft.subject ? `<p><strong>Objet :</strong> ${escapeHtml(draft.subject)}</p>` : ""}
+      <pre style="white-space: pre-wrap; font: inherit; background: var(--surface-2, #f4f6f8); padding: 12px 14px; border-radius: 8px;">${highlighted}</pre>
+      ${draft.missing.length ? `<p><strong>À compléter par l'équipe :</strong></p><ul>${draft.missing.map((m) => `<li>${escapeHtml(m)}</li>`).join("")}</ul>` : ""}`;
+  }
+  return `<div class="settings-section">
+    <h2>Brouillon de réponse</h2>
+    <p class="section-hint">Préparé par l'IA pour votre équipe. Il n'est jamais envoyé ni déposé dans la boîte mail : relisez-le, complétez les champs surlignés et envoyez-le vous-même.</p>
+    ${body}
+    ${form}
+  </div>`;
+}
+
 async function renderDossierDetailPage(
   thread: ThreadRow,
   reminders: ReminderRow[],
@@ -1988,6 +2043,8 @@ async function renderDossierDetailPage(
       ${addForm}
     </div>`;
 
+  const draftSection = renderReplyDraftSection(await getLatestReplyDraft(thread.thread_id), thread.thread_id, csrfToken);
+
   const misclassifiedSection =
     thread.status === "skipped" || thread.status === "ai_error"
       ? `<div class="settings-section">
@@ -2049,7 +2106,7 @@ async function renderDossierDetailPage(
     "dossiers",
     "Dossier",
     "Détail du dossier, statut de traitement, et séquence de relance appliquée.",
-    banner + header + misclassifiedSection + stepsSection + remindersSection,
+    banner + header + misclassifiedSection + draftSection + stepsSection + remindersSection,
     "/dossiers"
   );
 }
