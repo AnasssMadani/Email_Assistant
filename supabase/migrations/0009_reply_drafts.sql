@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS reply_drafts (
   missing      TEXT        NOT NULL DEFAULT '[]',
   confidence   TEXT        NOT NULL DEFAULT 'low',
   source       TEXT        NOT NULL DEFAULT 'auto',
+  -- Avis de l'équipe sur la page Brouillons: 'bon' (tel quel), 'retouche' (à corriger), 'inutilisable'. NULL = pas encore relu.
+  verdict      TEXT,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS reply_drafts_thread_idx ON reply_drafts (thread_id, created_at DESC);

@@ -15,6 +15,9 @@ const {
   listPipelineErrors,
   countReplyDraftsLast24h,
   recordHumanReplyCorpus,
+  listReplyDraftComparisons,
+  setReplyDraftVerdict,
+  upsertThreadReceived,
 } = await freshTestDb();
 const { setClientForTesting } = await import("../src/ai/client.js");
 const { processIncomingMessage } = await import("../src/pipeline/processIncoming.js");
@@ -151,4 +154,44 @@ test("end to end at stage 0: attachments saved, draft written, nothing sent", as
   } finally {
     config.draftRepliesEnabled = false;
   }
+});
+
+test("the review page pairs each draft with the team's real reply and keeps the team's verdict", async () => {
+  const { renderDraftsBody } = await import("../src/web/draftsView.js");
+  const message = incoming({ id: "m-cmp", threadId: "t-cmp", subject: "Cotation <urgent>", attachments: undefined, hasAttachments: false });
+  await upsertThreadReceived({
+    threadId: message.threadId,
+    subject: message.subject,
+    senderEmail: message.from.email,
+    senderName: "Widad",
+    categoryId: category.id,
+    urgency: "normal",
+    slaMinutes: 60,
+    status: "received",
+    dueAt: null,
+    receivedAt: new Date(),
+  });
+  draftAnswer = { shouldReply: true, reason: "Prix demandé.", subject: "Re: Cotation", body: "Bonjour,\n\nPrix : [[prix]] <b>USD</b>", missing: ["prix"], confidence: "low" };
+  await draftAndStoreReply({ thread: { id: message.threadId, messages: [message] }, incoming: message, category, source: "manuel" });
+  const since = new Date(Date.now() - 60_000).toISOString();
+
+  let rows = (await listReplyDraftComparisons(since)).filter((r) => r.draft.threadId === message.threadId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].teamReply, null);
+  assert.equal(rows[0].subject, "Cotation <urgent>");
+
+  await new Promise((r) => setTimeout(r, 5));
+  await recordHumanReplyCorpus({ threadId: message.threadId, categoryId: category.id, replyBody: "Bonjour, notre prix est 1480 USD." });
+  await setReplyDraftVerdict(rows[0].draft.id, "retouche");
+  rows = (await listReplyDraftComparisons(since)).filter((r) => r.draft.threadId === message.threadId);
+  assert.match(rows[0].teamReply ?? "", /1480 USD/);
+  assert.equal(rows[0].draft.verdict, "retouche");
+
+  const html = renderDraftsBody(rows, 3, "csrf-token");
+  assert.match(html, /<mark>\[\[prix\]\]<\/mark>/);
+  assert.match(html, /notre prix est 1480 USD/);
+  assert.ok(!html.includes("<b>USD</b>"), "draft text is escaped");
+  assert.ok(!html.includes("<urgent>"), "subject is escaped");
+  assert.match(html, /name="_csrf"|csrf-token/);
+  assert.match(html, /A retoucher|À retoucher/);
 });

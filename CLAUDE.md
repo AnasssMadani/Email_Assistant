@@ -166,7 +166,10 @@ boundary — extend those, don't bypass them by handing a client view raw admin 
   the substance of the email from the thread, attachments and real team replies (`human_reply_corpus`),
   with `[[fields]]` for anything not in the data (prices, dates, decisions). Back-office only: shown on the
   dossier page, never sent and never placed in the mailbox. Automatic with `ENABLE_DRAFT_REPLIES=true`
-  (cap `DRAFT_REPLIES_MAX_PER_DAY`, default 80); the "Préparer une réponse" button always works.
+  (set in `render.yaml` for prod and dev; cap `DRAFT_REPLIES_MAX_PER_DAY`, default 80); the "Préparer une
+  réponse" button always works. The `/brouillons` page (`draftsView.ts`) shows each draft next to the team's
+  real reply (first `human_reply_corpus` row after the draft) with a verdict (bon / retouche / inutilisable)
+  stored in `reply_drafts.verdict` — the accuracy measure for the 3-day check.
 - Dates: always render through `formatDateTime()` (`shared.ts`) — `config.timezone`
   (default `Africa/Casablanca`), never bare `toLocaleString()`.
 

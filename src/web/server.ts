@@ -13,6 +13,7 @@ import { draftAndStoreReply } from "../pipeline/replyDrafts.js";
 import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
 import { learnFromPastedThreads, refreshPlaybooks, undoLearningBatch } from "../pipeline/learning.js";
 import { renderLearningBody } from "./learningView.js";
+import { renderDraftsBody } from "./draftsView.js";
 import {
   computeLiveMorningReport,
   formatReportDay,
@@ -50,6 +51,9 @@ import {
   getMorningReportByDate,
   getThreadRelanceOverride,
   getLatestReplyDraft,
+  listReplyDraftComparisons,
+  REPLY_DRAFT_VERDICTS,
+  setReplyDraftVerdict,
   getThreadRow,
   getValidConnectInvite,
   hasThreadRelanceOverride,
@@ -1037,6 +1041,36 @@ app.post("/carnet/analyser", requireCsrf, async (req: Request, res: Response) =>
   res.redirect("/carnet?saved=1");
 });
 
+// ---------- Brouillons de reponse (comparaison avec la vraie reponse de l'equipe) ----------
+
+function draftDays(raw: unknown): number {
+  const n = Number(raw);
+  return [1, 3, 7, 30].includes(n) ? n : 3;
+}
+
+app.get("/brouillons", async (req: Request, res: Response) => {
+  const days = draftDays(query(req).jours);
+  const since = new Date(Date.now() - days * 86_400_000).toISOString();
+  const rows = await listReplyDraftComparisons(since);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    pageShell(
+      "brouillons",
+      "Brouillons de réponse",
+      "Ce que l'IA aurait répondu, à côté de ce que l'équipe a réellement répondu.",
+      renderDraftsBody(rows, days, res.locals.csrfToken as string | undefined)
+    )
+  );
+});
+
+app.post("/brouillons/:id/avis", requireCsrf, async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const body = req.body as Record<string, string>;
+  const verdict = REPLY_DRAFT_VERDICTS.find((v) => v === body.verdict) ?? null;
+  if (Number.isInteger(id) && id > 0) await setReplyDraftVerdict(id, verdict);
+  res.redirect(`/brouillons?jours=${draftDays(body.days)}`);
+});
+
 // ---------- Apprentissage (maturité par catégorie + import manuel de fils) ----------
 
 app.get("/apprentissage", async (req: Request, res: Response) => {
@@ -1253,6 +1287,7 @@ app.get("/confidentialite", (_req: Request, res: Response) => {
 
 type ActivePage =
   | "etape"
+  | "brouillons"
   | "connexion"
   | "dossiers"
   | "reglages"
@@ -1274,6 +1309,7 @@ const NAV_ICONS: Record<ActivePage, string> = {
   journal: `<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>`,
   envois: `<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>`,
   carnet: `<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>`,
+  brouillons: `<path d="M4 4h16v12H8l-4 4z"/>`,
   apprentissage: `<path d="M22 10 12 5 2 10l10 5 10-5z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/>`,
   rapport: `<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>`,
   consommation: `<line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>`,
@@ -1288,6 +1324,7 @@ const NAV_ITEMS: Array<{ key: ActivePage; href: string; label: string }> = [
   { key: "reglages", href: "/reglages", label: "Réglages" },
   { key: "journal", href: "/journal", label: "Journal" },
   { key: "envois", href: "/envois", label: "Envois" },
+  { key: "brouillons", href: "/brouillons", label: "Brouillons de réponse" },
   { key: "apprentissage", href: "/apprentissage", label: "Apprentissage" },
   { key: "carnet", href: "/carnet", label: "Carnet" },
   { key: "consommation", href: "/consommation", label: "Consommation IA" },

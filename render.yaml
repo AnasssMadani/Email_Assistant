@@ -76,6 +76,10 @@ services:
       # (apres validation ecrite de la direction de Global Link).
       - key: MAX_STAGE
         value: "0"
+      # Brouillons de reponse de l'IA, visibles seulement dans le back-office
+      # (page Brouillons): jamais envoyes, jamais deposes dans la boite mail.
+      - key: ENABLE_DRAFT_REPLIES
+        value: "true"
       # Vides a l'etape 0: sans SMTP_HOST, aucun envoi n'est possible.
       - key: SMTP_HOST
         sync: false
@@ -122,6 +126,10 @@ services:
         sync: false
       - key: MAX_STAGE
         value: "0"
+      # Brouillons de reponse de l'IA, visibles seulement dans le back-office
+      # (page Brouillons): jamais envoyes, jamais deposes dans la boite mail.
+      - key: ENABLE_DRAFT_REPLIES
+        value: "true"
       - key: CONNECTION_STATE_PATH
         value: /var/data/connection.json
       - key: GOOGLE_TOKEN_PATH

@@ -2005,7 +2005,11 @@ export interface ReplyDraftRow {
   confidence: "low" | "medium" | "high";
   source: "auto" | "manuel";
   createdAt: string;
+  verdict: ReplyDraftVerdict | null;
 }
+
+export type ReplyDraftVerdict = "bon" | "retouche" | "inutilisable";
+export const REPLY_DRAFT_VERDICTS: ReplyDraftVerdict[] = ["bon", "retouche", "inutilisable"];
 
 export async function saveReplyDraft(params: {
   threadId: string;
@@ -2051,6 +2055,7 @@ function toReplyDraft(r: {
   confidence: string;
   source: string;
   created_at: string | Date;
+  verdict?: string | null;
 }): ReplyDraftRow {
   let missing: string[] = [];
   try {
@@ -2072,7 +2077,51 @@ function toReplyDraft(r: {
     confidence: (["low", "medium", "high"].includes(r.confidence) ? r.confidence : "low") as ReplyDraftRow["confidence"],
     source: r.source === "manuel" ? "manuel" : "auto",
     createdAt: new Date(r.created_at).toISOString(),
+    verdict: REPLY_DRAFT_VERDICTS.includes(r.verdict as ReplyDraftVerdict) ? (r.verdict as ReplyDraftVerdict) : null,
   };
+}
+
+export async function setReplyDraftVerdict(id: number, verdict: ReplyDraftVerdict | null): Promise<void> {
+  await pool.query("UPDATE reply_drafts SET verdict = $1 WHERE id = $2", [verdict, id]);
+}
+
+export interface ReplyDraftComparison {
+  draft: ReplyDraftRow;
+  subject: string;
+  senderEmail: string;
+  senderName: string | null;
+  /** Premiere vraie reponse de l'equipe apres ce brouillon (corpus), s'il y en a une. */
+  teamReply: string | null;
+  teamReplyAt: string | null;
+}
+
+/** Brouillons recents, chacun avec la vraie reponse que l'equipe a fini par envoyer (pour juger leur justesse). */
+export async function listReplyDraftComparisons(sinceIso: string, limit = 200): Promise<ReplyDraftComparison[]> {
+  const drafts = await pool.query(
+    "SELECT * FROM reply_drafts WHERE created_at >= $1 ORDER BY created_at DESC, id DESC LIMIT $2",
+    [sinceIso, limit]
+  );
+  const out: ReplyDraftComparison[] = [];
+  for (const row of drafts.rows) {
+    const draft = toReplyDraft(row);
+    const thread = await pool.query<{ subject: string; sender_email: string; sender_name: string | null }>(
+      "SELECT subject, sender_email, sender_name FROM threads WHERE thread_id = $1",
+      [draft.threadId]
+    );
+    const reply = await pool.query<{ reply_body: string; created_at: string | Date }>(
+      "SELECT reply_body, created_at FROM human_reply_corpus WHERE thread_id = $1 AND created_at >= $2 ORDER BY created_at ASC LIMIT 1",
+      [draft.threadId, draft.createdAt]
+    );
+    out.push({
+      draft,
+      subject: thread.rows[0]?.subject ?? "(dossier supprimé)",
+      senderEmail: thread.rows[0]?.sender_email ?? "",
+      senderName: thread.rows[0]?.sender_name ?? null,
+      teamReply: reply.rows[0] ? cleanReplyForLearning(reply.rows[0].reply_body) : null,
+      teamReplyAt: reply.rows[0] ? new Date(reply.rows[0].created_at).toISOString() : null,
+    });
+  }
+  return out;
 }
 
 export async function getLatestReplyDraft(threadId: string): Promise<ReplyDraftRow | undefined> {
