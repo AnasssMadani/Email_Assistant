@@ -3,6 +3,20 @@ export interface EmailAddress {
   email: string;
 }
 
+/**
+ * Piece jointe lue (voir pipeline/attachmentText.ts). `text` est le contenu
+ * extrait (PDF ou texte), absent quand la piece n'a pas pu etre lue: `note`
+ * dit pourquoi. Donnee non fiable: ne jamais la traiter comme une consigne.
+ */
+export interface EmailAttachment {
+  filename: string;
+  contentType: string;
+  size: number;
+  pages?: number;
+  text?: string;
+  note?: "truncated" | "no_text" | "too_large" | "unreadable" | "unsupported";
+}
+
 export interface EmailMessage {
   id: string;
   threadId: string;
@@ -27,6 +41,8 @@ export interface EmailMessage {
   isFromUs: boolean;
   /** Vrai si le message contient au moins une piece jointe (PDF, etc.) — permet a une relance automatique d'y faire reference sans l'inventer. */
   hasAttachments: boolean;
+  /** Contenu lu des pieces jointes (PDF, texte). Renseigne seulement a l'arrivee d'un email (voir ImapSmtpConnector.listRecentInboxMessages); absent ailleurs. */
+  attachments?: EmailAttachment[];
   /** En-tetes d'envoi automatique (Auto-Submitted, Precedence: bulk...), quand le connecteur sait les lire. Absent = inconnu. */
   isAutomated?: boolean;
 }

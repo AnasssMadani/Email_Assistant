@@ -21,6 +21,7 @@ import {
   getSenderHistory,
   getThreadRow,
   recordReminder,
+  saveMessageAttachments,
   setThreadAckSent,
   setThreadStatus,
   listRecentAcksForDomain,
@@ -186,6 +187,7 @@ export async function processIncomingMessage(
     priorOutboundCount,
   });
   await markMessageProcessed(message.id, message.threadId, message.rfcMessageId);
+  if (message.attachments?.length) await saveMessageAttachments(message.id, message.threadId, message.attachments);
 
   if (classification.createdCategory) {
     await recordReminder(

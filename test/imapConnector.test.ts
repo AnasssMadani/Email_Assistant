@@ -2,6 +2,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { ImapFlow } from "imapflow";
 import { freshTestDb } from "./_pgTestDb.js";
+import { makePdf } from "./_pdf.js";
 import { startFakeImapServer, type FakeImapServer, type FakeMailbox } from "./_fakeImapServer.js";
 
 const { markMessageProcessed, listSmtpSentMessages } = await freshTestDb();
@@ -391,6 +392,51 @@ test("a text part that actually holds HTML code is converted to readable text", 
   assert.match(invoice.bodyText, /Dear PROMARK ,\n+Please find attached invoice 1110\./);
   // Un email texte normal reste tel quel.
   assert.match(inbox.find((m) => m.subject === "Grille tarifaire")?.bodyText ?? "", /^Ci-joint notre grille\./);
+});
+
+test("a PDF attached to a new email is read (even past the 256 KB cut), without any write command", async () => {
+  const pdf = makePdf(["INVOICE 5521", "Total USD 3400.00"], 300_000);
+  const base64 = pdf.toString("base64").replace(/(.{76})/g, "$1\r\n");
+  const raw = mail(
+    {
+      From: "Arkas Agent <ops@arkas-agent.tr>",
+      To: OWN,
+      Subject: "Invoice attached",
+      "Message-ID": "<inv-5521@arkas-agent.tr>",
+      "MIME-Version": "1.0",
+      "Content-Type": 'multipart/mixed; boundary="xyz"',
+    },
+    [
+      "--xyz",
+      "Content-Type: text/plain; charset=UTF-8",
+      "",
+      "Please see attached.",
+      "--xyz",
+      'Content-Type: application/pdf; name="inv5521.pdf"',
+      'Content-Disposition: attachment; filename="inv5521.pdf"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      base64,
+      "--xyz--",
+      "",
+    ].join("\r\n")
+  );
+  const bodyStructure = `(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" 22 1)("APPLICATION" "PDF" ("NAME" "inv5521.pdf") NIL NIL "BASE64" ${base64.length} NIL ("ATTACHMENT" ("FILENAME" "inv5521.pdf")) NIL) "MIXED" ("BOUNDARY" "xyz") NIL NIL)`;
+  const { server, connector } = await setup({ extraInbox: [{ uid: 105, raw, bodyStructure }] });
+  const inbox = await connector.listRecentInboxMessages(25);
+  await connector.close();
+
+  const invoice = inbox.find((m) => m.subject === "Invoice attached");
+  assert.ok(invoice);
+  assert.equal(invoice.hasAttachments, true);
+  assert.equal(invoice.attachments?.length, 1);
+  assert.match(invoice.attachments?.[0].text ?? "", /INVOICE 5521/);
+  assert.match(invoice.attachments?.[0].text ?? "", /Total USD 3400\.00/);
+  assertOnlyReadOnlyCommands(server);
+  // Un faux PDF (fixture "Grille tarifaire") est signale illisible, sans erreur.
+  assert.equal(inbox.find((m) => m.subject === "Grille tarifaire")?.attachments?.[0].note, "unreadable");
+  // Un email sans piece jointe n'a pas de champ attachments.
+  assert.equal(inbox.find((m) => m.subject === "Your Invoice 1110")?.attachments, undefined);
 });
 
 test("after an outage, catch-up also reads older unprocessed emails; without it only the last 25", async () => {

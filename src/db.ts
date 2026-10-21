@@ -6,7 +6,7 @@ import { getPool } from "./dbPool.js";
 import { config } from "./config.js";
 import { cleanReplyForLearning } from "./pipeline/emailText.js";
 import { PUBLIC_MAIL_DOMAINS } from "./utils.js";
-import type { AckSchedule, CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
+import type { AckSchedule, CategoryConfig, EmailAttachment, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
 
 const pool = getPool();
 
@@ -1263,6 +1263,44 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
  * rendant impossible de juger si l'IA l'a bien classifie. L'accuse, s'il y
  * en a un, est ajoute ensuite via recordAckDraft (ack_drafted passe a 1).
  */
+/** Garde le texte extrait des pieces jointes d'un email (voir migration 0008). Idempotent. */
+export async function saveMessageAttachments(
+  messageId: string,
+  threadId: string,
+  attachments: EmailAttachment[]
+): Promise<void> {
+  for (const a of attachments) {
+    await pool.query(
+      `INSERT INTO message_attachments (message_id, thread_id, filename, content_type, size_bytes, pages, extracted_text, note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (message_id, filename) DO NOTHING`,
+      [messageId, threadId, a.filename, a.contentType, a.size, a.pages ?? null, a.text ?? null, a.note ?? null]
+    );
+  }
+}
+
+/** Pieces jointes lues d'un dossier, de la plus ancienne a la plus recente. */
+export async function listThreadAttachments(threadId: string): Promise<Array<EmailAttachment & { messageId: string }>> {
+  const result = await pool.query<{
+    message_id: string;
+    filename: string;
+    content_type: string;
+    size_bytes: number;
+    pages: number | null;
+    extracted_text: string | null;
+    note: string | null;
+  }>("SELECT * FROM message_attachments WHERE thread_id = $1 ORDER BY created_at ASC, filename ASC", [threadId]);
+  return result.rows.map((r) => ({
+    messageId: r.message_id,
+    filename: r.filename,
+    contentType: r.content_type,
+    size: Number(r.size_bytes),
+    ...(r.pages != null ? { pages: Number(r.pages) } : {}),
+    ...(r.extracted_text ? { text: r.extracted_text } : {}),
+    ...(r.note ? { note: r.note as EmailAttachment["note"] } : {}),
+  }));
+}
+
 export async function recordClassification(params: {
   threadId: string;
   messageId: string;
