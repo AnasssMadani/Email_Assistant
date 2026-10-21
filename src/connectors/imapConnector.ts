@@ -5,7 +5,7 @@ import nodemailer, { type SendMailOptions } from "nodemailer";
 import { config } from "../config.js";
 import { isMessageProcessed, listSmtpSentMessages, recordSmtpSentMessage } from "../db.js";
 import { installReadOnlyGuard } from "./imapReadOnlyGuard.js";
-import { htmlToText } from "../pipeline/emailText.js";
+import { htmlToText, looksLikeHtml } from "../pipeline/emailText.js";
 import {
   decodeImapThreadId,
   encodeImapMessageId,
@@ -261,8 +261,11 @@ export class ImapSmtpConnector implements EmailConnector {
     // Partie texte vide mais HTML present (frequent depuis un iPhone ou
     // Outlook): conversion qui garde les retours a la ligne, sinon le
     // nettoyage de l'historique cite ne fonctionne plus (voir htmlToText).
+    // Partie texte qui contient du HTML brut (voir looksLikeHtml): convertie aussi.
     const bodyText = parsed.text?.trim()
-      ? parsed.text
+      ? looksLikeHtml(parsed.text)
+        ? htmlToText(parsed.text)
+        : parsed.text
       : typeof parsed.html === "string"
         ? htmlToText(parsed.html)
         : "";

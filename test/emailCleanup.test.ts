@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { freshTestDb } from "./_pgTestDb.js";
-import { cleanReplyForLearning, htmlToText, stripQuotedHistory } from "../src/pipeline/emailText.js";
+import { cleanReplyForLearning, htmlToText, looksLikeHtml, stripQuotedHistory } from "../src/pipeline/emailText.js";
 import { isAutomatedMessage } from "../src/pipeline/automatedSender.js";
 import type { EmailMessage } from "../src/types.js";
 
@@ -18,6 +18,15 @@ test("htmlToText keeps line breaks, drops style blocks and decodes entities", ()
   assert.ok(!text.includes("&nbsp;"), text);
   assert.match(text, /Hi dear,\n+Please find the B\/L draft\.\nThanks & regards/);
   assert.match(text, /a écrit/);
+});
+
+test("looksLikeHtml spots HTML code sent as plain text, not emails that quote a <link>", () => {
+  assert.equal(looksLikeHtml("<html><head><meta http- equiv='Content- Type'></head><body><p>Bonjour</p></body></html>"), true);
+  assert.equal(looksLikeHtml("  <!DOCTYPE html><html><body>x</body></html>"), true);
+  assert.equal(looksLikeHtml("<p style='font-size: 16px'>Bonjour,</p><p>Merci de trouver ci joint notre quotation</p>"), true);
+  assert.equal(looksLikeHtml("<https://www.bwlturkey.com/> Hi dear, draft HBL attached"), false);
+  assert.equal(looksLikeHtml("<photo.png> Bonjour, ci-joint la facture"), false);
+  assert.equal(looksLikeHtml("Bonjour,\nVoir <p> dans le code.\nMerci"), false);
 });
 
 test("stripQuotedHistory cuts a flattened reply at an inline quote marker", () => {

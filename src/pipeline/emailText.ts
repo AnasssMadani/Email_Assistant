@@ -127,6 +127,17 @@ function decodeEntities(text: string): string {
  * balises <style>/<script>/<head> (sinon du CSS se retrouve dans le texte lu
  * par l'IA et dans le corpus de l'equipe) et decode les entites (&nbsp;...).
  */
+/**
+ * Partie "texte" qui contient en realite du HTML (certains logiciels
+ * d'agents, ex: les avis d'arrivee et factures de Norvex, envoient le code
+ * HTML dans la partie text/plain). Telle quelle, l'IA ne lit que des balises
+ * et le carnet les affiche. Prudent: seul un texte qui COMMENCE par une
+ * balise de structure HTML est concerne, pas un email qui cite "<lien>".
+ */
+export function looksLikeHtml(text: string): boolean {
+  return /^\s*<(!doctype\s+html|html|head|body|meta|style|div|p|table|span)\b/i.test(text);
+}
+
 export function htmlToText(html: string): string {
   const withBreaks = html
     .replace(/<!--[\s\S]*?-->/g, " ")

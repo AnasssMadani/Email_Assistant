@@ -141,7 +141,9 @@ after(async () => {
 
 let uidValiditySeed = 1000;
 
-async function setup(options: { user?: string; mailboxAddress?: string; copyMailbox?: boolean } = {}) {
+async function setup(
+  options: { user?: string; mailboxAddress?: string; copyMailbox?: boolean; extraInbox?: FakeMailbox["messages"] } = {}
+) {
   // UIDVALIDITY distinct par test: les ids de message (dossier + UIDVALIDITY
   // + UID) restent uniques alors que la base de test est partagee par tout
   // le fichier (processed_messages, smtp_sent_messages).
@@ -154,6 +156,7 @@ async function setup(options: { user?: string; mailboxAddress?: string; copyMail
     mailboxes.INBOX.messages.push(...sent.filter((m) => !m.flags?.includes("\\Draft")).map((m) => ({ ...m, uid: m.uid + 200, flags: [] })));
     mailboxes["INBOX.Sent"].messages = [];
   }
+  if (options.extraInbox) mailboxes.INBOX.messages.push(...options.extraInbox);
   for (const mb of Object.values(mailboxes)) mb.uidValidity = ++uidValiditySeed;
   const server = await startFakeImapServer(mailboxes);
   servers.push(server);
@@ -358,6 +361,35 @@ test("messages are mapped with stable ids, thread root, isFromUs and attachment 
   // La reponse du client (References: <root-1> ...) rejoint le meme dossier.
   assert.equal(clientReply.threadId, first.threadId);
   assert.deepEqual(decodeImapThreadId(first.threadId), { kind: "root", rootMessageId: "<root-1@shipper.cn>" });
+});
+
+test("a text part that actually holds HTML code is converted to readable text", async () => {
+  const { connector } = await setup({
+    extraInbox: [
+      {
+        uid: 104,
+        raw: mail(
+          {
+            From: "Norvex <billing@norvexcargo.com>",
+            To: OWN,
+            Subject: "Your Invoice 1110",
+            "Message-ID": "<inv-1110@norvexcargo.com>",
+            "Content-Type": "text/plain; charset=UTF-8",
+          },
+          "<html><head><style>p { margin: 0 }</style></head><body><p>Dear&nbsp;PROMARK ,</p><p>Please find attached invoice 1110.</p></body></html>\r\n"
+        ),
+      },
+    ],
+  });
+  const inbox = await connector.listRecentInboxMessages(25);
+  await connector.close();
+
+  const invoice = inbox.find((m) => m.subject === "Your Invoice 1110");
+  assert.ok(invoice);
+  assert.ok(!invoice.bodyText.includes("<"), invoice.bodyText);
+  assert.match(invoice.bodyText, /Dear PROMARK ,\n+Please find attached invoice 1110\./);
+  // Un email texte normal reste tel quel.
+  assert.match(inbox.find((m) => m.subject === "Grille tarifaire")?.bodyText ?? "", /^Ci-joint notre grille\./);
 });
 
 test("already-processed messages are not downloaded again", async () => {
