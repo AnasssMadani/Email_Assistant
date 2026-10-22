@@ -30,11 +30,20 @@ const classificationSchema = z.object({
 
 type RawClassification = z.infer<typeof classificationSchema>;
 
+/** Ce que la boite sait deja de l'expediteur et de la conversation (voir getSenderHistory). */
+export interface ClassifyContext {
+  senderPreviousEmails: number;
+  senderTeamReplies: number;
+  /** Messages envoyes par notre equipe dans cette conversation avant cet email. */
+  ourEarlierMessages: number;
+}
+
 export async function classifyEmail(
   thread: EmailThread,
-  incoming: EmailMessage
+  incoming: EmailMessage,
+  context?: ClassifyContext
 ): Promise<ClassificationResult> {
-  const raw = await withRetry(() => classifyEmailOnce(thread, incoming), "classification");
+  const raw = await withRetry(() => classifyEmailOnce(thread, incoming, context), "classification");
   return resolveCategory(raw);
 }
 
@@ -68,7 +77,31 @@ function cleanText(value: string | undefined, maxLength: number): string {
   return (value ?? "").replace(/\s+/g, " ").trim().slice(0, maxLength).trim();
 }
 
-async function classifyEmailOnce(thread: EmailThread, incoming: EmailMessage): Promise<RawClassification> {
+function describeContext(context: ClassifyContext | undefined): string[] {
+  if (!context) return [];
+  const lines = [
+    "",
+    `Contexte (historique de cette boite, 90 derniers jours): cet expediteur ou son domaine a deja ecrit ${context.senderPreviousEmails} fois, et notre equipe lui a deja repondu ${context.senderTeamReplies} fois. Notre equipe a deja ecrit ${context.ourEarlierMessages} message(s) dans cette conversation.`,
+  ];
+  if (context.senderTeamReplies > 0) {
+    lines.push(
+      "Cet expediteur est un correspondant connu: ne le marque suspect (suspicious=true) que pour un changement de coordonnees bancaires, un lien de connexion ou de validation, ou une piece jointe inattendue.",
+      "Un message court, un transfert interne ('fyi', '@collegue') ou une demande de validation sans lien ne sont PAS suspects de la part d'un correspondant connu."
+    );
+  }
+  if (context.ourEarlierMessages > 0) {
+    lines.push(
+      "Notre equipe a deja ecrit dans cette conversation: l'expediteur repond a NOTRE demande ou a notre echange. Ce n'est pas une nouvelle demande de cotation ni une nouvelle demande client: un prix recu releve de 'tarif_partenaire', une question ou une information sur l'operation de 'suivi_dossier'."
+    );
+  }
+  return lines;
+}
+
+async function classifyEmailOnce(
+  thread: EmailThread,
+  incoming: EmailMessage,
+  context?: ClassifyContext
+): Promise<RawClassification> {
   const client = getClient();
   const categories = await listCategories();
   const categoryList = categories
@@ -141,6 +174,7 @@ async function classifyEmailOnce(thread: EmailThread, incoming: EmailMessage): P
       "message (pas a l'historique cite en dessous). En cas de doute, utilise 'autre'.",
       "Un email qui n'appelle aucune reponse (information, cloture, notification automatique,",
       "newsletter, spam) doit avoir requiresAcknowledgement=false.",
+      ...describeContext(context),
       ...(canCreateCategory
         ? [
             "",

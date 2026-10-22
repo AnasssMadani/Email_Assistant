@@ -9,9 +9,11 @@ import { GraphConnector } from "../connectors/graphConnector.js";
 import { createEmailConnector } from "../connectors/index.js";
 import { checkPostReplyThread, checkPreReplyThread } from "../pipeline/relanceCheck.js";
 import { sendAcknowledgement } from "../pipeline/processIncoming.js";
+import { draftAndStoreReply } from "../pipeline/replyDrafts.js";
 import { runCorpusAnalysis } from "../pipeline/corpusAnalysis.js";
 import { learnFromPastedThreads, refreshPlaybooks, undoLearningBatch } from "../pipeline/learning.js";
 import { renderLearningBody } from "./learningView.js";
+import { renderDraftsBody } from "./draftsView.js";
 import {
   computeLiveMorningReport,
   formatReportDay,
@@ -48,6 +50,10 @@ import {
   getEffectiveRelanceSteps,
   getMorningReportByDate,
   getThreadRelanceOverride,
+  getLatestReplyDraft,
+  listReplyDraftComparisons,
+  REPLY_DRAFT_VERDICTS,
+  setReplyDraftVerdict,
   getThreadRow,
   getValidConnectInvite,
   hasThreadRelanceOverride,
@@ -84,6 +90,7 @@ import {
   type ReminderRow,
   type ThreadRow,
 } from "../db.js";
+import type { ReplyDraftRow } from "../db.js";
 import type { AckSchedule, CategoryConfig, EmailMessage, RelanceChannel, RelanceStep } from "../types.js";
 import { DEFAULT_OFFICE_HOURS, getOfficeHours, setOfficeHours, type OfficeHours } from "../officeHours.js";
 import {
@@ -620,6 +627,29 @@ app.post("/dossiers/:threadId/relance-steps/:order/delete", requireCsrf, async (
  * applique la categorie choisie par l'admin, et declenche l'accuse comme si
  * la classification avait ete bonne des le depart.
  */
+app.post("/dossiers/:threadId/preparer-reponse", requireCsrf, async (req: Request, res: Response) => {
+  const threadId = req.params.threadId;
+  const threadRow = await getThreadRow(threadId);
+  if (!threadRow) {
+    res.redirect("/dossiers");
+    return;
+  }
+  try {
+    const connector = createEmailConnector();
+    const thread = await connector.getThread(threadId);
+    const lastInbound = [...thread.messages].reverse().find((m) => !m.isFromUs);
+    if (!lastInbound) throw new Error("Aucun message entrant trouvé dans ce fil.");
+    const category = await getCategory(threadRow.category_id);
+    await draftAndStoreReply({ thread, incoming: lastInbound, category, source: "manuel" });
+  } catch (err) {
+    console.error(`[brouillon] erreur sur le dossier ${threadId}:`, err);
+    await recordPipelineError("reply_draft", threadId, (err as Error).message);
+    res.redirect(`/dossiers/${encodeURIComponent(threadId)}?error=1`);
+    return;
+  }
+  res.redirect(`/dossiers/${encodeURIComponent(threadId)}?saved=1`);
+});
+
 app.post("/dossiers/:threadId/traiter", requireCsrf, async (req: Request, res: Response) => {
   const threadId = req.params.threadId;
   const threadRow = await getThreadRow(threadId);
@@ -1011,6 +1041,36 @@ app.post("/carnet/analyser", requireCsrf, async (req: Request, res: Response) =>
   res.redirect("/carnet?saved=1");
 });
 
+// ---------- Brouillons de reponse (comparaison avec la vraie reponse de l'equipe) ----------
+
+function draftDays(raw: unknown): number {
+  const n = Number(raw);
+  return [1, 3, 7, 30].includes(n) ? n : 3;
+}
+
+app.get("/brouillons", async (req: Request, res: Response) => {
+  const days = draftDays(query(req).jours);
+  const since = new Date(Date.now() - days * 86_400_000).toISOString();
+  const rows = await listReplyDraftComparisons(since);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    pageShell(
+      "brouillons",
+      "Brouillons de réponse",
+      "Ce que l'IA aurait répondu, à côté de ce que l'équipe a réellement répondu.",
+      renderDraftsBody(rows, days, res.locals.csrfToken as string | undefined)
+    )
+  );
+});
+
+app.post("/brouillons/:id/avis", requireCsrf, async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const body = req.body as Record<string, string>;
+  const verdict = REPLY_DRAFT_VERDICTS.find((v) => v === body.verdict) ?? null;
+  if (Number.isInteger(id) && id > 0) await setReplyDraftVerdict(id, verdict);
+  res.redirect(`/brouillons?jours=${draftDays(body.days)}`);
+});
+
 // ---------- Apprentissage (maturité par catégorie + import manuel de fils) ----------
 
 app.get("/apprentissage", async (req: Request, res: Response) => {
@@ -1227,6 +1287,7 @@ app.get("/confidentialite", (_req: Request, res: Response) => {
 
 type ActivePage =
   | "etape"
+  | "brouillons"
   | "connexion"
   | "dossiers"
   | "reglages"
@@ -1248,6 +1309,7 @@ const NAV_ICONS: Record<ActivePage, string> = {
   journal: `<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>`,
   envois: `<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>`,
   carnet: `<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>`,
+  brouillons: `<path d="M4 4h16v12H8l-4 4z"/>`,
   apprentissage: `<path d="M22 10 12 5 2 10l10 5 10-5z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/>`,
   rapport: `<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>`,
   consommation: `<line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>`,
@@ -1262,6 +1324,7 @@ const NAV_ITEMS: Array<{ key: ActivePage; href: string; label: string }> = [
   { key: "reglages", href: "/reglages", label: "Réglages" },
   { key: "journal", href: "/journal", label: "Journal" },
   { key: "envois", href: "/envois", label: "Envois" },
+  { key: "brouillons", href: "/brouillons", label: "Brouillons de réponse" },
   { key: "apprentissage", href: "/apprentissage", label: "Apprentissage" },
   { key: "carnet", href: "/carnet", label: "Carnet" },
   { key: "consommation", href: "/consommation", label: "Consommation IA" },
@@ -1847,6 +1910,35 @@ function renderThreadRow(
 
 // ---------- Detail d'un dossier ----------
 
+const CONFIDENCE_LABELS = {
+  high: "L'équipe n'aura presque rien à changer",
+  medium: "Quelques champs à compléter",
+  low: "Le fond dépend d'une décision ou d'une information absente du fil",
+} as const;
+
+function renderReplyDraftSection(draft: ReplyDraftRow | undefined, threadId: string, csrfToken: string | undefined): string {
+  const form = `<form class="step-add-form" method="POST" action="/dossiers/${encodeURIComponent(threadId)}/preparer-reponse">
+      ${csrfField(csrfToken)}
+      <button class="btn btn-primary btn-sm" type="submit">${draft ? "Préparer à nouveau" : "Préparer une réponse"}</button>
+    </form>`;
+  let body = `<p class="section-hint">Aucun brouillon pour ce dossier.</p>`;
+  if (draft && !draft.shouldReply) {
+    body = `<p><strong>Aucune réponse nécessaire.</strong> ${escapeHtml(draft.reason)}</p>`;
+  } else if (draft) {
+    const highlighted = escapeHtml(draft.body).replace(/\[\[([^\]]+)\]\]/g, "<mark>[[$1]]</mark>");
+    body = `<p class="section-hint">${escapeHtml(draft.reason)} — ${escapeHtml(CONFIDENCE_LABELS[draft.confidence])}.</p>
+      ${draft.subject ? `<p><strong>Objet :</strong> ${escapeHtml(draft.subject)}</p>` : ""}
+      <pre style="white-space: pre-wrap; font: inherit; background: var(--surface-2, #f4f6f8); padding: 12px 14px; border-radius: 8px;">${highlighted}</pre>
+      ${draft.missing.length ? `<p><strong>À compléter par l'équipe :</strong></p><ul>${draft.missing.map((m) => `<li>${escapeHtml(m)}</li>`).join("")}</ul>` : ""}`;
+  }
+  return `<div class="settings-section">
+    <h2>Brouillon de réponse</h2>
+    <p class="section-hint">Préparé par l'IA pour votre équipe. Il n'est jamais envoyé ni déposé dans la boîte mail : relisez-le, complétez les champs surlignés et envoyez-le vous-même.</p>
+    ${body}
+    ${form}
+  </div>`;
+}
+
 async function renderDossierDetailPage(
   thread: ThreadRow,
   reminders: ReminderRow[],
@@ -1988,6 +2080,8 @@ async function renderDossierDetailPage(
       ${addForm}
     </div>`;
 
+  const draftSection = renderReplyDraftSection(await getLatestReplyDraft(thread.thread_id), thread.thread_id, csrfToken);
+
   const misclassifiedSection =
     thread.status === "skipped" || thread.status === "ai_error"
       ? `<div class="settings-section">
@@ -2049,7 +2143,7 @@ async function renderDossierDetailPage(
     "dossiers",
     "Dossier",
     "Détail du dossier, statut de traitement, et séquence de relance appliquée.",
-    banner + header + misclassifiedSection + stepsSection + remindersSection,
+    banner + header + misclassifiedSection + draftSection + stepsSection + remindersSection,
     "/dossiers"
   );
 }
@@ -2691,6 +2785,7 @@ const CARNET_NO_ACK_SHORT: Record<string, string> = {
   doublon: "déjà accusés",
   heures_bureau: "heures de bureau",
   suspect: "suspects",
+  armateur: "armateurs et portails",
   "": "en cours ou en erreur",
 };
 
@@ -2705,6 +2800,7 @@ const CARNET_NO_ACK_REASONS: Record<string, string> = {
   doublon: "Aucun — un accusé a déjà été rédigé pour cette conversation ou cette référence ces 7 derniers jours.",
   heures_bureau: "Aucun — reçu pendant les heures de bureau : cette catégorie n'accuse que la nuit et le week-end.",
   suspect: "Aucun — email suspect (hameçonnage probable) : ne pas ouvrir les pièces jointes ni les liens.",
+  armateur: "Aucun — l'expéditeur est un armateur ou un portail : un accusé serait inutile (le dossier reste suivi).",
   "": "Aucun accusé rédigé pour l'instant (rédaction en cours, ou erreur — voir le Journal).",
 };
 

@@ -10,6 +10,13 @@ function required(name: string): string {
   return value;
 }
 
+function parseDomainList(raw: string | undefined, fallback: string): string[] {
+  return (raw ?? fallback)
+    .split(",")
+    .map((d) => d.trim().toLowerCase().replace(/^@/, ""))
+    .filter(Boolean);
+}
+
 export const config = {
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
   // PORT: injectee automatiquement par la plupart des PaaS (Render, Railway,
@@ -85,6 +92,11 @@ export const config = {
     // de ~800 emails/jour, une recherche d'en-tete sans borne de date
     // parcourrait des centaines de milliers de messages a chaque cycle.
     threadLookbackDays: Number(process.env.IMAP_THREAD_LOOKBACK_DAYS ?? 60),
+    // Rattrapage apres une panne: chaque cycle relit les N derniers emails;
+    // en plus, les emails non traites des X dernieres heures parmi les 100
+    // precedents sont repris. 0 = desactive. Volontairement borne: jamais
+    // d'accuse pour de vieux emails apres un changement de boite.
+    catchUpHours: Math.max(0, Number(process.env.IMAP_CATCHUP_HOURS ?? 36) || 0),
   },
   smtp: {
     host: process.env.SMTP_HOST ?? "",
@@ -123,6 +135,23 @@ export const config = {
   // 24h glissantes (voir createCategoryFromAi dans db.ts) — au-dela, l'email
   // tombe dans la categorie de repli. 0 desactive la creation automatique.
   aiCategoriesMaxPerDay: Math.max(0, Number(process.env.AI_CATEGORIES_MAX_PER_DAY ?? 3) || 0),
+  // Domaines d'armateurs et de portails (separes par des virgules; un
+  // sous-domaine compte: "service.hlag.com" pour "hlag.com"). Leurs emails
+  // sont toujours suivis, mais ne recoivent JAMAIS d'accuse: un accuse a un
+  // armateur est du bruit. Remplace la liste par defaut si la variable existe.
+  noAckDomains: parseDomainList(
+    process.env.NO_ACK_DOMAINS,
+    "cma-cgm.com,maersk.com,msc.com,one-line.com,hlag.com,hapag-lloyd.com,coscon.com,coscoshipping.com,coscoshipping.ma,hmm21.com,arkasdenizcilik.com.tr,arkas-maroc.com"
+  ),
+  // Brouillons de reponse rediges par l'IA pour l'equipe, a chaque email suivi
+  // (off par defaut: un appel Claude de plus par email). Ils ne quittent jamais
+  // l'application: aucun envoi, rien dans la boite mail. Le bouton « Préparer
+  // une réponse » d'un dossier fonctionne meme quand ceci est desactive.
+  draftRepliesEnabled: process.env.ENABLE_DRAFT_REPLIES === "true",
+  draftRepliesMaxPerDay: Math.max(0, Number(process.env.DRAFT_REPLIES_MAX_PER_DAY ?? 80) || 0),
+  // Domaines dont TOUT message est automatique (portails sans adresse noreply
+  // reconnaissable): ranges sans appel a l'IA, comme les noreply.
+  automatedDomains: parseDomainList(process.env.AUTOMATED_DOMAINS, "portnet.ma"),
   // Dossier des notes de style par categorie, generees a partir du corpus des
   // vraies reponses de l'equipe (voir src/pipeline/corpusAnalysis.ts) et
   // relues par le prompt de redaction de l'accuse. Le contenu vit en base

@@ -1,3 +1,5 @@
+import { config } from "../config.js";
+import { emailInDomains } from "../utils.js";
 import type { EmailMessage } from "../types.js";
 
 /**
@@ -12,6 +14,8 @@ const AUTOMATED_LOCAL_PART =
 
 export function isAutomatedMessage(message: EmailMessage): boolean {
   if (message.isAutomated) return true;
+  // Portails dont l'adresse d'envoi n'a rien de "noreply" (ex: Portnet).
+  if (emailInDomains(message.from.email, config.automatedDomains)) return true;
   const localPart = message.from.email.split("@")[0] ?? "";
   return AUTOMATED_LOCAL_PART.test(localPart);
 }

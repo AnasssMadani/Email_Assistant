@@ -1,5 +1,5 @@
 import type { gmail_v1 } from "googleapis";
-import { htmlToText } from "../pipeline/emailText.js";
+import { htmlToText, looksLikeHtml } from "../pipeline/emailText.js";
 
 export function decodeBase64Url(data: string): string {
   const normalized = data.replace(/-/g, "+").replace(/_/g, "/");
@@ -25,7 +25,8 @@ export function extractPlainText(part: gmail_v1.Schema$MessagePart | undefined):
   if (!part) return "";
 
   if (part.mimeType === "text/plain" && part.body?.data) {
-    return decodeBase64Url(part.body.data);
+    const text = decodeBase64Url(part.body.data);
+    return looksLikeHtml(text) ? htmlToText(text) : text;
   }
 
   if (part.parts && part.parts.length > 0) {

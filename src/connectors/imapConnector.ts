@@ -5,7 +5,13 @@ import nodemailer, { type SendMailOptions } from "nodemailer";
 import { config } from "../config.js";
 import { isMessageProcessed, listSmtpSentMessages, recordSmtpSentMessage } from "../db.js";
 import { installReadOnlyGuard } from "./imapReadOnlyGuard.js";
-import { htmlToText } from "../pipeline/emailText.js";
+import { htmlToText, looksLikeHtml } from "../pipeline/emailText.js";
+import {
+  extractAttachment,
+  isReadableAttachmentType,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+} from "../pipeline/attachmentText.js";
 import {
   decodeImapThreadId,
   encodeImapMessageId,
@@ -17,6 +23,7 @@ import {
 } from "./imapIds.js";
 import type {
   EmailAddress,
+  EmailAttachment,
   EmailConnector,
   EmailMessage,
   EmailThread,
@@ -38,6 +45,8 @@ export interface ImapSmtpSettings {
     inboxFolder: string;
     sentFolder: string;
     threadLookbackDays: number;
+    /** Heures de rattrapage apres une panne (0 = desactive, voir config.imap.catchUpHours). */
+    catchUpHours?: number;
     /** Reserve aux tests (serveur IMAP factice en clair sur 127.0.0.1). */
     allowInsecureForTesting?: boolean;
   };
@@ -68,6 +77,13 @@ export interface SmtpTransport {
  */
 const MAX_SOURCE_BYTES = 256 * 1024;
 
+/**
+ * Pour lire une piece jointe (PDF, texte) il faut le message complet: relu une
+ * seule fois, a l'arrivee, et seulement si la structure du message annonce une
+ * piece lisible de taille raisonnable (BODYSTRUCTURE, sans rien telecharger).
+ */
+const MAX_ATTACHMENT_SOURCE_BYTES = MAX_ATTACHMENT_BYTES + 1024 * 1024;
+
 /** Deconnexion apres inactivite: un connecteur neuf est cree a chaque cycle (scheduler.ts) et l'interface n'a pas de close() — sans ce delai, chaque cycle laisserait une session IMAP ouverte (Dovecot plafonne a ~10 connexions par utilisateur/IP). */
 const IDLE_LOGOUT_MS = 5_000;
 
@@ -94,6 +110,9 @@ function settingsFromConfig(): ImapSmtpSettings {
  *   (smtp_sent_messages) et reinjectes dans getThread(), pour que le
  *   comptage automated_outbound_count fonctionne comme avec Gmail/Graph.
  */
+/** Nombre maximal d'emails relus en plus de la fenetre normale lors d'un rattrapage. */
+const CATCH_UP_EXTRA_MESSAGES = 100;
+
 export class ImapSmtpConnector implements EmailConnector {
   readonly name = "imap" as const;
   private readonly settings: ImapSmtpSettings;
@@ -246,7 +265,8 @@ export class ImapSmtpConnector implements EmailConnector {
     folder: string,
     uidValidity: string,
     msg: FetchMessageObject,
-    ownEmail: string
+    ownEmail: string,
+    readAttachments = false
   ): Promise<FetchedMessage | null> {
     if (!msg.source) return null;
     const parsed = await simpleParser(msg.source, { skipImageLinks: true, skipTextToHtml: true, skipTextLinks: true });
@@ -261,8 +281,11 @@ export class ImapSmtpConnector implements EmailConnector {
     // Partie texte vide mais HTML present (frequent depuis un iPhone ou
     // Outlook): conversion qui garde les retours a la ligne, sinon le
     // nettoyage de l'historique cite ne fonctionne plus (voir htmlToText).
+    // Partie texte qui contient du HTML brut (voir looksLikeHtml): convertie aussi.
     const bodyText = parsed.text?.trim()
-      ? parsed.text
+      ? looksLikeHtml(parsed.text)
+        ? htmlToText(parsed.text)
+        : parsed.text
       : typeof parsed.html === "string"
         ? htmlToText(parsed.html)
         : "";
@@ -279,6 +302,10 @@ export class ImapSmtpConnector implements EmailConnector {
       isAutomated: hasAutomatedHeaders(parsed.headers),
       hasAttachments: hasAttachmentNode(msg.bodyStructure),
     };
+    if (readAttachments && message.hasAttachments) {
+      const attachments = await readAttachmentContents(parsed.attachments);
+      if (attachments.length > 0) message.attachments = attachments;
+    }
     const chain = [...parseReferences(parsed.references), normalizeMessageId(parsed.inReplyTo), rfcMessageId].filter(
       (id): id is string => !!id
     );
@@ -291,7 +318,8 @@ export class ImapSmtpConnector implements EmailConnector {
     folder: string,
     uidValidity: string,
     uids: number[],
-    ownEmail: string
+    ownEmail: string,
+    readAttachments = false
   ): Promise<FetchedMessage[]> {
     if (uids.length === 0) return [];
     const fetched: FetchMessageObject[] = [];
@@ -307,7 +335,17 @@ export class ImapSmtpConnector implements EmailConnector {
       // Brouillon (\Draft) jamais envoye: meme raison que le filtre DRAFT
       // de GmailConnector.getThread (ne pas fausser le comptage isFromUs).
       if (msg.flags?.has("\\Draft")) continue;
-      const message = await this.toEmailMessage(folder, uidValidity, msg, ownEmail);
+      if (readAttachments && needsFullSource(msg)) {
+        // Meme lecture seule (BODY.PEEK) que ci-dessus, mais sans la limite des 256 Ko.
+        for await (const full of client.fetch(
+          String(msg.uid),
+          { uid: true, source: { maxLength: MAX_ATTACHMENT_SOURCE_BYTES } },
+          { uid: true }
+        )) {
+          if (full.source) msg.source = full.source;
+        }
+      }
+      const message = await this.toEmailMessage(folder, uidValidity, msg, ownEmail, readAttachments);
       if (message) messages.push(message);
     }
     return messages;
@@ -325,15 +363,23 @@ export class ImapSmtpConnector implements EmailConnector {
       // (UID) seul, sans contenu — puis on ne telecharge que ceux qui n'ont
       // pas deja ete traites (meme optimisation que GmailConnector.listByLabel).
       const start = Math.max(1, mailbox.exists - maxResults + 1);
+      // Rattrapage: apres une panne de plus de quelques minutes, plus de N
+      // emails ont pu arriver. On regarde un peu plus loin, mais on ne garde
+      // de ces plus anciens que ceux recus dans la fenetre de rattrapage.
+      const catchUpMs = (this.settings.imap.catchUpHours ?? 0) * 3_600_000;
+      const from = catchUpMs > 0 ? Math.max(1, start - CATCH_UP_EXTRA_MESSAGES) : start;
+      const oldestAllowed = Date.now() - catchUpMs;
       const candidateUids: number[] = [];
-      for await (const msg of client.fetch(`${start}:*`, { uid: true })) {
-        candidateUids.push(msg.uid);
+      for await (const msg of client.fetch(`${from}:*`, { uid: true, internalDate: true })) {
+        if (msg.seq >= start || (msg.internalDate && new Date(msg.internalDate).getTime() >= oldestAllowed)) {
+          candidateUids.push(msg.uid);
+        }
       }
       const processed = await Promise.all(
         candidateUids.map((uid) => isMessageProcessed(encodeImapMessageId({ folder: path, uidValidity, uid })))
       );
       const uids = candidateUids.filter((_uid, i) => !processed[i]);
-      const messages = (await this.fetchByUids(client, path, uidValidity, uids, ownEmail)).map((f) => f.message);
+      const messages = (await this.fetchByUids(client, path, uidValidity, uids, ownEmail, folder !== "sent")).map((f) => f.message);
       return messages.sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime());
     });
   }
@@ -519,6 +565,34 @@ function allAddresses(field: AddressObject | AddressObject[] | undefined): Email
     .flatMap((a) => (a.group ? a.group : [a]))
     .map((a) => ({ name: a.name || undefined, email: a.address ?? "" }))
     .filter((a) => a.email);
+}
+
+/** Pieces lisibles (PDF, texte) annoncees par la structure du message, avec leur taille. */
+function readableAttachmentNodes(node: MessageStructureObject | undefined): MessageStructureObject[] {
+  if (!node) return [];
+  const own = node.dispositionParameters?.filename || node.parameters?.name;
+  const here = own && isReadableAttachmentType(node.type, String(own)) ? [node] : [];
+  return [...here, ...(node.childNodes ?? []).flatMap(readableAttachmentNodes)];
+}
+
+/** Vrai si le message annonce une piece lisible, assez petite, que les 256 Ko lus ne contiennent pas en entier. */
+function needsFullSource(msg: FetchMessageObject): boolean {
+  const nodes = readableAttachmentNodes(msg.bodyStructure);
+  if (nodes.length === 0) return false;
+  if ((msg.source?.length ?? 0) < MAX_SOURCE_BYTES) return false;
+  return nodes.every((n) => (n.size ?? 0) <= MAX_ATTACHMENT_BYTES);
+}
+
+async function readAttachmentContents(
+  attachments: Array<{ filename?: string; contentType: string; content: Buffer; size: number }>
+): Promise<EmailAttachment[]> {
+  const out: EmailAttachment[] = [];
+  for (const att of attachments) {
+    if (!att.filename || !isReadableAttachmentType(att.contentType, att.filename)) continue;
+    if (out.length >= MAX_ATTACHMENTS_PER_MESSAGE) break;
+    out.push(await extractAttachment({ filename: att.filename, contentType: att.contentType, content: att.content }));
+  }
+  return out;
 }
 
 /** Meme definition que hasAttachmentParts (mime.ts) pour Gmail: toute partie portant un nom de fichier. */

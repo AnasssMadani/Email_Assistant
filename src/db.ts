@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { getPool } from "./dbPool.js";
 import { config } from "./config.js";
 import { cleanReplyForLearning } from "./pipeline/emailText.js";
-import type { AckSchedule, CategoryConfig, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
+import { PUBLIC_MAIL_DOMAINS } from "./utils.js";
+import type { AckSchedule, CategoryConfig, EmailAttachment, RelanceChannel, RelanceStep, ThreadStatus, UrgencyThreshold } from "./types.js";
 
 const pool = getPool();
 
@@ -1262,6 +1263,44 @@ function toCarnetEntry(row: CarnetEntryRow): CarnetEntry {
  * rendant impossible de juger si l'IA l'a bien classifie. L'accuse, s'il y
  * en a un, est ajoute ensuite via recordAckDraft (ack_drafted passe a 1).
  */
+/** Garde le texte extrait des pieces jointes d'un email (voir migration 0008). Idempotent. */
+export async function saveMessageAttachments(
+  messageId: string,
+  threadId: string,
+  attachments: EmailAttachment[]
+): Promise<void> {
+  for (const a of attachments) {
+    await pool.query(
+      `INSERT INTO message_attachments (message_id, thread_id, filename, content_type, size_bytes, pages, extracted_text, note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (message_id, filename) DO NOTHING`,
+      [messageId, threadId, a.filename, a.contentType, a.size, a.pages ?? null, a.text ?? null, a.note ?? null]
+    );
+  }
+}
+
+/** Pieces jointes lues d'un dossier, de la plus ancienne a la plus recente. */
+export async function listThreadAttachments(threadId: string): Promise<Array<EmailAttachment & { messageId: string }>> {
+  const result = await pool.query<{
+    message_id: string;
+    filename: string;
+    content_type: string;
+    size_bytes: number;
+    pages: number | null;
+    extracted_text: string | null;
+    note: string | null;
+  }>("SELECT * FROM message_attachments WHERE thread_id = $1 ORDER BY created_at ASC, filename ASC", [threadId]);
+  return result.rows.map((r) => ({
+    messageId: r.message_id,
+    filename: r.filename,
+    contentType: r.content_type,
+    size: Number(r.size_bytes),
+    ...(r.pages != null ? { pages: Number(r.pages) } : {}),
+    ...(r.extracted_text ? { text: r.extracted_text } : {}),
+    ...(r.note ? { note: r.note as EmailAttachment["note"] } : {}),
+  }));
+}
+
 export async function recordClassification(params: {
   threadId: string;
   messageId: string;
@@ -1348,7 +1387,9 @@ export type AckSkipReason =
   /** Categorie reglee "hors heures de bureau" et l'email est arrive pendant les heures de bureau. */
   | "heures_bureau"
   /** Email suspect (hameconnage probable): jamais d'accuse. */
-  | "suspect";
+  | "suspect"
+  /** Expediteur armateur ou portail (config NO_ACK_DOMAINS): suivi, mais jamais d'accuse. */
+  | "armateur";
 
 export async function recordAckSkipped(messageId: string, reason: AckSkipReason): Promise<void> {
   await pool.query("UPDATE shadow_log SET ack_skip_reason = $1 WHERE message_id = $2", [reason, messageId]);
@@ -1374,6 +1415,41 @@ export async function listRecentAcksForDomain(
   return result.rows
     .filter((r) => r.sender_email.toLowerCase().endsWith(suffix))
     .map((r) => ({ threadId: r.thread_id, subject: r.original_subject, senderEmail: r.sender_email }));
+}
+
+export interface SenderHistory {
+  /** Emails deja recus de cet expediteur (ou de son domaine), hors emails juges suspects. */
+  previousEmails: number;
+  /** Dossiers de cet expediteur (ou de son domaine) auxquels l'equipe a deja repondu. */
+  teamReplies: number;
+}
+
+/**
+ * Ce que la boite sait deja d'un expediteur sur les 90 derniers jours.
+ * Messagerie grand public: l'adresse exacte seulement; sinon tout le domaine
+ * (un partenaire ecrit depuis plusieurs adresses). Les emails classes
+ * "suspect" ne comptent jamais: un fraudeur ne devient pas connu en
+ * s'etant fait signaler.
+ */
+export async function getSenderHistory(senderEmail: string): Promise<SenderHistory> {
+  const email = senderEmail.toLowerCase();
+  const domain = email.split("@")[1];
+  if (!domain) return { previousEmails: 0, teamReplies: 0 };
+  const exact = PUBLIC_MAIL_DOMAINS.has(domain);
+  const matches = (candidate: string) => (exact ? candidate.toLowerCase() === email : candidate.toLowerCase().endsWith(`@${domain}`));
+  const since = new Date(Date.now() - 90 * 86_400_000).toISOString();
+  const seen = await pool.query<{ sender_email: string }>(
+    `SELECT sender_email FROM shadow_log WHERE created_at >= $1 AND category_id <> 'suspect' AND LOWER(sender_email) LIKE $2`,
+    [since, `%${exact ? email : `@${domain}`}`]
+  );
+  const replied = await pool.query<{ sender_email: string }>(
+    `SELECT sender_email FROM threads WHERE created_at >= $1 AND human_replied_at IS NOT NULL AND category_id <> 'suspect' AND LOWER(sender_email) LIKE $2`,
+    [since, `%${exact ? email : `@${domain}`}`]
+  );
+  return {
+    previousEmails: seen.rows.filter((r) => matches(r.sender_email)).length,
+    teamReplies: replied.rows.filter((r) => matches(r.sender_email)).length,
+  };
 }
 
 /** Vrai si un accuse a deja ete redige dans ce fil (quel que soit l'expediteur). */
@@ -1553,6 +1629,27 @@ export async function getAckReviewStats(): Promise<{ drafted: number; reviewedOk
 export async function listCategoriesWithCorpus(): Promise<string[]> {
   const result = await pool.query<{ category_id: string }>("SELECT DISTINCT category_id FROM human_reply_corpus");
   return result.rows.map((r) => r.category_id);
+}
+
+/** Exemples recents d'une categorie pour guider un brouillon: la demande (quand elle est connue) et la vraie reponse de l'equipe. */
+export async function listCorpusExamplesForDraft(
+  categoryId: string,
+  limit = 6
+): Promise<Array<{ clientAsk: string | null; replyBody: string }>> {
+  const result = await pool.query<{ client_ask: string | null; reply_body: string }>(
+    "SELECT client_ask, reply_body FROM human_reply_corpus WHERE category_id = $1 ORDER BY (client_ask IS NULL), created_at DESC LIMIT $2",
+    [categoryId, limit * 3]
+  );
+  const seen = new Set<string>();
+  const out: Array<{ clientAsk: string | null; replyBody: string }> = [];
+  for (const row of result.rows) {
+    const body = cleanReplyForLearning(row.reply_body);
+    if (!body || seen.has(body)) continue;
+    seen.add(body);
+    out.push({ clientAsk: row.client_ask ? cleanReplyForLearning(row.client_ask) : null, replyBody: body });
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 export async function listHumanReplyCorpusByCategory(categoryId: string): Promise<string[]> {
@@ -1890,4 +1987,154 @@ export function resolveEffectiveSteps(
     }
   }
   return all.byCategory.get(row.category_id) ?? [];
+}
+
+
+// ==================== Brouillons de reponse (back-office seulement) ====================
+
+export interface ReplyDraftRow {
+  id: number;
+  threadId: string;
+  messageId: string;
+  categoryId: string;
+  shouldReply: boolean;
+  reason: string;
+  subject: string;
+  body: string;
+  missing: string[];
+  confidence: "low" | "medium" | "high";
+  source: "auto" | "manuel";
+  createdAt: string;
+  verdict: ReplyDraftVerdict | null;
+}
+
+export type ReplyDraftVerdict = "bon" | "retouche" | "inutilisable";
+export const REPLY_DRAFT_VERDICTS: ReplyDraftVerdict[] = ["bon", "retouche", "inutilisable"];
+
+export async function saveReplyDraft(params: {
+  threadId: string;
+  messageId: string;
+  categoryId: string;
+  shouldReply: boolean;
+  reason: string;
+  subject: string;
+  body: string;
+  missing: string[];
+  confidence: "low" | "medium" | "high";
+  source: "auto" | "manuel";
+}): Promise<void> {
+  await pool.query(
+    `INSERT INTO reply_drafts (thread_id, message_id, category_id, should_reply, reason, subject, body, missing, confidence, source)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT DO NOTHING`,
+    [
+      params.threadId,
+      params.messageId,
+      params.categoryId,
+      params.shouldReply ? 1 : 0,
+      params.reason,
+      params.subject,
+      params.body,
+      JSON.stringify(params.missing),
+      params.confidence,
+      params.source,
+    ]
+  );
+}
+
+function toReplyDraft(r: {
+  id: string | number;
+  thread_id: string;
+  message_id: string;
+  category_id: string;
+  should_reply: number;
+  reason: string;
+  subject: string;
+  body: string;
+  missing: string;
+  confidence: string;
+  source: string;
+  created_at: string | Date;
+  verdict?: string | null;
+}): ReplyDraftRow {
+  let missing: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(r.missing);
+    if (Array.isArray(parsed)) missing = parsed.filter((m): m is string => typeof m === "string");
+  } catch {
+    /* champ vide ou ancien format */
+  }
+  return {
+    id: Number(r.id),
+    threadId: r.thread_id,
+    messageId: r.message_id,
+    categoryId: r.category_id,
+    shouldReply: Number(r.should_reply) === 1,
+    reason: r.reason,
+    subject: r.subject,
+    body: r.body,
+    missing,
+    confidence: (["low", "medium", "high"].includes(r.confidence) ? r.confidence : "low") as ReplyDraftRow["confidence"],
+    source: r.source === "manuel" ? "manuel" : "auto",
+    createdAt: new Date(r.created_at).toISOString(),
+    verdict: REPLY_DRAFT_VERDICTS.includes(r.verdict as ReplyDraftVerdict) ? (r.verdict as ReplyDraftVerdict) : null,
+  };
+}
+
+export async function setReplyDraftVerdict(id: number, verdict: ReplyDraftVerdict | null): Promise<void> {
+  await pool.query("UPDATE reply_drafts SET verdict = $1 WHERE id = $2", [verdict, id]);
+}
+
+export interface ReplyDraftComparison {
+  draft: ReplyDraftRow;
+  subject: string;
+  senderEmail: string;
+  senderName: string | null;
+  /** Premiere vraie reponse de l'equipe apres ce brouillon (corpus), s'il y en a une. */
+  teamReply: string | null;
+  teamReplyAt: string | null;
+}
+
+/** Brouillons recents, chacun avec la vraie reponse que l'equipe a fini par envoyer (pour juger leur justesse). */
+export async function listReplyDraftComparisons(sinceIso: string, limit = 200): Promise<ReplyDraftComparison[]> {
+  const drafts = await pool.query(
+    "SELECT * FROM reply_drafts WHERE created_at >= $1 ORDER BY created_at DESC, id DESC LIMIT $2",
+    [sinceIso, limit]
+  );
+  const out: ReplyDraftComparison[] = [];
+  for (const row of drafts.rows) {
+    const draft = toReplyDraft(row);
+    const thread = await pool.query<{ subject: string; sender_email: string; sender_name: string | null }>(
+      "SELECT subject, sender_email, sender_name FROM threads WHERE thread_id = $1",
+      [draft.threadId]
+    );
+    const reply = await pool.query<{ reply_body: string; created_at: string | Date }>(
+      "SELECT reply_body, created_at FROM human_reply_corpus WHERE thread_id = $1 AND created_at >= $2 ORDER BY created_at ASC LIMIT 1",
+      [draft.threadId, draft.createdAt]
+    );
+    out.push({
+      draft,
+      subject: thread.rows[0]?.subject ?? "(dossier supprimé)",
+      senderEmail: thread.rows[0]?.sender_email ?? "",
+      senderName: thread.rows[0]?.sender_name ?? null,
+      teamReply: reply.rows[0] ? cleanReplyForLearning(reply.rows[0].reply_body) : null,
+      teamReplyAt: reply.rows[0] ? new Date(reply.rows[0].created_at).toISOString() : null,
+    });
+  }
+  return out;
+}
+
+export async function getLatestReplyDraft(threadId: string): Promise<ReplyDraftRow | undefined> {
+  const result = await pool.query(
+    "SELECT * FROM reply_drafts WHERE thread_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+    [threadId]
+  );
+  return result.rows[0] ? toReplyDraft(result.rows[0]) : undefined;
+}
+
+/** Brouillons automatiques des 24 dernieres heures (fenetre glissante): plafond de cout (voir config.draftRepliesMaxPerDay). */
+export async function countReplyDraftsLast24h(): Promise<number> {
+  const since = new Date(Date.now() - 86_400_000).toISOString();
+  const result = await pool.query<{ n: string }>("SELECT COUNT(*) AS n FROM reply_drafts WHERE created_at >= $1 AND source = 'auto'", [since]);
+  return Number(result.rows[0]?.n ?? 0);
 }

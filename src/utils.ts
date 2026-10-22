@@ -25,3 +25,35 @@ export const INTERNAL_SUBJECT_PREFIXES = ["[Rappel]", "[Rapport]"] as const;
 export function isInternalNotificationSubject(subject: string): boolean {
   return INTERNAL_SUBJECT_PREFIXES.some((prefix) => subject.startsWith(prefix));
 }
+
+/** Messageries grand public: deux expediteurs du meme domaine sont deux personnes differentes. */
+export const PUBLIC_MAIL_DOMAINS = new Set([
+  "gmail.com",
+  "googlemail.com",
+  "hotmail.com",
+  "hotmail.fr",
+  "outlook.com",
+  "outlook.fr",
+  "live.com",
+  "live.fr",
+  "msn.com",
+  "yahoo.com",
+  "yahoo.fr",
+  "icloud.com",
+  "me.com",
+  "aol.com",
+  "gmx.com",
+  "gmx.fr",
+  "orange.fr",
+  "menara.ma",
+  "qq.com",
+  "163.com",
+  "126.com",
+]);
+
+/** Vrai si l'adresse est celle d'un des domaines (sous-domaines compris: "service.hlag.com" pour "hlag.com"). */
+export function emailInDomains(email: string, domains: string[]): boolean {
+  const domain = email.split("@")[1]?.toLowerCase();
+  if (!domain) return false;
+  return domains.some((d) => domain === d || domain.endsWith(`.${d}`));
+}

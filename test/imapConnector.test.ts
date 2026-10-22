@@ -2,6 +2,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { ImapFlow } from "imapflow";
 import { freshTestDb } from "./_pgTestDb.js";
+import { makePdf } from "./_pdf.js";
 import { startFakeImapServer, type FakeImapServer, type FakeMailbox } from "./_fakeImapServer.js";
 
 const { markMessageProcessed, listSmtpSentMessages } = await freshTestDb();
@@ -141,7 +142,9 @@ after(async () => {
 
 let uidValiditySeed = 1000;
 
-async function setup(options: { user?: string; mailboxAddress?: string; copyMailbox?: boolean } = {}) {
+async function setup(
+  options: { user?: string; mailboxAddress?: string; copyMailbox?: boolean; extraInbox?: FakeMailbox["messages"]; catchUpHours?: number } = {}
+) {
   // UIDVALIDITY distinct par test: les ids de message (dossier + UIDVALIDITY
   // + UID) restent uniques alors que la base de test est partagee par tout
   // le fichier (processed_messages, smtp_sent_messages).
@@ -154,6 +157,7 @@ async function setup(options: { user?: string; mailboxAddress?: string; copyMail
     mailboxes.INBOX.messages.push(...sent.filter((m) => !m.flags?.includes("\\Draft")).map((m) => ({ ...m, uid: m.uid + 200, flags: [] })));
     mailboxes["INBOX.Sent"].messages = [];
   }
+  if (options.extraInbox) mailboxes.INBOX.messages.push(...options.extraInbox);
   for (const mb of Object.values(mailboxes)) mb.uidValidity = ++uidValiditySeed;
   const server = await startFakeImapServer(mailboxes);
   servers.push(server);
@@ -170,6 +174,7 @@ async function setup(options: { user?: string; mailboxAddress?: string; copyMail
         inboxFolder: "INBOX",
         sentFolder: "",
         threadLookbackDays: 60,
+        catchUpHours: options.catchUpHours,
         allowInsecureForTesting: true,
       },
       smtp: { host: "smtp.test", port: 465, secure: true, user: "", password: "", fromAddress: "" },
@@ -358,6 +363,102 @@ test("messages are mapped with stable ids, thread root, isFromUs and attachment 
   // La reponse du client (References: <root-1> ...) rejoint le meme dossier.
   assert.equal(clientReply.threadId, first.threadId);
   assert.deepEqual(decodeImapThreadId(first.threadId), { kind: "root", rootMessageId: "<root-1@shipper.cn>" });
+});
+
+test("a text part that actually holds HTML code is converted to readable text", async () => {
+  const { connector } = await setup({
+    extraInbox: [
+      {
+        uid: 104,
+        raw: mail(
+          {
+            From: "Norvex <billing@norvexcargo.com>",
+            To: OWN,
+            Subject: "Your Invoice 1110",
+            "Message-ID": "<inv-1110@norvexcargo.com>",
+            "Content-Type": "text/plain; charset=UTF-8",
+          },
+          "<html><head><style>p { margin: 0 }</style></head><body><p>Dear&nbsp;PROMARK ,</p><p>Please find attached invoice 1110.</p></body></html>\r\n"
+        ),
+      },
+    ],
+  });
+  const inbox = await connector.listRecentInboxMessages(25);
+  await connector.close();
+
+  const invoice = inbox.find((m) => m.subject === "Your Invoice 1110");
+  assert.ok(invoice);
+  assert.ok(!invoice.bodyText.includes("<"), invoice.bodyText);
+  assert.match(invoice.bodyText, /Dear PROMARK ,\n+Please find attached invoice 1110\./);
+  // Un email texte normal reste tel quel.
+  assert.match(inbox.find((m) => m.subject === "Grille tarifaire")?.bodyText ?? "", /^Ci-joint notre grille\./);
+});
+
+test("a PDF attached to a new email is read (even past the 256 KB cut), without any write command", async () => {
+  const pdf = makePdf(["INVOICE 5521", "Total USD 3400.00"], 300_000);
+  const base64 = pdf.toString("base64").replace(/(.{76})/g, "$1\r\n");
+  const raw = mail(
+    {
+      From: "Arkas Agent <ops@arkas-agent.tr>",
+      To: OWN,
+      Subject: "Invoice attached",
+      "Message-ID": "<inv-5521@arkas-agent.tr>",
+      "MIME-Version": "1.0",
+      "Content-Type": 'multipart/mixed; boundary="xyz"',
+    },
+    [
+      "--xyz",
+      "Content-Type: text/plain; charset=UTF-8",
+      "",
+      "Please see attached.",
+      "--xyz",
+      'Content-Type: application/pdf; name="inv5521.pdf"',
+      'Content-Disposition: attachment; filename="inv5521.pdf"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      base64,
+      "--xyz--",
+      "",
+    ].join("\r\n")
+  );
+  const bodyStructure = `(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" 22 1)("APPLICATION" "PDF" ("NAME" "inv5521.pdf") NIL NIL "BASE64" ${base64.length} NIL ("ATTACHMENT" ("FILENAME" "inv5521.pdf")) NIL) "MIXED" ("BOUNDARY" "xyz") NIL NIL)`;
+  const { server, connector } = await setup({ extraInbox: [{ uid: 105, raw, bodyStructure }] });
+  const inbox = await connector.listRecentInboxMessages(25);
+  await connector.close();
+
+  const invoice = inbox.find((m) => m.subject === "Invoice attached");
+  assert.ok(invoice);
+  assert.equal(invoice.hasAttachments, true);
+  assert.equal(invoice.attachments?.length, 1);
+  assert.match(invoice.attachments?.[0].text ?? "", /INVOICE 5521/);
+  assert.match(invoice.attachments?.[0].text ?? "", /Total USD 3400\.00/);
+  assertOnlyReadOnlyCommands(server);
+  // Un faux PDF (fixture "Grille tarifaire") est signale illisible, sans erreur.
+  assert.equal(inbox.find((m) => m.subject === "Grille tarifaire")?.attachments?.[0].note, "unreadable");
+  // Un email sans piece jointe n'a pas de champ attachments.
+  assert.equal(inbox.find((m) => m.subject === "Your Invoice 1110")?.attachments, undefined);
+});
+
+test("after an outage, catch-up also reads older unprocessed emails; without it only the last 25", async () => {
+  const backlog = Array.from({ length: 40 }, (_, i) => ({
+    uid: 300 + i,
+    raw: mail({
+      From: `Agent ${i} <agent${i}@backlog.tr>`,
+      To: OWN,
+      Subject: `Backlog ${i}`,
+      "Message-ID": `<backlog-${i}@backlog.tr>`,
+    }),
+  }));
+  const plain = await setup({ extraInbox: backlog });
+  const lastOnly = await plain.connector.listRecentInboxMessages(25);
+  await plain.connector.close();
+  assert.equal(lastOnly.length, 25);
+
+  const withCatchUp = await setup({ extraInbox: backlog, catchUpHours: 1_000_000 });
+  const caughtUp = await withCatchUp.connector.listRecentInboxMessages(25);
+  await withCatchUp.connector.close();
+  assert.equal(caughtUp.length, 43, "all 3 fixture emails + 40 backlog emails");
+  assertOnlyReadOnlyCommands(withCatchUp.server);
 });
 
 test("already-processed messages are not downloaded again", async () => {

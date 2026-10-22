@@ -58,7 +58,7 @@ and Microsoft Graph as pluggable connectors behind `EmailConnector` (`src/types.
 
 ```
 src/ai/            classify.ts, draftAcknowledgement.ts, draftRelance.ts (pre/post_reply
-                    prompts), draftReplies.ts (paused by default, see config), client.ts
+                    prompts), draftReply.ts (back-office reply drafts, see Gotchas), client.ts
                     (CLAUDE_MODEL), structured.ts (withRetry + AI usage recording)
 src/connectors/     gmailConnector.ts, graphConnector.ts (implement EmailConnector),
                     gmailAuth.ts/graphAuth.ts (OAuth), mime.ts (MIME parse/build), index.ts
@@ -145,8 +145,7 @@ boundary — extend those, don't bypass them by handing a client view raw admin 
   `getThread()` must filter out DRAFT-labeled messages before this count is compared,
   or the 3 draft replies (when enabled) inflate the "real" message count and trip a
   false positive.
-- **`draftRepliesEnabled` is off by default** (`config.draftRepliesEnabled`,
-  `ENABLE_DRAFT_REPLIES` env var) — accusé/relances/notifications still run normally.
+- **`draftRepliesEnabled` is off by default** (`ENABLE_DRAFT_REPLIES`) — accusé/relances/notifications still run normally.
 - **Thread-id/connector mismatch**: switching the connected mailbox's provider leaves
   old dossiers with the previous provider's thread-id shape in the DB.
   `threadIdMatchesConnector()` in `relanceCheck.ts` skips them instead of retrying
@@ -156,9 +155,21 @@ boundary — extend those, don't bypass them by handing a client view raw admin 
   same fire time and send back-to-back, one cron cycle apart.
 - **`maxExternalRelancesPerCycle`** (default 5) caps client-facing relances per cycle,
   shared across both loops — internal-only rappels are not throttled.
-- Attachments: the pipeline never reads PDF/Excel content, only the plain-text body and
-  a boolean `hasAttachments` flag. Classification/accusé/relance on an attachment-only
-  email works from the subject line alone.
+- Attachments: at intake only (`ImapSmtpConnector.listRecentInboxMessages`), PDF and plain text/CSV
+  attachments are read (`src/pipeline/attachmentText.ts`, unpdf): max 8 MB, 12 pages, 8000 chars, 4 files
+  per email. Only the extracted TEXT is kept (`message_attachments`, never the file), and prompts frame it
+  as untrusted data (`formatAttachments` in `prompts.ts`). The full message is re-fetched with `BODY.PEEK`
+  past the 256 KiB cut only when BODYSTRUCTURE announces a readable attachment. Excel/Word/images are
+  flagged "unsupported" and scanned PDFs "no_text", never guessed. Gmail/Graph connectors do not read
+  attachments (IMAP is the live one). Never add a write method to read an attachment.
+- Reply drafts (`src/ai/draftReply.ts`, `src/pipeline/replyDrafts.ts`, table `reply_drafts`): a draft answers
+  the substance of the email from the thread, attachments and real team replies (`human_reply_corpus`),
+  with `[[fields]]` for anything not in the data (prices, dates, decisions). Back-office only: shown on the
+  dossier page, never sent and never placed in the mailbox. Automatic with `ENABLE_DRAFT_REPLIES=true`
+  (set in `render.yaml` for prod and dev; cap `DRAFT_REPLIES_MAX_PER_DAY`, default 80); the "Préparer une
+  réponse" button always works. The `/brouillons` page (`draftsView.ts`) shows each draft next to the team's
+  real reply (first `human_reply_corpus` row after the draft) with a verdict (bon / retouche / inutilisable)
+  stored in `reply_drafts.verdict` — the accuracy measure for the 3-day check.
 - Dates: always render through `formatDateTime()` (`shared.ts`) — `config.timezone`
   (default `Africa/Casablanca`), never bare `toLocaleString()`.
 

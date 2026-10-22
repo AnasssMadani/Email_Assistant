@@ -3,9 +3,10 @@ import { getCategory } from "../settings.js";
 import { isSendAllowed } from "../stage.js";
 import { classifyEmail } from "../ai/classify.js";
 import { draftAcknowledgement } from "../ai/draftAcknowledgement.js";
-import { buildReplySubject, isInternalNotificationSubject } from "../utils.js";
+import { buildReplySubject, emailInDomains, isInternalNotificationSubject, PUBLIC_MAIL_DOMAINS } from "../utils.js";
 import { tagSource } from "./errorTag.js";
 import { stripQuotedHistory } from "./emailText.js";
+import { maybeAutoDraftReply } from "./replyDrafts.js";
 import { isAutomatedMessage } from "./automatedSender.js";
 import { getOfficeHours, isWithinOfficeHours } from "../officeHours.js";
 import {
@@ -18,8 +19,10 @@ import {
   recordAckSkipped,
   recordClassification,
   recordPipelineError,
+  getSenderHistory,
   getThreadRow,
   recordReminder,
+  saveMessageAttachments,
   setThreadAckSent,
   setThreadStatus,
   listRecentAcksForDomain,
@@ -82,9 +85,14 @@ export async function processIncomingMessage(
     return;
   }
 
+  const senderHistory = await getSenderHistory(message.from.email);
   let classification: Awaited<ReturnType<typeof classifyEmail>>;
   try {
-    classification = await classifyEmail(thread, message);
+    classification = await classifyEmail(thread, message, {
+      senderPreviousEmails: senderHistory.previousEmails,
+      senderTeamReplies: senderHistory.teamReplies,
+      ourEarlierMessages: priorOutboundCount,
+    });
   } catch (err) {
     // La classification a echoue (ex: solde de jetons Claude epuise, panne
     // API) — plutot que de laisser ce message invisible et retente
@@ -123,7 +131,12 @@ export async function processIncomingMessage(
   // Hameconnage probable: rangé dans "Suspect" quand la categorie existe,
   // quelle que soit la categorie proposee (un faux appel d'offres arrive
   // classe "devis urgent").
-  const suspectCategory = classification.suspicious ? await findCategory(SUSPECT_CATEGORY_ID) : undefined;
+  // Un correspondant connu (l'equipe lui a deja repondu) signale suspect n'est
+  // pas range "Suspect": on ne cache pas la demande d'un partenaire. Il reste
+  // sans accuse, mais le dossier est suivi et l'equipe est prevenue.
+  const knownSuspect = !!classification.suspicious && senderHistory.teamReplies > 0;
+  const suspectCategory =
+    classification.suspicious && !knownSuspect ? await findCategory(SUSPECT_CATEGORY_ID) : undefined;
   const category = suspectCategory ?? (await getCategory(classification.categoryId));
 
   if (category.id === "spam_newsletter") {
@@ -140,7 +153,7 @@ export async function processIncomingMessage(
   // Un email qui attend une reponse de l'equipe est SUIVI (rappel interne si
   // personne ne repond), qu'il recoive un accuse ou non. Un email suspect ne
   // l'est jamais: personne ne doit y repondre.
-  const followed = classification.requiresAcknowledgement && !classification.suspicious;
+  const followed = classification.requiresAcknowledgement && (!classification.suspicious || knownSuspect);
   const now = Date.now();
   const dueAt = followed ? new Date(now + category.slaMinutes * 60_000).toISOString() : null;
 
@@ -175,6 +188,7 @@ export async function processIncomingMessage(
     priorOutboundCount,
   });
   await markMessageProcessed(message.id, message.threadId, message.rfcMessageId);
+  if (message.attachments?.length) await saveMessageAttachments(message.id, message.threadId, message.attachments);
 
   if (classification.createdCategory) {
     await recordReminder(
@@ -182,6 +196,19 @@ export async function processIncomingMessage(
       "internal",
       `[Catégorie] Nouvelle catégorie créée par l'IA : « ${classification.createdCategory.label} » (aucune catégorie existante ne convenait). Réglages repris de la catégorie de repli — à revoir dans Réglages.`
     );
+  }
+
+  if (knownSuspect) {
+    await recordAckSkipped(message.id, "suspect");
+    if (followed) await setThreadAckSent(message.threadId);
+    await recordReminder(
+      message.threadId,
+      "internal",
+      `[À vérifier] Correspondant connu, mais l'IA a trouvé cet email suspect : ${classification.suspicionReason?.trim() || "signaux d'hameçonnage détectés"}. Aucun accusé envoyé ; vérifiez avant d'ouvrir un lien ou une pièce jointe.`
+    );
+    console.log(`[suspect, expediteur connu] "${message.subject}" — ${message.from.email}, suivi sans accuse.`);
+    await maybeAutoDraftReply(thread, message, category);
+    return;
   }
 
   if (classification.suspicious) {
@@ -213,6 +240,7 @@ export async function processIncomingMessage(
     await setThreadAckSent(message.threadId);
     await recordReminder(message.threadId, "internal", `[Accusé non envoyé] ${suppression.note}`);
     console.log(`[accuse supprime] "${message.subject}" — ${suppression.note}`);
+    await maybeAutoDraftReply(thread, message, category);
     return;
   }
 
@@ -233,7 +261,9 @@ export async function processIncomingMessage(
       "internal",
       `[Erreur IA] La rédaction/l'envoi de l'accusé a échoué : ${(err as Error).message}`
     );
+    return;
   }
+  await maybeAutoDraftReply(thread, message, category);
 }
 
 const SUSPECT_CATEGORY_ID = "suspect";
@@ -312,6 +342,12 @@ export async function ackPolicySuppression(
   incoming: EmailMessage,
   at: Date = new Date()
 ): Promise<{ code: AckSkipReason; note: string } | undefined> {
+  if (emailInDomains(incoming.from.email, config.noAckDomains)) {
+    return {
+      code: "armateur",
+      note: "l'expéditeur est un armateur ou un portail : pas d'accusé.",
+    };
+  }
   if (!category.acknowledgeAutomatically) {
     return {
       code: "categorie",
@@ -336,29 +372,7 @@ export async function ackPolicySuppression(
   return undefined;
 }
 
-const PUBLIC_MAIL_DOMAINS = new Set([
-  "gmail.com",
-  "googlemail.com",
-  "hotmail.com",
-  "hotmail.fr",
-  "outlook.com",
-  "outlook.fr",
-  "live.com",
-  "live.fr",
-  "msn.com",
-  "yahoo.com",
-  "yahoo.fr",
-  "icloud.com",
-  "me.com",
-  "aol.com",
-  "gmx.com",
-  "gmx.fr",
-  "orange.fr",
-  "menara.ma",
-  "qq.com",
-  "163.com",
-  "126.com",
-]);
+
 
 async function isDuplicateAck(incoming: EmailMessage): Promise<boolean> {
   if (await threadHasAckDraft(incoming.threadId)) return true;
